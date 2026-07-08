@@ -2132,11 +2132,10 @@ static bool dist_route_entry_matches_worker(
         const ds4_dist_route_entry *route,
         const ds4_dist_worker_entry *worker) {
     const bool route_has_output = (route->flags & DS4_DIST_ROUTE_F_OUTPUT_LOGITS) != 0;
-    /* Match using forward address when configured, otherwise control-plane. */
-    const char *worker_host = worker->forward_host[0] ? worker->forward_host : worker->peer_host;
-    return route->port == worker->listen_port &&
-           strcmp(route->host, worker_host) == 0 &&
-           route->layer_start == worker->layer_start &&
+    /* Match by layer range and output flag — this is topology-independent and
+     * works whether forward addresses are used or not.  Host/port matching is
+     * unreliable when forward addresses differ from control-plane addresses. */
+    return route->layer_start == worker->layer_start &&
            route->layer_end == worker->layer_end &&
            route_has_output == (worker->has_output != 0);
 }
@@ -2314,11 +2313,14 @@ static bool dist_coordinator_build_route_plan(
          *                             port = first worker's listen_port
          *   - Hop N (N>0):           host = worker[N-1]'s forward_host
          *                             port = worker[N]'s listen_port
-         * When forward_host is empty, fall back to the control-plane address.
+         * When forward_host is empty on the previous node, fall back to the
+         * control-plane address.  If the previous node has forward_host set
+         * but this node does not (last in ring), also fall back to
+         * control-plane since this node's data listener is on --listen.
          */
         if (i == 0 && state->forward_host[0]) {
             snprintf(entry.host, sizeof(entry.host), "%s", state->forward_host);
-        } else if (i > 0 && path[i - 1]->forward_host[0]) {
+        } else if (i > 0 && path[i - 1]->forward_host[0] && w->forward_host[0]) {
             snprintf(entry.host, sizeof(entry.host), "%s", path[i - 1]->forward_host);
         } else {
             snprintf(entry.host, sizeof(entry.host), "%s", w->peer_host);
@@ -8031,8 +8033,13 @@ static int dist_run_worker(ds4_engine *engine, const ds4_dist_options *opt, int 
      * --forward-host on each node is the IP of the next node (N+1) on the
      * high-speed network; it is NOT this node's own listen address.  The
      * coordinator builds route entries using forward_host so peer-to-peer
-     * forwarding goes over the high-speed network. */
-    const char *listen_host = opt->listen_host;
+     * forwarding goes over the high-speed network.
+     *
+     * When forward_host is configured, the data listener must be reachable at
+     * the high-speed IP that the previous node uses to connect.  Override the
+     * listen host to 0.0.0.0 so it binds on all interfaces. */
+    const char *listen_host = opt->forward_host && opt->forward_host[0]
+        ? "0.0.0.0" : opt->listen_host;
     int requested_port = opt->listen_port > 0 ? opt->listen_port : 0;
     int listen_fd = dist_open_listener(listen_host, requested_port, err, sizeof(err));
     if (listen_fd < 0) {
