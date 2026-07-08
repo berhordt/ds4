@@ -8451,10 +8451,6 @@ static int dist_validate_options(const ds4_dist_options *opt, char *err, size_t 
             if (errlen) snprintf(err, errlen, "--role coordinator must not use --coordinator");
             return 1;
         }
-        if (opt->forward_host) {
-            if (errlen) snprintf(err, errlen, "--forward-host is only valid for --role worker");
-            return 1;
-        }
         return 0;
     }
 
