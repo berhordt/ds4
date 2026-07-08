@@ -87,7 +87,6 @@ typedef struct {
     uint32_t listen_port;
     uint32_t model_name_len;
     uint32_t forward_host_len;
-    uint32_t forward_port;
 } ds4_dist_hello_fixed;
 
 typedef struct {
@@ -212,7 +211,6 @@ typedef struct ds4_dist_worker_entry {
     char peer_host[NI_MAXHOST];
     char peer_port[NI_MAXSERV];
     char forward_host[NI_MAXHOST];
-    uint32_t forward_port;
     char model_name[DS4_DIST_MAX_MODEL_NAME + 1u];
     uint32_t model_id;
     uint32_t quant_bits;
@@ -242,6 +240,7 @@ typedef struct {
     uint32_t prefill_window;
     uint32_t activation_bits;
     uint64_t generation;
+    char forward_host[NI_MAXHOST];
     pthread_mutex_t mu;
     ds4_dist_worker_entry *workers;
     bool shutting_down;
@@ -1472,7 +1471,6 @@ static void dist_hello_to_wire(ds4_dist_hello_fixed *h) {
     h->listen_port = htonl(h->listen_port);
     h->model_name_len = htonl(h->model_name_len);
     h->forward_host_len = htonl(h->forward_host_len);
-    h->forward_port = htonl(h->forward_port);
 }
 
 static void dist_hello_from_wire(ds4_dist_hello_fixed *h) {
@@ -1487,7 +1485,6 @@ static void dist_hello_from_wire(ds4_dist_hello_fixed *h) {
     h->listen_port = ntohl(h->listen_port);
     h->model_name_len = ntohl(h->model_name_len);
     h->forward_host_len = ntohl(h->forward_host_len);
-    h->forward_port = ntohl(h->forward_port);
 }
 
 static uint64_t dist_u64_from_halves(uint32_t hi, uint32_t lo) {
@@ -1774,6 +1771,9 @@ static int dist_send_hello(ds4_engine *engine, const ds4_dist_options *opt, int 
     size_t model_name_len = strlen(model_name);
     if (model_name_len > DS4_DIST_MAX_MODEL_NAME) model_name_len = DS4_DIST_MAX_MODEL_NAME;
 
+    /* forward_host is the IP of the next node (N+1) in the ring on the
+     * high-speed network.  Advertise it so the coordinator knows the
+     * peer-to-peer forwarding topology. */
     const char *forward_host = opt->forward_host ? opt->forward_host : "";
     size_t forward_host_len = strlen(forward_host);
     if (forward_host_len >= NI_MAXHOST) forward_host_len = NI_MAXHOST - 1u;
@@ -1790,7 +1790,6 @@ static int dist_send_hello(ds4_engine *engine, const ds4_dist_options *opt, int 
         listen_port,
         (uint32_t)model_name_len,
         (uint32_t)forward_host_len,
-        forward_host_len ? (uint32_t)opt->forward_port : 0u,
     };
     ds4_dist_hello_fixed wire = h;
     dist_hello_to_wire(&wire);
@@ -1905,7 +1904,6 @@ static void dist_coordinator_add_worker(
     snprintf(entry->peer_host, sizeof(entry->peer_host), "%s", peer_host);
     snprintf(entry->peer_port, sizeof(entry->peer_port), "%s", peer_port);
     snprintf(entry->forward_host, sizeof(entry->forward_host), "%s", forward_host ? forward_host : "");
-    entry->forward_port = hello->forward_port;
     snprintf(entry->model_name, sizeof(entry->model_name), "%s", model_name ? model_name : "unknown");
     entry->model_id = hello->model_id;
     entry->quant_bits = hello->quant_bits;
@@ -1957,14 +1955,12 @@ static void dist_coordinator_add_worker(
     char layer_end[32];
     if (entry->has_output) snprintf(layer_end, sizeof(layer_end), "output");
     else snprintf(layer_end, sizeof(layer_end), "%u", entry->layer_end);
-    const char *data_host = entry->forward_host[0] ? entry->forward_host : entry->peer_host;
-    uint32_t data_port = entry->forward_port ? entry->forward_port : entry->listen_port;
     DIST_COORD_DEBUG(state,
                      "ds4: distributed coordinator: registered worker %s:%s data=%s:%u model_id=%u quant=Q%u layers=%u:%s hidden=%u ctx=%u\n",
                      entry->peer_host,
                      entry->peer_port,
-                     data_host,
-                     data_port,
+                     entry->forward_host[0] ? entry->forward_host : entry->peer_host,
+                     entry->listen_port,
                      entry->model_id,
                      entry->quant_bits,
                      entry->layer_start,
@@ -2089,12 +2085,10 @@ static void dist_coordinator_report_plan(ds4_dist_coordinator_state *state) {
             char end[32];
             if (w->has_output) snprintf(end, sizeof(end), "output");
             else snprintf(end, sizeof(end), "%u", w->layer_end);
-            const char *data_host = w->forward_host[0] ? w->forward_host : w->peer_host;
-            uint32_t data_port = w->forward_port ? w->forward_port : w->listen_port;
             used += (size_t)snprintf(plan + used, sizeof(plan) - used,
                                      " -> %s:%u Q%u %u:%s",
-                                     data_host,
-                                     data_port,
+                                     w->forward_host[0] ? w->forward_host : w->peer_host,
+                                     w->listen_port,
                                      w->quant_bits,
                                      w->layer_start,
                                      end);
@@ -2140,8 +2134,7 @@ static bool dist_route_entry_matches_worker(
     const bool route_has_output = (route->flags & DS4_DIST_ROUTE_F_OUTPUT_LOGITS) != 0;
     /* Match using forward address when configured, otherwise control-plane. */
     const char *worker_host = worker->forward_host[0] ? worker->forward_host : worker->peer_host;
-    uint32_t worker_port = worker->forward_port ? worker->forward_port : worker->listen_port;
-    return route->port == worker_port &&
+    return route->port == worker->listen_port &&
            strcmp(route->host, worker_host) == 0 &&
            route->layer_start == worker->layer_start &&
            route->layer_end == worker->layer_end &&
@@ -2164,11 +2157,10 @@ static void dist_coordinator_forget_route_workers(
             *link = entry->next;
             close(entry->fd);
             const char *worker_host = entry->forward_host[0] ? entry->forward_host : entry->peer_host;
-            uint32_t worker_port = entry->forward_port ? entry->forward_port : entry->listen_port;
             DIST_COORD_DEBUG(state,
                              "ds4: distributed coordinator: forgot failed route worker %s:%u layers=%u:%u%s\n",
                              worker_host,
-                             worker_port,
+                             entry->listen_port,
                              entry->layer_start,
                              entry->layer_end,
                              entry->has_output ? "+output" : "");
@@ -2314,16 +2306,24 @@ static bool dist_coordinator_build_route_plan(
         ds4_dist_route_entry entry;
         memset(&entry, 0, sizeof(entry));
         entry.fd = -1;
-        /* Use forward address when configured, otherwise fall back to
-         * control-plane address for peer-to-peer forwarding. */
-        const bool use_forward = w->forward_host[0];
-        if (use_forward) {
-            snprintf(entry.host, sizeof(entry.host), "%s", w->forward_host);
-            entry.port = w->forward_port ? w->forward_port : w->listen_port;
+        /* Ring forwarding: --forward-host on each node is the IP of the next
+         * node (N+1) on the high-speed network.  The route entry for hop N
+         * must contain the address that the PREVIOUS node uses to reach this
+         * node's data listener:
+         *   - Hop 0 (first worker):  host = coordinator's forward_host
+         *                             port = first worker's listen_port
+         *   - Hop N (N>0):           host = worker[N-1]'s forward_host
+         *                             port = worker[N]'s listen_port
+         * When forward_host is empty, fall back to the control-plane address.
+         */
+        if (i == 0 && state->forward_host[0]) {
+            snprintf(entry.host, sizeof(entry.host), "%s", state->forward_host);
+        } else if (i > 0 && path[i - 1]->forward_host[0]) {
+            snprintf(entry.host, sizeof(entry.host), "%s", path[i - 1]->forward_host);
         } else {
             snprintf(entry.host, sizeof(entry.host), "%s", w->peer_host);
-            entry.port = w->listen_port;
         }
+        entry.port = w->listen_port;
         entry.layer_start = w->layer_start;
         entry.layer_end = w->layer_end;
         entry.flags = w->has_output ? DS4_DIST_ROUTE_F_OUTPUT_LOGITS : 0u;
@@ -2331,7 +2331,7 @@ static bool dist_coordinator_build_route_plan(
             /* When forward network is configured, always use a fresh data
              * connection to the forward address rather than dup'ing the
              * control-plane socket. */
-            if (use_forward) {
+            if (entry.host[0] && strcmp(entry.host, w->peer_host) != 0) {
                 entry.fd = dist_connect_endpoint(entry.host, (int)entry.port, err, errlen);
                 if (entry.fd < 0) {
                     pthread_mutex_unlock(&state->mu);
@@ -4327,7 +4327,7 @@ static void *dist_coordinator_client_main(void *arg) {
     }
 
     dist_coordinator_add_worker(state, fd, peer_host, peer_port, &hello, model_name,
-                                hello.forward_host_len ? forward_host : NULL);
+                                hello.forward_host_len && forward_host[0] ? forward_host : NULL);
 
     if (state->use_control_for_work) {
         dist_coordinator_monitor_worker_fd(state, fd, peer_host, peer_port);
@@ -5517,6 +5517,10 @@ int ds4_dist_session_create(
     d->state.local_has_output = opt->layers.has_output;
     d->state.local_can_output_head = ds4_engine_has_output_head(engine);
     d->state.replay_check = opt->replay_check;
+    d->state.forward_host[0] = '\0';
+    if (opt->forward_host && opt->forward_host[0]) {
+        snprintf(d->state.forward_host, sizeof(d->state.forward_host), "%s", opt->forward_host);
+    }
     d->state.debug = opt->debug;
     d->state.use_control_for_work = true;
     d->state.prefill_chunk = opt->prefill_chunk;
@@ -5804,6 +5808,10 @@ static int dist_run_coordinator(ds4_engine *engine, const ds4_dist_options *opt,
     state.debug = opt->debug;
     state.use_control_for_work = gen && gen->prompt;
     state.prefill_chunk = opt->prefill_chunk;
+    state.forward_host[0] = '\0';
+    if (opt->forward_host && opt->forward_host[0]) {
+        snprintf(state.forward_host, sizeof(state.forward_host), "%s", opt->forward_host);
+    }
     state.prefill_window = opt->prefill_window;
     state.activation_bits = dist_activation_bits_or_default(opt->activation_bits);
     pthread_mutex_init(&state.mu, NULL);
@@ -8019,14 +8027,14 @@ static int dist_run_worker(ds4_engine *engine, const ds4_dist_options *opt, int 
     else snprintf(layer_end, sizeof(layer_end), "%u", opt->layers.end);
 
     char err[256];
-    /* Forward address: use high-speed network for peer-to-peer data, while
-     * control-plane traffic stays on the shared network (--listen). */
-    const char *data_host = opt->forward_host && opt->forward_host[0]
-        ? opt->forward_host : opt->listen_host;
-    int data_port_requested = opt->forward_port > 0
-        ? opt->forward_port
-        : (opt->listen_port > 0 ? opt->listen_port : 0);
-    int listen_fd = dist_open_listener(data_host, data_port_requested, err, sizeof(err));
+    /* The worker data listener binds to --listen (shared control-plane network).
+     * --forward-host on each node is the IP of the next node (N+1) on the
+     * high-speed network; it is NOT this node's own listen address.  The
+     * coordinator builds route entries using forward_host so peer-to-peer
+     * forwarding goes over the high-speed network. */
+    const char *listen_host = opt->listen_host;
+    int requested_port = opt->listen_port > 0 ? opt->listen_port : 0;
+    int listen_fd = dist_open_listener(listen_host, requested_port, err, sizeof(err));
     if (listen_fd < 0) {
         fprintf(stderr, "ds4: distributed worker: %s\n", err);
         return 1;
@@ -8063,9 +8071,9 @@ static int dist_run_worker(ds4_engine *engine, const ds4_dist_options *opt, int 
             opt->layers.start,
             layer_end,
             ds4_engine_model_id(engine),
-            data_host ? data_host : "*",
+            listen_host ? listen_host : "*",
             listen_port,
-            opt->forward_host && opt->forward_host[0] ? " forward=" : "",
+            opt->forward_host && opt->forward_host[0] ? " next_hop=" : "",
             opt->forward_host && opt->forward_host[0] ? opt->forward_host : "",
             opt->coordinator_host,
             opt->coordinator_port);
@@ -8235,11 +8243,10 @@ void ds4_dist_usage(FILE *fp) {
         "      Coordinator TCP listen address. Workers may later use it to force their data listener.\n"
         "  --coordinator HOST PORT\n"
         "      Coordinator TCP address for --role worker.\n"
-        "  --forward-host HOST PORT\n"
-        "      Worker high-speed network address for peer-to-peer forwarding.\n"
-        "      When set, the worker data listener binds to this address and advertises\n"
-        "      it for the forwarding chain instead of the control-plane address.\n"
-        "      Requires --role worker.\n"
+        "  --forward-host IP\n"
+        "      IP address of the next node (N+1) in the ring on the high-speed\n"
+        "      network for peer-to-peer forwarding.  The port is the --listen port\n"
+        "      of that node.  Valid for both --role coordinator and --role worker.\n"
         "  --dist-prefill-chunk N\n"
         "      Coordinator prefill pipeline chunk size. Default: session cap, normally 4096.\n"
         "      Non-default values are experimental and can change logits unless validated.\n"
@@ -8330,15 +8337,12 @@ ds4_dist_cli_parse_result ds4_dist_parse_cli_arg(
             if (errlen) snprintf(err, errlen, "missing distributed options");
             return DS4_DIST_CLI_ERROR;
         }
-        if (opt->forward_host || opt->forward_port) {
+        if (opt->forward_host) {
             if (errlen) snprintf(err, errlen, "specify --forward-host only once");
             return DS4_DIST_CLI_ERROR;
         }
         const char *host = dist_cli_need_arg(index, argc, argv, arg, err, errlen);
         if (!host) return DS4_DIST_CLI_ERROR;
-        const char *port = dist_cli_need_arg(index, argc, argv, arg, err, errlen);
-        if (!port) return DS4_DIST_CLI_ERROR;
-        if (!dist_cli_parse_port(port, arg, &opt->forward_port, err, errlen)) return DS4_DIST_CLI_ERROR;
         opt->forward_host = host;
         return DS4_DIST_CLI_MATCHED;
     }
@@ -8416,7 +8420,7 @@ static int dist_validate_options(const ds4_dist_options *opt, char *err, size_t 
     if (opt->role == DS4_DISTRIBUTED_NONE) {
         if (opt->layers.set || opt->listen_host || opt->listen_port ||
             opt->coordinator_host || opt->coordinator_port ||
-            opt->forward_host || opt->forward_port ||
+            opt->forward_host ||
             opt->prefill_chunk != 0 || opt->prefill_window != 0 ||
             opt->activation_bits != 0) {
             if (errlen) snprintf(err, errlen, "distributed options require --role coordinator or --role worker");
@@ -8447,7 +8451,7 @@ static int dist_validate_options(const ds4_dist_options *opt, char *err, size_t 
             if (errlen) snprintf(err, errlen, "--role coordinator must not use --coordinator");
             return 1;
         }
-        if (opt->forward_host || opt->forward_port) {
+        if (opt->forward_host) {
             if (errlen) snprintf(err, errlen, "--forward-host is only valid for --role worker");
             return 1;
         }
