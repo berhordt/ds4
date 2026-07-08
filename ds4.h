@@ -84,6 +84,8 @@ typedef struct {
     int listen_port;
     const char *coordinator_host;
     int coordinator_port;
+    const char *forward_host;
+    int forward_port;
     uint32_t prefill_chunk;
     uint32_t prefill_window;
     uint32_t activation_bits;
