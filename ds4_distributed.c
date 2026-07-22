@@ -2085,9 +2085,16 @@ static void dist_coordinator_report_plan(ds4_dist_coordinator_state *state) {
             char end[32];
             if (w->has_output) snprintf(end, sizeof(end), "output");
             else snprintf(end, sizeof(end), "%u", w->layer_end);
+            const char *host;
+            if (i == 0 && state->forward_host[0])
+                host = state->forward_host;
+            else if (i > 0 && path[i - 1]->forward_host[0] && w->forward_host[0])
+                host = path[i - 1]->forward_host;
+            else
+                host = w->peer_host;
             used += (size_t)snprintf(plan + used, sizeof(plan) - used,
                                      " -> %s:%u Q%u %u:%s",
-                                     w->forward_host[0] ? w->forward_host : w->peer_host,
+                                     host,
                                      w->listen_port,
                                      w->quant_bits,
                                      w->layer_start,
