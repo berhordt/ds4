@@ -67,7 +67,7 @@ endif
 ifeq ($(UNAME_S),Darwin)
 .PHONY: metal-decode-schedule-bench metal-prefill-variant-bench check-mxfp4-half-lut
 
-all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
+all: ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4-tp-discover
 
 help:
 	@echo "DS4 build targets:"
@@ -96,6 +96,9 @@ ds4-eval: ds4_eval.o ds4_help.o $(CORE_OBJS)
 
 ds4-agent: ds4_agent.o ds4_help.o ds4_web.o ds4_kvstore.o linenoise.o ds4_gpu_args.o $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ ds4_agent.o ds4_help.o ds4_web.o ds4_kvstore.o linenoise.o ds4_gpu_args.o $(CORE_OBJS) $(METAL_LDLIBS)
+
+ds4-tp-discover: ds4_tp_discover.c
+	$(CC) $(CFLAGS) -o $@ ds4_tp_discover.c -ldl
 
 gguf-tools/quality-testing/score_official: gguf-tools/quality-testing/score_official.c ds4.h $(CORE_OBJS) rax.o ds4_gpu_args.o
 	$(CC) $(QUALITY_CFLAGS) -I. -o $@ gguf-tools/quality-testing/score_official.c $(CORE_OBJS) rax.o ds4_gpu_args.o $(METAL_LDLIBS)

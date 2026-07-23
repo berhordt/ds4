@@ -1129,6 +1129,204 @@ static int tp_rdma_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint
     return ok;
 }
 
+/* ------------------------------------------------------------------------
+ * Per-peer RDMA gate exchange helpers.
+ * --------------------------------------------------------------------- */
+
+static int tp_rdma_post_gate_recv_peer(ds4_tp *tp, uint32_t pi, uint64_t seq) {
+    ds4_tp_rdma *r = &tp->peers[pi].rdma;
+    const uint32_t slot = tp_gate_slot(tp, seq);
+    const uintptr_t base = (uintptr_t)(tp->slab + tp->peers[pi].in_off +
+                                       (uint64_t)slot * tp->vec_bytes);
+    uint64_t off = 0;
+    while (off < tp->vec_bytes) {
+        const uint64_t len = tp->vec_bytes - off > DS4_TP_RDMA_MAX_MSG ?
+            DS4_TP_RDMA_MAX_MSG : tp->vec_bytes - off;
+        const int last = off + len == tp->vec_bytes;
+        struct ibv_sge sge;
+        struct ibv_recv_wr wr, *bad = NULL;
+        memset(&wr, 0, sizeof(wr));
+        sge.addr = base + off; sge.length = (uint32_t)len; sge.lkey = r->mr->lkey;
+        wr.wr_id = last ? seq : 0;
+        wr.sg_list = &sge; wr.num_sge = 1;
+        if (ibv_post_recv(r->qp, &wr, &bad) != 0) return 0;
+        off += len;
+    }
+    return 1;
+}
+
+static int tp_rdma_drain_cq_peer(ds4_tp *tp, uint32_t pi) {
+    ds4_tp_rdma *r = &tp->peers[pi].rdma;
+    struct ibv_wc wc[16];
+    int n = ibv_poll_cq(r->cq, 16, wc);
+    if (n < 0) return 0;
+    for (int i = 0; i < n; i++) {
+        if (wc[i].status != IBV_WC_SUCCESS) return 0;
+        if (wc[i].opcode & IBV_WC_RECV) {
+            if (wc[i].wr_id > r->recv_done) r->recv_done = wc[i].wr_id;
+        } else if (r->send_outstanding > 0) r->send_outstanding--;
+    }
+    return 1;
+}
+
+/* ------------------------------------------------------------------------
+ * All-to-all RDMA gate exchange: post sends+recvs to all peers, poll all CQs.
+ * --------------------------------------------------------------------- */
+
+static int tp_rdma_gate_exchange_all(ds4_tp *tp, uint32_t layer, uint32_t gate,
+                                      uint64_t seq) {
+    const uint32_t slot = layer * DS4_TP_GATES_PER_LAYER + gate;
+    if (slot != tp_gate_slot(tp, seq)) return 0;
+    const uintptr_t send_base = (uintptr_t)(tp->slab + tp->out_off +
+                                            (uint64_t)slot * tp->vec_bytes);
+    int ok = 1;
+
+    /* Phase 1: arm receive windows and post sends to all peers. */
+    for (uint32_t pi = 0; ok && pi < tp->peer_count; pi++) {
+        ds4_tp_rdma *r = &tp->peers[pi].rdma;
+        pthread_mutex_lock(&r->post_lock);
+        if (!r->recv_window_active) {
+            for (uint64_t s = seq; ok && s < seq + DS4_TP_RDMA_RECV_WINDOW; s++)
+                ok = tp_rdma_post_gate_recv_peer(tp, pi, s);
+            if (ok) r->recv_window_active = true;
+        }
+        /* Post sends (chunked if vec > 16KB). */
+        for (uint64_t off = 0; ok && off < tp->vec_bytes; ) {
+            const uint64_t len = tp->vec_bytes - off > DS4_TP_RDMA_MAX_MSG ?
+                DS4_TP_RDMA_MAX_MSG : tp->vec_bytes - off;
+            struct ibv_sge sge;
+            struct ibv_send_wr wr, *bad = NULL;
+            memset(&wr, 0, sizeof(wr));
+            sge.addr = send_base + off; sge.length = (uint32_t)len;
+            sge.lkey = r->mr->lkey;
+            wr.wr_id = seq; wr.sg_list = &sge; wr.num_sge = 1;
+            wr.opcode = IBV_WR_SEND; wr.send_flags = IBV_SEND_SIGNALED;
+            ok = ibv_post_send(r->qp, &wr, &bad) == 0;
+            if (ok) r->send_outstanding++;
+            off += len;
+        }
+        pthread_mutex_unlock(&r->post_lock);
+    }
+
+    /* Phase 2: busy-wait for recv completions from all peers. */
+    double deadline = tp_now_sec() + (double)tp->timeout_sec;
+    for (uint32_t pi = 0; ok && pi < tp->peer_count; pi++) {
+        ds4_tp_rdma *r = &tp->peers[pi].rdma;
+        uint32_t peer_poll = 0;
+        while (ok && r->recv_done < seq) {
+            ok = tp_rdma_drain_cq_peer(tp, pi);
+            if (ok && (peer_poll++ & 0x3fffu) == 0 && tp_peer_closed(tp)) ok = 0;
+            if (tp_now_sec() > deadline) {
+                fprintf(stderr, "ds4-tp: timeout peer %u gate seq %llu (recv_done %llu)\n",
+                        pi, (unsigned long long)seq, (unsigned long long)r->recv_done);
+                ok = 0;
+            }
+        }
+        if (ok) {
+            pthread_mutex_lock(&r->post_lock);
+            ok = tp_rdma_post_gate_recv_peer(tp, pi, seq + DS4_TP_RDMA_RECV_WINDOW);
+            r->last_gate_seq = seq;
+            pthread_mutex_unlock(&r->post_lock);
+        }
+    }
+    return ok;
+}
+
+/* ------------------------------------------------------------------------
+ * Ring RDMA gate exchange: circulate partials through prev/next neighbours.
+ * --------------------------------------------------------------------- */
+
+static int tp_rdma_gate_exchange_ring(ds4_tp *tp, uint32_t layer, uint32_t gate,
+                                       uint64_t seq) {
+    const uint32_t slot = layer * DS4_TP_GATES_PER_LAYER + gate;
+    if (slot != tp_gate_slot(tp, seq)) return 0;
+    uint32_t next = (tp->rank + 1u) % tp->world_size;
+    uint32_t prev = (tp->rank + tp->world_size - 1u) % tp->world_size;
+    uint32_t pi_next = UINT32_MAX, pi_prev = UINT32_MAX;
+    for (uint32_t pi = 0; pi < tp->peer_count; pi++) {
+        if (tp->peers[pi].rank == next) pi_next = pi;
+        if (tp->peers[pi].rank == prev) pi_prev = pi;
+    }
+    if (pi_next >= tp->peer_count || pi_prev >= tp->peer_count) return 0;
+
+    /* Accumulator buffer for the running sum. */
+    const uint32_t n_floats = (uint32_t)(tp->vec_bytes / sizeof(float));
+    float *accum = malloc(tp->vec_bytes);
+    if (!accum) return 0;
+    memcpy(accum, tp->slab + tp->out_off + (uint64_t)slot * tp->vec_bytes,
+           tp->vec_bytes);
+
+    for (uint32_t hop = 0; hop < tp->peer_count; hop++) {
+        ds4_tp_rdma *rn = &tp->peers[pi_next].rdma;
+        ds4_tp_rdma *rp = &tp->peers[pi_prev].rdma;
+        uint8_t *in_ptr = tp->slab + tp->peers[pi_prev].in_off +
+                          (uint64_t)slot * tp->vec_bytes;
+
+        /* Arm recv window on prev peer. */
+        pthread_mutex_lock(&rp->post_lock);
+        if (!rp->recv_window_active) {
+            for (uint64_t s = seq; s < seq + DS4_TP_RDMA_RECV_WINDOW; s++)
+                if (!tp_rdma_post_gate_recv_peer(tp, pi_prev, s)) {
+                    pthread_mutex_unlock(&rp->post_lock);
+                    free(accum); return 0;
+                }
+            rp->recv_window_active = true;
+        }
+
+        /* Post sends to next peer from accumulator. */
+        int ok = 1;
+        uintptr_t send_base = (uintptr_t)accum;
+        for (uint64_t off = 0; ok && off < tp->vec_bytes; ) {
+            const uint64_t len = tp->vec_bytes - off > DS4_TP_RDMA_MAX_MSG ?
+                DS4_TP_RDMA_MAX_MSG : tp->vec_bytes - off;
+            struct ibv_sge sge;
+            struct ibv_send_wr wr, *bad = NULL;
+            memset(&wr, 0, sizeof(wr));
+            sge.addr = send_base + off; sge.length = (uint32_t)len;
+            sge.lkey = rn->mr->lkey;
+            wr.wr_id = seq; wr.sg_list = &sge; wr.num_sge = 1;
+            wr.opcode = IBV_WR_SEND; wr.send_flags = IBV_SEND_SIGNALED;
+            ok = ibv_post_send(rn->qp, &wr, &bad) == 0;
+            if (ok) rn->send_outstanding++;
+            off += len;
+        }
+        pthread_mutex_unlock(&rp->post_lock);
+
+        /* Wait for recv from prev peer. */
+        double deadline = tp_now_sec() + (double)tp->timeout_sec;
+        uint32_t peer_poll = 0;
+        while (ok && rp->recv_done < seq) {
+            ok = tp_rdma_drain_cq_peer(tp, pi_prev);
+            if (ok && (peer_poll++ & 0x3fffu) == 0 && tp_peer_closed(tp)) ok = 0;
+            if (tp_now_sec() > deadline) ok = 0;
+        }
+        if (!ok) { free(accum); return 0; }
+
+        /* Accumulate received partial. */
+        const float *in_f = (const float *)in_ptr;
+        for (uint32_t i = 0; i < n_floats; i++) accum[i] += in_f[i];
+
+        /* Slide recv window. */
+        pthread_mutex_lock(&rp->post_lock);
+        if (!tp_rdma_post_gate_recv_peer(tp, pi_prev,
+                                          seq + DS4_TP_RDMA_RECV_WINDOW)) {
+            pthread_mutex_unlock(&rp->post_lock);
+            free(accum); return 0;
+        }
+        rp->last_gate_seq = seq;
+        pthread_mutex_unlock(&rp->post_lock);
+    }
+
+    /* Copy accumulated sum to all in-buffers for GPU combine. */
+    for (uint32_t pi = 0; pi < tp->peer_count; pi++) {
+        uint8_t *dst = tp->slab + tp->peers[pi].in_off +
+                       (uint64_t)slot * tp->vec_bytes;
+        memcpy(dst, accum, tp->vec_bytes);
+    }
+    free(accum);
+    return 1;
+}
+
 static int tp_rdma_big_gate_capable(const ds4_tp *tp) {
     const uint64_t stage_bytes =
         (uint64_t)DS4_TP_RDMA_BULK_SLOTS * DS4_TP_RDMA_MAX_MSG;
@@ -1383,6 +1581,207 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
 
 static void tp_rdma_close(ds4_tp *tp) {
     ds4_tp_rdma *r = &tp->rdma;
+    if (r->qp) r->api.destroy_qp(r->qp);
+    if (r->mr) r->api.dereg_mr(r->mr);
+    if (r->cq) r->api.destroy_cq(r->cq);
+    if (r->pd) r->api.dealloc_pd(r->pd);
+    if (r->ctx) r->api.close_device(r->ctx);
+    r->qp = NULL; r->mr = NULL; r->cq = NULL; r->pd = NULL; r->ctx = NULL;
+}
+
+/* ------------------------------------------------------------------------
+ * Per-peer RDMA: open, register/exchange, close.
+ * --------------------------------------------------------------------- */
+
+static int tp_rdma_open_peer(ds4_tp *tp, uint32_t pi, char *err, size_t errlen) {
+    ds4_tp_rdma *r = &tp->peers[pi].rdma;
+    /* Share the already-loaded API. */
+    r->api = tp->rdma.api;
+
+    /* Device selection: use peer config's rdma_device if set,
+     * otherwise fall back to the global --rdma-device option. */
+    const char *want_name = NULL;
+    if (pi < tp->opt.peer_count && tp->opt.peers[pi].rdma_device[0])
+        want_name = tp->opt.peers[pi].rdma_device;
+    else if (tp->opt.rdma_device)
+        want_name = tp->opt.rdma_device;
+
+    int num = 0;
+    struct ibv_device **devs = r->api.get_device_list(&num);
+    if (!devs || num == 0) {
+        tp_set_err(err, errlen, "tp rdma peer %u: no verbs devices", pi);
+        if (devs) r->api.free_device_list(devs);
+        return 0;
+    }
+    char states[256] = "";
+    for (int i = 0; i < num && !r->ctx; i++) {
+        const char *name = r->api.get_device_name(devs[i]);
+        if (want_name && strcmp(want_name, name) != 0) continue;
+        struct ibv_context *ctx = r->api.open_device(devs[i]);
+        if (!ctx) continue;
+        struct ibv_port_attr pa;
+        if (r->api.query_port(ctx, 1, &pa) == 0 &&
+            (pa.state == IBV_PORT_ACTIVE || want_name)) {
+            r->ctx = ctx;
+            r->port = pa;
+            fprintf(stderr, "ds4-tp: peer %u rdma device %s (port state %d)\n",
+                    pi, name, (int)pa.state);
+            break;
+        }
+        size_t off = strlen(states);
+        snprintf(states + off, sizeof(states) - off, "%s%s=%d",
+                 off ? ", " : "", name, (int)pa.state);
+        r->api.close_device(ctx);
+    }
+    r->api.free_device_list(devs);
+    if (!r->ctx) {
+        tp_set_err(err, errlen,
+                   "tp rdma peer %u: no device with an active port (%s)", pi, states);
+        return 0;
+    }
+
+    /* Find IPv4-mapped GID. */
+    r->gid_index = -1;
+    if (tp->opt.rdma_gid_index_set) {
+        r->gid_index = tp->opt.rdma_gid_index;
+        if (r->api.query_gid(r->ctx, 1, r->gid_index, &r->gid) != 0) {
+            tp_set_err(err, errlen, "tp rdma peer %u: query_gid(%d): %s",
+                       pi, r->gid_index, strerror(errno));
+            return 0;
+        }
+    } else {
+        for (int i = 0; i < r->port.gid_tbl_len; i++) {
+            union ibv_gid tmp;
+            if (r->api.query_gid(r->ctx, 1, i, &tmp) != 0) continue;
+            uint64_t hi; uint16_t mid, v4tag;
+            memcpy(&hi, &tmp.raw[0], 8);
+            memcpy(&mid, &tmp.raw[8], 2);
+            memcpy(&v4tag, &tmp.raw[10], 2);
+            if (hi == 0 && mid == 0 && v4tag == 0xffff) {
+                r->gid = tmp; r->gid_index = i; break;
+            }
+        }
+        if (r->gid_index < 0) {
+            tp_set_err(err, errlen,
+                       "tp rdma peer %u: no IPv4-mapped GID on active port", pi);
+            return 0;
+        }
+    }
+
+    r->pd = r->api.alloc_pd(r->ctx);
+    if (!r->pd) { tp_set_err(err, errlen, "tp rdma peer %u: alloc_pd failed", pi); return 0; }
+    r->cq = r->api.create_cq(r->ctx, 512, NULL, NULL, 0);
+    if (!r->cq) { tp_set_err(err, errlen, "tp rdma peer %u: create_cq failed", pi); return 0; }
+
+    struct ibv_qp_init_attr qia = {0};
+    qia.send_cq = r->cq; qia.recv_cq = r->cq;
+    qia.qp_type = IBV_QPT_UC;
+    qia.cap.max_send_wr = 256;
+    qia.cap.max_recv_wr = 64;
+    qia.cap.max_send_sge = 1;
+    qia.cap.max_recv_sge = 1;
+    qia.cap.max_inline_data = 0;
+    r->qp = r->api.create_qp(r->pd, &qia);
+    if (!r->qp) {
+        tp_set_err(err, errlen, "tp rdma peer %u: create_qp(UC): %s", pi, strerror(errno));
+        return 0;
+    }
+    r->max_inline = qia.cap.max_inline_data;
+    pthread_mutex_init(&r->post_lock, NULL);
+    return 1;
+}
+
+static int tp_rdma_register_and_exchange_peer(ds4_tp *tp, uint32_t pi,
+                                               char *err, size_t errlen) {
+    ds4_tp_rdma *r = &tp->peers[pi].rdma;
+    r->mr = r->api.reg_mr(r->pd, tp->slab, tp->slab_bytes,
+                          IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ |
+                          IBV_ACCESS_REMOTE_WRITE);
+    if (!r->mr) {
+        tp_set_err(err, errlen, "tp rdma peer %u: reg_mr(%llu bytes): %s",
+                   pi, (unsigned long long)tp->slab_bytes, strerror(errno));
+        return 0;
+    }
+    ds4_tp_rdma_info mine = {0};
+    mine.slab_base = (uint64_t)(uintptr_t)tp->slab;
+    mine.rkey = r->mr->rkey;
+    mine.qpn = r->qp->qp_num;
+    mine.psn = (uint32_t)(getpid() ^ (uintptr_t)tp) & 0xffffff;
+    mine.mtu = (uint32_t)r->port.active_mtu;
+    mine.lid = r->port.lid;
+    memcpy(mine.gid, r->gid.raw, 16);
+    mine.link_layer = r->port.link_layer;
+
+    /* Exchange over the peer's control_fd (leader) or data_fd (worker). */
+    int xfd = tp->rank == 0 ? tp->peers[pi].control_fd : tp->control_fd;
+    if (xfd < 0) xfd = tp->peers[pi].data_fd;
+    if (!tp_send_frame(xfd, DS4_TP_FRAME_RDMA_INFO, &mine, sizeof(mine))) {
+        tp_set_err(err, errlen, "tp rdma peer %u: info send failed", pi);
+        return 0;
+    }
+    uint32_t type = 0, bytes = 0;
+    if (!tp_read_frame_header(xfd, &type, &bytes) ||
+        type != DS4_TP_FRAME_RDMA_INFO || bytes != sizeof(r->peer) ||
+        !tp_read_full(xfd, &r->peer, sizeof(r->peer))) {
+        tp_set_err(err, errlen, "tp rdma peer %u: info recv failed", pi);
+        return 0;
+    }
+
+    /* QP state machine: INIT -> RTR -> RTS */
+    struct ibv_qp_attr a = {0};
+    a.qp_state = IBV_QPS_INIT;
+    a.pkey_index = 0; a.port_num = 1;
+    a.qp_access_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ |
+                        IBV_ACCESS_REMOTE_WRITE;
+    if (r->api.modify_qp(r->qp, &a,
+            IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS) != 0) {
+        tp_set_err(err, errlen, "tp rdma peer %u: modify INIT: %s", pi, strerror(errno));
+        return 0;
+    }
+    memset(&a, 0, sizeof(a));
+    a.qp_state = IBV_QPS_RTR;
+    a.path_mtu = IBV_MTU_1024;
+    a.dest_qp_num = r->peer.qpn;
+    a.rq_psn = r->peer.psn;
+    a.ah_attr.dlid = (uint16_t)r->peer.lid;
+    a.ah_attr.port_num = 1;
+    a.ah_attr.is_global = 1;
+    memcpy(a.ah_attr.grh.dgid.raw, r->peer.gid, 16);
+    a.ah_attr.grh.sgid_index = (uint8_t)r->gid_index;
+    a.ah_attr.grh.hop_limit = 1;
+    if (r->api.modify_qp(r->qp, &a,
+            IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
+            IBV_QP_RQ_PSN) != 0) {
+        tp_set_err(err, errlen, "tp rdma peer %u: modify RTR: %s", pi, strerror(errno));
+        return 0;
+    }
+    memset(&a, 0, sizeof(a));
+    a.qp_state = IBV_QPS_RTS;
+    a.sq_psn = mine.psn;
+    if (r->api.modify_qp(r->qp, &a, IBV_QP_STATE | IBV_QP_SQ_PSN) != 0) {
+        tp_set_err(err, errlen, "tp rdma peer %u: modify RTS: %s", pi, strerror(errno));
+        return 0;
+    }
+    if (tp->vec_bytes > 2ull * DS4_TP_RDMA_MAX_MSG) {
+        tp_set_err(err, errlen, "tp rdma peer %u: vector too large for RDMA chunking", pi);
+        return 0;
+    }
+    /* RDMA ready barrier. */
+    if (!tp_send_frame(xfd, DS4_TP_FRAME_RDMA_READY, NULL, 0)) {
+        tp_set_err(err, errlen, "tp rdma peer %u: ready send failed", pi);
+        return 0;
+    }
+    uint32_t rtype = 0, rbytes = 0;
+    if (!tp_read_frame_header(xfd, &rtype, &rbytes) ||
+        rtype != DS4_TP_FRAME_RDMA_READY || rbytes != 0) {
+        tp_set_err(err, errlen, "tp rdma peer %u: ready barrier failed", pi);
+        return 0;
+    }
+    return 1;
+}
+
+static void tp_rdma_close_peer(ds4_tp *tp, uint32_t pi) {
+    ds4_tp_rdma *r = &tp->peers[pi].rdma;
     if (r->qp) r->api.destroy_qp(r->qp);
     if (r->mr) r->api.dereg_mr(r->mr);
     if (r->cq) r->api.destroy_cq(r->cq);
@@ -1662,7 +2061,12 @@ int ds4_tp_create(
 
 #ifdef DS4_TP_HAVE_VERBS
     if (tp->rdma_active) {
-        if (!tp_rdma_open(tp, err, errlen)) goto fail;
+        /* Open RDMA for each peer. */
+        for (uint32_t pi = 0; pi < tp->peer_count; pi++) {
+            if (!tp_rdma_open_peer(tp, pi, err, errlen)) goto fail;
+        }
+        /* Legacy compat: mirror first peer's RDMA state. */
+        tp->rdma = tp->peers[0].rdma;
     }
 #endif
 
@@ -1695,8 +2099,13 @@ int ds4_tp_attach_slab(ds4_tp *tp, void *base, char *err, size_t errlen) {
            (uint64_t)tp->n_slots * 8 * (tp->peer_count ? tp->peer_count : 1u));
     memset(tp->slab + tp->token_off, 0, 16 * (tp->peer_count ? tp->peer_count : 1u));
 #ifdef DS4_TP_HAVE_VERBS
-    if (tp->rdma_active)
-        return tp_rdma_register_and_exchange(tp, err, errlen);
+    if (tp->rdma_active) {
+        for (uint32_t pi = 0; pi < tp->peer_count; pi++) {
+            if (!tp_rdma_register_and_exchange_peer(tp, pi, err, errlen))
+                return 0;
+        }
+        return 1;
+    }
 #endif
     (void)err; (void)errlen;
     return 1;
@@ -1705,7 +2114,8 @@ int ds4_tp_attach_slab(ds4_tp *tp, void *base, char *err, size_t errlen) {
 void ds4_tp_free(ds4_tp *tp) {
     if (!tp) return;
 #ifdef DS4_TP_HAVE_VERBS
-    tp_rdma_close(tp);
+    for (uint32_t pi = 0; pi < tp->peer_count; pi++)
+        tp_rdma_close_peer(tp, pi);
 #endif
     if (tp->control_fd >= 0) close(tp->control_fd);
     for (uint32_t pi = 0; pi < tp->peer_count; pi++) {
@@ -1775,8 +2185,13 @@ static int tp_gate_exchange_one(ds4_tp *tp, uint32_t pi, uint32_t layer,
 int ds4_tp_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint64_t seq) {
     uint8_t *out_ptr = tp->slab + ds4_tp_slab_out_offset(tp, layer, gate);
 #ifdef DS4_TP_HAVE_VERBS
-    if (tp->rdma_active && tp->peer_count <= 1)
-        return tp_rdma_gate_exchange(tp, layer, gate, seq);
+    if (tp->rdma_active) {
+        if (tp->peer_count <= 1)
+            return tp_rdma_gate_exchange(tp, layer, gate, seq);
+        if (tp->topology == DS4_TP_TOPO_RING)
+            return tp_rdma_gate_exchange_ring(tp, layer, gate, seq);
+        return tp_rdma_gate_exchange_all(tp, layer, gate, seq);
+    }
 #endif
     if (tp->topology == DS4_TP_TOPO_RING) {
         /* Ring: N-1 hops.  Each hop sends accumulated partial to next
