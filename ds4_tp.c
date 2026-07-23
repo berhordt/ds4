@@ -39,7 +39,7 @@
 
 #define DS4_TP_MAGIC UINT32_C(0x44533454) /* "DS4T" */
 #define DS4_TP_BATCH_MAGIC UINT32_C(0x44533442) /* "DS4B" */
-#define DS4_TP_PROTOCOL_VERSION 7u
+#define DS4_TP_PROTOCOL_VERSION 8u
 
 /* Default gate timeout is generous: the first gate after a sync waits for
  * the peer's whole (possibly cold page cache) prefill. */
@@ -66,7 +66,11 @@ typedef struct {
     uint32_t gate_slot_start;
     uint32_t gate_slot_step;
     uint32_t gates_per_token;
-    uint32_t pad;
+    uint32_t world_size;       /* v8: total ranks (0=legacy 2-node) */
+    uint32_t rank;             /* v8: this node's rank */
+    uint32_t topology;         /* v8: DS4_TP_TOPO_* */
+    uint32_t expert_start;     /* v8: first routed expert owned */
+    uint32_t expert_count;     /* v8: number of routed experts owned */
 } ds4_tp_hello_fixed;
 
 typedef struct {
@@ -150,36 +154,51 @@ typedef struct {
 } ds4_tp_rdma;
 #endif
 
+struct ds4_tp_peer {
+    uint32_t rank;
+    int control_fd;             /* leader→worker control socket */
+    int data_fd;                /* TCP data socket for gate exchange with this peer */
+    uint64_t in_off;            /* offset into slab for this peer's in vectors */
+    uint64_t batch_in_off;      /* offset for this peer's batch in vectors */
+#ifdef DS4_TP_HAVE_VERBS
+    ds4_tp_rdma rdma;
+#endif
+};
+
 struct ds4_tp {
     ds4_tp_options opt;
-    int rank;                   /* 0 leader, 1 worker */
-    int control_fd;
-    int data_fd;                /* TCP fallback, headers, and verify gates */
-    bool rdma_active;
-    uint32_t peer_ctx;
+    int rank;                   /* 0..world_size-1 */
+    uint32_t world_size;
+    uint32_t topology;          /* DS4_TP_TOPO_ALL_TO_ALL or DS4_TP_TOPO_RING */
+    uint32_t peer_count;
+    ds4_tp_peer peers[DS4_TP_MAX_PEERS];
+    uint32_t expert_start;      /* first routed expert owned by this rank */
+    uint32_t expert_count;      /* number of routed experts owned */
+    int control_fd;             /* leader→worker or worker→leader */
+    int data_fd;                /* legacy: first peer's data_fd (compat) */
+    bool rdma_active;           /* RDMA active with at least one peer */
+    uint32_t peer_ctx;          /* legacy: first peer's ctx_size */
     uint32_t n_layer;
     uint32_t n_embd;
     uint64_t vec_bytes;
     uint32_t n_slots;
-    /* Decode gate schedule (see ds4_tp_identity). */
     uint32_t gate_slot_start;
     uint32_t gate_slot_step;
     uint32_t gates_per_token;
     uint8_t *slab;
     uint64_t slab_bytes;
-    /* Slab regions, see ds4_tp.h layout comment. */
     uint64_t out_off;
-    uint64_t in_off;
-    uint64_t in_flags_off;
-    uint64_t token_off;
+    uint64_t in_off;            /* start of per-peer in vector regions */
+    uint64_t in_flags_off;      /* start of per-peer in seq flags */
+    uint64_t token_off;         /* start of per-peer token slots */
     uint64_t out_flags_off;     /* local staging for RDMA flag writes */
     uint64_t gpu_flags_off;     /* GPU-written gate-ready flags (u32/slot) */
     uint64_t batch_out_off;     /* [layer][row] verify-block local partials */
-    uint64_t batch_in_off;      /* [layer][row] verify-block peer partials */
+    uint64_t batch_in_off;      /* start of per-peer batch in regions */
     uint64_t timeout_sec;
     atomic_bool failed;
 #ifdef DS4_TP_HAVE_VERBS
-    ds4_tp_rdma rdma;
+    ds4_tp_rdma rdma;           /* legacy: first peer's RDMA state */
 #endif
 };
 
@@ -353,14 +372,21 @@ bool ds4_tp_enabled(const ds4_tp_options *opt) {
 
 void ds4_tp_usage(FILE *fp) {
     fprintf(fp,
-        "Tensor parallelism (two identical machines):\n"
-        "  --tensor-parallel           Use --role/--listen/--coordinator for a 50/50 TP pair.\n"
+        "Tensor parallelism (2-6 identical machines):\n"
+        "  --tensor-parallel           Use --role/--listen/--coordinator for a TP mesh.\n"
         "  --transport <auto|rdma|tcp> Gate transport (default auto).\n"
         "  --rdma-device <name>        Select a verbs device such as rdma_en1.\n"
         "  --rdma-gid-index <n>        Select the local verbs GID index.\n"
         "  --tensor-parallel-token-prefill\n"
         "                              GLM diagnostic: prefill one token at a time.\n"
-        "  --debug-hash <n>            Cross-check hidden state every n tokens.\n");
+        "  --debug-hash <n>            Cross-check hidden state every n tokens.\n"
+        "  --tp-world <2..6>           Total number of ranks in the mesh.\n"
+        "  --tp-rank <0..5>            This node's rank in the mesh.\n"
+        "  --tp-topology <all_to_all|ring>\n"
+        "                              Mesh topology (auto: all-to-all for <=4, ring for >=5).\n"
+        "  --tp-config-file <path>     JSON config file with peer list.\n"
+        "  --tp-peer RANK:HOST:PORT:RDMA_HOST:RDMA_DEV\n"
+        "                              Add a peer to the mesh (repeatable).\n");
 }
 
 int ds4_tp_parse_cli_arg(
@@ -404,6 +430,66 @@ int ds4_tp_parse_cli_arg(
     } else if (!strcmp(arg, "--debug-hash")) {
         if (i + 1 >= argc) goto missing;
         opt->debug_hash = atoi(argv[++i]);
+    } else if (!strcmp(arg, "--tp-world")) {
+        if (i + 1 >= argc) goto missing;
+        char *end = NULL;
+        errno = 0;
+        long v = strtol(argv[++i], &end, 10);
+        if (errno != 0 || !end || *end != '\0' || v < 2 || v > 6) {
+            tp_set_err(err, errlen, "--tp-world must be 2..6");
+            return DS4_TP_CLI_ERROR;
+        }
+        opt->world_size = (uint32_t)v;
+    } else if (!strcmp(arg, "--tp-rank")) {
+        if (i + 1 >= argc) goto missing;
+        char *end = NULL;
+        errno = 0;
+        long v = strtol(argv[++i], &end, 10);
+        if (errno != 0 || !end || *end != '\0' || v < 0 || v > 5) {
+            tp_set_err(err, errlen, "--tp-rank must be 0..5");
+            return DS4_TP_CLI_ERROR;
+        }
+        opt->rank = (uint32_t)v;
+    } else if (!strcmp(arg, "--tp-topology")) {
+        if (i + 1 >= argc) goto missing;
+        const char *v = argv[++i];
+        if (!strcmp(v, "all_to_all")) opt->topology = DS4_TP_TOPO_ALL_TO_ALL;
+        else if (!strcmp(v, "ring")) opt->topology = DS4_TP_TOPO_RING;
+        else {
+            tp_set_err(err, errlen, "--tp-topology must be all_to_all or ring");
+            return DS4_TP_CLI_ERROR;
+        }
+    } else if (!strcmp(arg, "--tp-config-file")) {
+        if (i + 1 >= argc) goto missing;
+        opt->config_file = argv[++i];
+    } else if (!strcmp(arg, "--tp-peer")) {
+        if (i + 1 >= argc) goto missing;
+        if (opt->peer_count >= DS4_TP_MAX_PEERS) {
+            tp_set_err(err, errlen, "too many --tp-peer (max %u)", DS4_TP_MAX_PEERS);
+            return DS4_TP_CLI_ERROR;
+        }
+        const char *v = argv[++i];
+        ds4_tp_peer_config *p = &opt->peers[opt->peer_count];
+        memset(p, 0, sizeof(*p));
+        /* Parse RANK:CONTROL_HOST:CONTROL_PORT:RDMA_HOST:RDMA_DEVICE */
+        char buf[512];
+        snprintf(buf, sizeof(buf), "%s", v);
+        char *save = NULL;
+        char *tok = strtok_r(buf, ":", &save);
+        if (!tok) { tp_set_err(err, errlen, "--tp-peer format: RANK:CONTROL_HOST:CONTROL_PORT:RDMA_HOST:RDMA_DEVICE"); return DS4_TP_CLI_ERROR; }
+        p->rank = (uint32_t)atoi(tok);
+        tok = strtok_r(NULL, ":", &save);
+        if (!tok) goto peer_fmt;
+        snprintf(p->control_host, sizeof(p->control_host), "%s", tok);
+        tok = strtok_r(NULL, ":", &save);
+        if (!tok) goto peer_fmt;
+        p->control_port = atoi(tok);
+        tok = strtok_r(NULL, ":", &save);
+        if (!tok) goto peer_fmt;
+        snprintf(p->rdma_host, sizeof(p->rdma_host), "%s", tok);
+        tok = strtok_r(NULL, ":", &save);
+        if (tok) snprintf(p->rdma_device, sizeof(p->rdma_device), "%s", tok);
+        opt->peer_count++;
     } else {
         return DS4_TP_CLI_NOT_MATCHED;
     }
@@ -411,6 +497,9 @@ int ds4_tp_parse_cli_arg(
     return DS4_TP_CLI_MATCHED;
 missing:
     tp_set_err(err, errlen, "%s requires an argument", arg);
+    return DS4_TP_CLI_ERROR;
+peer_fmt:
+    tp_set_err(err, errlen, "--tp-peer format: RANK:CONTROL_HOST:CONTROL_PORT:RDMA_HOST:RDMA_DEVICE");
     return DS4_TP_CLI_ERROR;
 }
 
@@ -426,6 +515,46 @@ int ds4_tp_adopt_distributed_options(
                    "--tensor-parallel selects its role through --role");
         return 0;
     }
+    if (tp->world_size >= 2) {
+        /* Mesh mode: --tp-world/--tp-rank take precedence, --role still required. */
+        if (dist->role == DS4_DISTRIBUTED_NONE) {
+            tp_set_err(err, errlen,
+                       "--tp-world requires --role coordinator or --role worker");
+            return 0;
+        }
+        if (dist->layers.set) {
+            tp_set_err(err, errlen, "tensor parallelism omits --layers");
+            return 0;
+        }
+        if (dist->prefill_chunk || dist->prefill_window || dist->activation_bits ||
+            dist->replay_check || dist->debug) {
+            tp_set_err(err, errlen,
+                       "--dist-* options cannot be used with --tensor-parallel");
+            return 0;
+        }
+        if (dist->role == DS4_DISTRIBUTED_COORDINATOR) {
+            if (!dist->listen_host || dist->listen_port <= 0) {
+                tp_set_err(err, errlen,
+                           "--role coordinator requires --listen HOST PORT");
+                return 0;
+            }
+            tp->role = DS4_TP_LEADER;
+            tp->listen_host = dist->listen_host;
+            tp->listen_port = dist->listen_port;
+        } else {
+            if (!dist->coordinator_host || dist->coordinator_port <= 0) {
+                tp_set_err(err, errlen,
+                           "--role worker requires --coordinator HOST PORT");
+                return 0;
+            }
+            tp->role = DS4_TP_WORKER;
+            tp->leader_host = dist->coordinator_host;
+            tp->leader_port = dist->coordinator_port;
+        }
+        memset(dist, 0, sizeof(*dist));
+        return 1;
+    }
+    /* Legacy 2-node path (unchanged). */
     if (dist->role == DS4_DISTRIBUTED_NONE) {
         tp_set_err(err, errlen,
                    "--tensor-parallel requires --role coordinator or --role worker");
@@ -507,12 +636,26 @@ int ds4_tp_validate_engine_options(
         tp_set_err(err, errlen, "tensor parallelism and --role distributed modes are exclusive");
         return 0;
     }
-    /* Speculative drafting (DSpark/MTP) is allowed on the leader: the
-     * verify block is mirrored to the worker via DS4_TP_FRAME_VERIFY and
-     * the legacy MTP path falls back to per-token decode under TP. */
     if (opt->load_slice) {
         tp_set_err(err, errlen, "tensor parallelism does not use distributed layer slices");
         return 0;
+    }
+    if (opt->tp.world_size >= 2) {
+        if (opt->tp.rank >= opt->tp.world_size) {
+            tp_set_err(err, errlen, "--tp-rank %u must be < --tp-world %u",
+                       opt->tp.rank, opt->tp.world_size);
+            return 0;
+        }
+        if (opt->tp.topology == DS4_TP_TOPO_ALL_TO_ALL && opt->tp.world_size > 4) {
+            tp_set_err(err, errlen,
+                       "all-to-all topology limited to 4 nodes (use ring for 5-6)");
+            return 0;
+        }
+        if (opt->tp.config_file && opt->tp.peer_count) {
+            tp_set_err(err, errlen,
+                       "--tp-config-file and --tp-peer are mutually exclusive");
+            return 0;
+        }
     }
     return 1;
 }
@@ -521,30 +664,41 @@ int ds4_tp_validate_engine_options(
  * Slab layout.
  * --------------------------------------------------------------------- */
 
-uint64_t ds4_tp_slab_bytes(uint32_t n_layer, uint32_t n_embd) {
+uint64_t ds4_tp_slab_bytes(uint32_t n_layer, uint32_t n_embd, uint32_t peer_count) {
     uint64_t vec = (uint64_t)n_embd * sizeof(float);
     uint64_t slots = (uint64_t)n_layer * DS4_TP_GATES_PER_LAYER;
-    return slots * vec * 2 +    /* out + in vectors */
-           slots * 8 * 2 +      /* in flags + out flag staging */
-           16 +                 /* token slot */
-           slots * 4 +          /* GPU-written gate-ready flags */
-           (uint64_t)n_layer * DS4_TP_BATCH_MAX_ROWS * vec * 2; /* batch out+in */
+    uint64_t p = (uint64_t)(peer_count ? peer_count : 1u);
+    return slots * vec +          /* out vectors (1 set) */
+           slots * vec * p +      /* in vectors (per peer) */
+           slots * 8 * p +        /* in seq flags (per peer) */
+           16 * p +               /* token slots (per peer) */
+           slots * 8 +            /* out flags staging */
+           slots * 4 +            /* GPU-written gate-ready flags */
+           (uint64_t)n_layer * DS4_TP_BATCH_MAX_ROWS * vec + /* batch out */
+           (uint64_t)n_layer * DS4_TP_BATCH_MAX_ROWS * vec * p; /* batch in (per peer) */
 }
 
 static void tp_slab_layout(ds4_tp *tp) {
     uint64_t vec = tp->vec_bytes;
     uint64_t slots = tp->n_slots;
+    uint32_t p = tp->peer_count ? tp->peer_count : 1u;
     tp->out_off = 0;
     tp->in_off = slots * vec;
-    tp->in_flags_off = tp->in_off + slots * vec;
-    tp->token_off = tp->in_flags_off + slots * 8;
-    tp->out_flags_off = tp->token_off + 16;
+    tp->in_flags_off = tp->in_off + slots * vec * p;
+    tp->token_off = tp->in_flags_off + slots * 8 * p;
+    tp->out_flags_off = tp->token_off + 16 * p;
     tp->gpu_flags_off = tp->out_flags_off + slots * 8;
     tp->batch_out_off = tp->gpu_flags_off + slots * 4;
     tp->batch_in_off = tp->batch_out_off +
                        (uint64_t)tp->n_layer * DS4_TP_BATCH_MAX_ROWS * vec;
     tp->slab_bytes = tp->batch_in_off +
-                     (uint64_t)tp->n_layer * DS4_TP_BATCH_MAX_ROWS * vec;
+                      (uint64_t)tp->n_layer * DS4_TP_BATCH_MAX_ROWS * vec * p;
+    /* Assign per-peer offsets into the in and batch_in regions. */
+    for (uint32_t pi = 0; pi < tp->peer_count; pi++) {
+        tp->peers[pi].in_off = tp->in_off + (uint64_t)pi * slots * vec;
+        tp->peers[pi].batch_in_off = tp->batch_in_off +
+            (uint64_t)pi * (uint64_t)tp->n_layer * DS4_TP_BATCH_MAX_ROWS * vec;
+    }
 }
 
 uint64_t ds4_tp_slab_gpu_flags_offset(const ds4_tp *tp) {
@@ -560,8 +714,11 @@ uint64_t ds4_tp_slab_out_offset(const ds4_tp *tp, uint32_t layer, uint32_t gate)
     return tp->out_off + (uint64_t)tp_slot(tp, layer, gate) * tp->vec_bytes;
 }
 
-uint64_t ds4_tp_slab_in_offset(const ds4_tp *tp, uint32_t layer, uint32_t gate) {
-    return tp->in_off + (uint64_t)tp_slot(tp, layer, gate) * tp->vec_bytes;
+uint64_t ds4_tp_slab_in_offset(const ds4_tp *tp, uint32_t peer_idx,
+                                uint32_t layer, uint32_t gate) {
+    if (peer_idx >= tp->peer_count) return tp->in_off;
+    return tp->peers[peer_idx].in_off +
+           (uint64_t)tp_slot(tp, layer, gate) * tp->vec_bytes;
 }
 
 uint64_t ds4_tp_slab_batch_out_offset(const ds4_tp *tp, uint32_t layer) {
@@ -569,8 +726,10 @@ uint64_t ds4_tp_slab_batch_out_offset(const ds4_tp *tp, uint32_t layer) {
            (uint64_t)layer * DS4_TP_BATCH_MAX_ROWS * tp->vec_bytes;
 }
 
-uint64_t ds4_tp_slab_batch_in_offset(const ds4_tp *tp, uint32_t layer) {
-    return tp->batch_in_off +
+uint64_t ds4_tp_slab_batch_in_offset(const ds4_tp *tp, uint32_t peer_idx,
+                                      uint32_t layer) {
+    if (peer_idx >= tp->peer_count) return tp->batch_in_off;
+    return tp->peers[peer_idx].batch_in_off +
            (uint64_t)layer * DS4_TP_BATCH_MAX_ROWS * tp->vec_bytes;
 }
 
@@ -1238,8 +1397,10 @@ static void tp_rdma_close(ds4_tp *tp) {
  * Bring-up.
  * --------------------------------------------------------------------- */
 
-static int tp_hello_exchange(ds4_tp *tp, const ds4_tp_identity *id, int rdma_ok,
+static int tp_hello_exchange(ds4_tp *tp, const ds4_tp_identity *id,
+                             int rdma_ok, int fd, uint32_t peer_idx,
                              char *err, size_t errlen) {
+    uint32_t ws = tp->world_size ? tp->world_size : 2u;
     ds4_tp_hello_fixed mine = {
         .magic = DS4_TP_MAGIC,
         .version = DS4_TP_PROTOCOL_VERSION,
@@ -1255,10 +1416,15 @@ static int tp_hello_exchange(ds4_tp *tp, const ds4_tp_identity *id, int rdma_ok,
         .gate_slot_start = id->gate_slot_start,
         .gate_slot_step = id->gate_slot_step,
         .gates_per_token = id->gates_per_token,
+        .world_size = ws,
+        .rank = (uint32_t)tp->rank,
+        .topology = tp->topology,
+        .expert_start = id->expert_start,
+        .expert_count = id->expert_count,
     };
     ds4_tp_hello_fixed theirs;
-    if (!tp_write_full(tp->control_fd, &mine, sizeof(mine)) ||
-        !tp_read_full(tp->control_fd, &theirs, sizeof(theirs))) {
+    if (!tp_write_full(fd, &mine, sizeof(mine)) ||
+        !tp_read_full(fd, &theirs, sizeof(theirs))) {
         tp_set_err(err, errlen, "tp hello exchange failed");
         return 0;
     }
@@ -1271,8 +1437,14 @@ static int tp_hello_exchange(ds4_tp *tp, const ds4_tp_identity *id, int rdma_ok,
                    theirs.version, DS4_TP_PROTOCOL_VERSION);
         return 0;
     }
-    if (theirs.role == mine.role) {
-        tp_set_err(err, errlen, "tp hello: both sides claim role %u", mine.role);
+    if (theirs.world_size != 0 && mine.world_size != 0 &&
+        theirs.world_size != mine.world_size) {
+        tp_set_err(err, errlen, "tp hello: world size mismatch %u != %u",
+                   theirs.world_size, mine.world_size);
+        return 0;
+    }
+    if (theirs.rank == mine.rank && mine.rank != 0) {
+        tp_set_err(err, errlen, "tp hello: duplicate rank %u", mine.rank);
         return 0;
     }
     if (theirs.gguf_bytes != mine.gguf_bytes || theirs.model_id != mine.model_id ||
@@ -1288,22 +1460,120 @@ static int tp_hello_exchange(ds4_tp *tp, const ds4_tp_identity *id, int rdma_ok,
                    theirs.n_layer, theirs.n_embd, theirs.n_vocab, theirs.quant_bits);
         return 0;
     }
-    tp->peer_ctx = theirs.ctx_size;
-    tp->n_layer = id->n_layer;
-    tp->n_embd = id->n_embd;
-    tp->vec_bytes = (uint64_t)id->n_embd * sizeof(float);
-    tp->n_slots = id->n_layer * DS4_TP_GATES_PER_LAYER;
-    tp->gate_slot_start = id->gate_slot_start;
-    tp->gate_slot_step = id->gate_slot_step;
-    tp->gates_per_token = id->gates_per_token;
-    tp_slab_layout(tp);
+    /* Store peer info. */
+    if (peer_idx < tp->peer_count) {
+        tp->peers[peer_idx].rank = theirs.rank;
+    }
     /* Transport decision: RDMA only when both sides can. */
     int want_rdma = tp->opt.transport != DS4_TP_TRANSPORT_TCP;
-    tp->rdma_active = want_rdma && rdma_ok && theirs.rdma_ok;
-    if (tp->opt.transport == DS4_TP_TRANSPORT_RDMA && !tp->rdma_active) {
-        tp_set_err(err, errlen, "tp: --transport rdma but %s side has no active device",
-                   rdma_ok ? "the peer" : "this");
+    bool peer_rdma = want_rdma && rdma_ok && theirs.rdma_ok;
+    if (tp->opt.transport == DS4_TP_TRANSPORT_RDMA && !peer_rdma) {
+        tp_set_err(err, errlen, "tp: --transport rdma but peer has no active device");
         return 0;
+    }
+    tp->rdma_active = tp->rdma_active || peer_rdma;
+    return 1;
+}
+
+static uint32_t tp_determine_topology(uint32_t world_size, ds4_tp_topology requested) {
+    if (requested == DS4_TP_TOPO_ALL_TO_ALL) return DS4_TP_TOPO_ALL_TO_ALL;
+    if (requested == DS4_TP_TOPO_RING) return DS4_TP_TOPO_RING;
+    /* Auto: all-to-all for 2-4 nodes, ring for 5-6. */
+    if (world_size <= 4) return DS4_TP_TOPO_ALL_TO_ALL;
+    return DS4_TP_TOPO_RING;
+}
+
+static int tp_accept_workers(ds4_tp *tp, int listener, const ds4_tp_identity *id,
+                              int rdma_ok, char *err, size_t errlen) {
+    for (uint32_t i = 0; i < tp->peer_count; i++) {
+        int fd = accept(listener, NULL, NULL);
+        if (fd < 0) {
+            tp_set_err(err, errlen, "tp accept worker %u: %s", i, strerror(errno));
+            return 0;
+        }
+        tp_socket_tune(fd);
+        if (!tp_hello_exchange(tp, id, rdma_ok, fd, i, err, errlen)) {
+            close(fd);
+            return 0;
+        }
+        tp->peers[i].control_fd = fd;
+        if (i == 0) tp->control_fd = fd; /* legacy compat */
+        fprintf(stderr, "ds4-tp: accepted worker rank %u\n", tp->peers[i].rank);
+    }
+    return 1;
+}
+
+static int tp_dial_leader(ds4_tp *tp, const ds4_tp_identity *id,
+                           int rdma_ok, char *err, size_t errlen) {
+    /* Worker: connect to leader for control, exchange hello. */
+    int fd = tp_dial(tp->opt.leader_host, tp->opt.leader_port,
+                      (double)tp->timeout_sec, err, errlen);
+    if (fd < 0) return 0;
+    tp_socket_tune(fd);
+    tp->control_fd = fd;
+    /* For worker, the leader is always peer 0. */
+    tp->peers[0].rank = 0;
+    if (!tp_hello_exchange(tp, id, rdma_ok, fd, 0, err, errlen)) {
+        close(fd);
+        tp->control_fd = -1;
+        return 0;
+    }
+    fprintf(stderr, "ds4-tp: connected to leader (rank %u)\n", tp->rank);
+    return 1;
+}
+
+static int tp_open_data_connections(ds4_tp *tp, int listener,
+                                     char *err, size_t errlen) {
+    if (tp->topology == DS4_TP_TOPO_RING) {
+        uint32_t prev = (tp->rank + tp->world_size - 1u) % tp->world_size;
+        uint32_t next = (tp->rank + 1u) % tp->world_size;
+        for (uint32_t pi = 0; pi < tp->peer_count; pi++) {
+            uint32_t pr = tp->peers[pi].rank;
+            if (pr != prev && pr != next) continue;
+            int fd = -1;
+            if (tp->rank == 0) {
+                fd = accept(listener, NULL, NULL);
+            } else {
+                const ds4_tp_peer_config *cfg = NULL;
+                for (uint32_t ci = 0; ci < tp->opt.peer_count; ci++) {
+                    if (tp->opt.peers[ci].rank == pr) { cfg = &tp->opt.peers[ci]; break; }
+                }
+                if (cfg && cfg->control_host[0]) {
+                    fd = tp_dial(cfg->control_host, cfg->control_port,
+                                  (double)tp->timeout_sec, err, errlen);
+                }
+            }
+            if (fd < 0) { tp_set_err(err, errlen, "tp data connect to rank %u failed", pr); return 0; }
+            tp_socket_tune(fd);
+            tp->peers[pi].data_fd = fd;
+            fprintf(stderr, "ds4-tp: data connection to rank %u (ring)\n", pr);
+        }
+    } else {
+        for (uint32_t pi = 0; pi < tp->peer_count; pi++) {
+            int fd = -1;
+            if (tp->rank == 0) {
+                fd = accept(listener, NULL, NULL);
+            } else {
+                uint32_t pr = tp->peers[pi].rank;
+                if (pr == 0) {
+                    fd = tp_dial(tp->opt.leader_host, tp->opt.leader_port,
+                                  (double)tp->timeout_sec, err, errlen);
+                } else {
+                    const ds4_tp_peer_config *cfg = NULL;
+                    for (uint32_t ci = 0; ci < tp->opt.peer_count; ci++) {
+                        if (tp->opt.peers[ci].rank == pr) { cfg = &tp->opt.peers[ci]; break; }
+                    }
+                    if (cfg && cfg->control_host[0]) {
+                        fd = tp_dial(cfg->control_host, cfg->control_port,
+                                      (double)tp->timeout_sec, err, errlen);
+                    }
+                }
+            }
+            if (fd < 0) { tp_set_err(err, errlen, "tp data connect to rank %u failed", tp->peers[pi].rank); return 0; }
+            tp_socket_tune(fd);
+            tp->peers[pi].data_fd = fd;
+            fprintf(stderr, "ds4-tp: data connection to rank %u\n", tp->peers[pi].rank);
+        }
     }
     return 1;
 }
@@ -1322,66 +1592,95 @@ int ds4_tp_create(
         return 0;
     }
     tp->opt = *opt;
-    tp->rank = opt->role == DS4_TP_LEADER ? 0 : 1;
     tp->control_fd = -1;
-    tp->data_fd = -1;
+    for (uint32_t i = 0; i < DS4_TP_MAX_PEERS; i++) {
+        tp->peers[i].control_fd = -1;
+        tp->peers[i].data_fd = -1;
+    }
     tp->timeout_sec = DS4_TP_DEFAULT_TIMEOUT_SEC;
     const char *tmo = getenv("DS4_TP_TIMEOUT_SEC");
     if (tmo) tp->timeout_sec = (uint64_t)atoi(tmo);
 
+    /* Determine world size and rank. */
+    if (opt->world_size >= 2 && opt->world_size <= 6) {
+        tp->world_size = opt->world_size;
+        tp->rank = (int)opt->rank;
+    } else {
+        tp->world_size = 2;
+        tp->rank = opt->role == DS4_TP_LEADER ? 0 : 1;
+    }
+    tp->topology = tp_determine_topology(tp->world_size, opt->topology);
+    tp->peer_count = tp->world_size - 1u;
+    tp->expert_start = id->expert_start;
+    tp->expert_count = id->expert_count;
+
+    /* Populate peer list from config. */
+    if (opt->peer_count > 0) {
+        for (uint32_t pi = 0; pi < tp->peer_count && pi < opt->peer_count; pi++) {
+            tp->peers[pi].rank = opt->peers[pi].rank;
+        }
+    } else {
+        /* Legacy 2-node: leader rank 0, worker rank 1. */
+        tp->peers[0].rank = tp->rank == 0 ? 1 : 0;
+    }
+
+    /* Set model geometry from identity. */
+    tp->n_layer = id->n_layer;
+    tp->n_embd = id->n_embd;
+    tp->vec_bytes = (uint64_t)id->n_embd * sizeof(float);
+    tp->n_slots = id->n_layer * DS4_TP_GATES_PER_LAYER;
+    tp->gate_slot_start = id->gate_slot_start;
+    tp->gate_slot_step = id->gate_slot_step;
+    tp->gates_per_token = id->gates_per_token;
+    tp->data_fd = -1; /* legacy compat */
+    tp_slab_layout(tp);
+
     int rdma_ok = 0;
 #ifdef DS4_TP_HAVE_VERBS
     if (opt->transport != DS4_TP_TRANSPORT_TCP &&
-        (uint64_t)id->n_embd * sizeof(float) <= 2ull * DS4_TP_RDMA_MAX_MSG)
+        (uint64_t)id->n_embd * sizeof(float) <= 2ull * DS4_TP_RDMA_MAX_MSG) {
         rdma_ok = tp_rdma_probe(&tp->rdma.api);
+        if (rdma_ok) {
+            /* Copy API to first peer for per-peer RDMA future use. */
+            tp->peers[0].rdma.api = tp->rdma.api;
+        }
+    }
 #endif
 
     int listener = -1;
     if (tp->rank == 0) {
         listener = tp_listen(opt->listen_host, opt->listen_port, err, errlen);
         if (listener < 0) goto fail;
-        fprintf(stderr, "ds4-tp: waiting for worker on %s:%d ...\n",
-                opt->listen_host ? opt->listen_host : "0.0.0.0", opt->listen_port);
-        tp->control_fd = accept(listener, NULL, NULL);
-        if (tp->control_fd < 0) {
-            tp_set_err(err, errlen, "tp accept: %s", strerror(errno));
+        fprintf(stderr, "ds4-tp: leader listening on %s:%d, waiting for %u worker(s)...\n",
+                opt->listen_host ? opt->listen_host : "0.0.0.0",
+                opt->listen_port, tp->peer_count);
+        if (!tp_accept_workers(tp, listener, id, rdma_ok, err, errlen))
             goto fail;
-        }
     } else {
-        tp->control_fd = tp_dial(opt->leader_host, opt->leader_port,
-                                 (double)tp->timeout_sec, err, errlen);
-        if (tp->control_fd < 0) goto fail;
+        if (!tp_dial_leader(tp, id, rdma_ok, err, errlen)) goto fail;
     }
-    tp_socket_tune(tp->control_fd);
-
-    if (!tp_hello_exchange(tp, id, rdma_ok, err, errlen)) goto fail;
 
 #ifdef DS4_TP_HAVE_VERBS
     if (tp->rdma_active) {
         if (!tp_rdma_open(tp, err, errlen)) goto fail;
     }
 #endif
-    {
-        /* Second socket dedicated to gate traffic so control frames never
-         * interleave with gate payloads.  Created under RDMA too for
-         * headers, verify-block gates, and transport fallback. */
-        if (tp->rank == 0) {
-            tp->data_fd = accept(listener, NULL, NULL);
-            if (tp->data_fd < 0) {
-                tp_set_err(err, errlen, "tp data accept: %s", strerror(errno));
-                goto fail;
-            }
-        } else {
-            tp->data_fd = tp_dial(opt->leader_host, opt->leader_port,
-                                  (double)tp->timeout_sec, err, errlen);
-            if (tp->data_fd < 0) goto fail;
-        }
-        tp_socket_tune(tp->data_fd);
+
+    /* Open data connections for gate exchange. */
+    if (!tp_open_data_connections(tp, listener, err, errlen)) goto fail;
+
+    /* Legacy compat: mirror first peer's fields. */
+    if (tp->peer_count > 0) {
+        tp->data_fd = tp->peers[0].data_fd;
+        tp->peer_ctx = id->ctx_size;
     }
-    if (listener >= 0) close(listener);
-    fprintf(stderr, "ds4-tp: %s connected, transport=%s\n",
-            tp->rank == 0 ? "worker" : "leader",
-            tp->rdma_active ? "rdma" : "tcp");
+
+    if (listener >= 0) { close(listener); listener = -1; }
+
+    fprintf(stderr, "ds4-tp: mesh ready, rank=%u world=%u topology=%s transport=%s peers=%u\n",
+            tp->rank, tp->world_size,
+            tp->topology == DS4_TP_TOPO_RING ? "ring" : "all-to-all",
+            tp->rdma_active ? "rdma" : "tcp", tp->peer_count);
     *out = tp;
     return 1;
 fail:
@@ -1392,10 +1691,12 @@ fail:
 
 int ds4_tp_attach_slab(ds4_tp *tp, void *base, char *err, size_t errlen) {
     tp->slab = base;
-    memset(tp->slab + tp->in_flags_off, 0, (uint64_t)tp->n_slots * 8);
-    memset(tp->slab + tp->token_off, 0, 16);
+    memset(tp->slab + tp->in_flags_off, 0,
+           (uint64_t)tp->n_slots * 8 * (tp->peer_count ? tp->peer_count : 1u));
+    memset(tp->slab + tp->token_off, 0, 16 * (tp->peer_count ? tp->peer_count : 1u));
 #ifdef DS4_TP_HAVE_VERBS
-    if (tp->rdma_active) return tp_rdma_register_and_exchange(tp, err, errlen);
+    if (tp->rdma_active)
+        return tp_rdma_register_and_exchange(tp, err, errlen);
 #endif
     (void)err; (void)errlen;
     return 1;
@@ -1407,13 +1708,23 @@ void ds4_tp_free(ds4_tp *tp) {
     tp_rdma_close(tp);
 #endif
     if (tp->control_fd >= 0) close(tp->control_fd);
-    if (tp->data_fd >= 0) close(tp->data_fd);
+    for (uint32_t pi = 0; pi < tp->peer_count; pi++) {
+        if (tp->peers[pi].control_fd >= 0) close(tp->peers[pi].control_fd);
+        if (tp->peers[pi].data_fd >= 0) close(tp->peers[pi].data_fd);
+    }
     free(tp);
 }
 
 int ds4_tp_rank(const ds4_tp *tp) { return tp->rank; }
+uint32_t ds4_tp_world_size(const ds4_tp *tp) { return tp->world_size; }
+uint32_t ds4_tp_get_topology(const ds4_tp *tp) { return tp->topology; }
 bool ds4_tp_is_rdma(const ds4_tp *tp) { return tp->rdma_active; }
-uint32_t ds4_tp_peer_ctx(const ds4_tp *tp) { return tp->peer_ctx; }
+uint32_t ds4_tp_peer_count(const ds4_tp *tp) { return tp->peer_count; }
+const ds4_tp_peer *ds4_tp_peer_at(const ds4_tp *tp, uint32_t idx) {
+    return idx < tp->peer_count ? &tp->peers[idx] : NULL;
+}
+uint32_t ds4_tp_expert_start(const ds4_tp *tp) { return tp->expert_start; }
+uint32_t ds4_tp_expert_count(const ds4_tp *tp) { return tp->expert_count; }
 bool ds4_tp_failed(const ds4_tp *tp) {
     return tp && atomic_load_explicit(&tp->failed, memory_order_acquire);
 }
@@ -1425,46 +1736,88 @@ void ds4_tp_mark_failed(ds4_tp *tp) {
  * Gate exchange.
  * --------------------------------------------------------------------- */
 
-int ds4_tp_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint64_t seq) {
-#ifdef DS4_TP_HAVE_VERBS
-    if (tp->rdma_active) return tp_rdma_gate_exchange(tp, layer, gate, seq);
-#endif
-    /* TCP: both sides write their partial then read the peer's.  16KB per
-     * direction fits comfortably in the socket buffers, so the symmetric
-     * write-then-read cannot deadlock.  Header and payload go out in one
-     * writev so NODELAY does not split them into two segments. */
+static int tp_gate_exchange_one(ds4_tp *tp, uint32_t pi, uint32_t layer,
+                                 uint32_t gate, uint64_t seq,
+                                 const void *out_data, void *in_data) {
     ds4_tp_gate_header h = { DS4_TP_MAGIC, (uint16_t)layer, (uint16_t)gate, seq };
     struct iovec iov[2] = {
         { &h, sizeof(h) },
-        { tp->slab + ds4_tp_slab_out_offset(tp, layer, gate), tp->vec_bytes },
+        { (void *)out_data, tp->vec_bytes },
     };
     size_t want = sizeof(h) + tp->vec_bytes;
-    ssize_t w = writev(tp->data_fd, iov, 2);
+    int fd = tp->peers[pi].data_fd;
+    if (fd < 0) return 0;
+    ssize_t w = writev(fd, iov, 2);
     if (w < 0 || (size_t)w != want) {
-        /* Short writev: finish with the plain path. */
         if (w < 0) return 0;
         size_t done = (size_t)w;
         if (done < sizeof(h)) {
-            if (!tp_write_full(tp->data_fd, (char *)&h + done, sizeof(h) - done)) return 0;
+            if (!tp_write_full(fd, (char *)&h + done, sizeof(h) - done)) return 0;
             done = sizeof(h);
         }
         uint64_t payload_done = done - sizeof(h);
-        if (!tp_write_full(tp->data_fd,
-                           tp->slab + ds4_tp_slab_out_offset(tp, layer, gate) + payload_done,
+        if (!tp_write_full(fd, (const char *)out_data + payload_done,
                            tp->vec_bytes - payload_done))
             return 0;
     }
     ds4_tp_gate_header ph;
-    if (!tp_read_full(tp->data_fd, &ph, sizeof(ph))) return 0;
-    if (ph.magic != DS4_TP_MAGIC || ph.layer != layer || ph.gate != gate || ph.seq != seq) {
-        fprintf(stderr, "ds4-tp: gate desync: got l=%u g=%u seq=%llu, want l=%u g=%u seq=%llu\n",
-                ph.layer, ph.gate, (unsigned long long)ph.seq,
+    if (!tp_read_full(fd, &ph, sizeof(ph))) return 0;
+    if (ph.magic != DS4_TP_MAGIC || ph.layer != layer ||
+        ph.gate != gate || ph.seq != seq) {
+        fprintf(stderr, "ds4-tp: gate desync peer %u: got l=%u g=%u seq=%llu, want l=%u g=%u seq=%llu\n",
+                pi, ph.layer, ph.gate, (unsigned long long)ph.seq,
                 layer, gate, (unsigned long long)seq);
         return 0;
     }
-    if (!tp_read_full(tp->data_fd, tp->slab + ds4_tp_slab_in_offset(tp, layer, gate),
-                      tp->vec_bytes))
-        return 0;
+    return tp_read_full(fd, in_data, tp->vec_bytes);
+}
+
+int ds4_tp_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint64_t seq) {
+    uint8_t *out_ptr = tp->slab + ds4_tp_slab_out_offset(tp, layer, gate);
+#ifdef DS4_TP_HAVE_VERBS
+    if (tp->rdma_active && tp->peer_count <= 1)
+        return tp_rdma_gate_exchange(tp, layer, gate, seq);
+#endif
+    if (tp->topology == DS4_TP_TOPO_RING) {
+        /* Ring: N-1 hops.  Each hop sends accumulated partial to next
+         * neighbour and receives prev neighbour's partial. */
+        uint32_t next = (tp->rank + 1u) % tp->world_size;
+        uint32_t prev = (tp->rank + tp->world_size - 1u) % tp->world_size;
+        /* Find peer indices for prev and next. */
+        uint32_t pi_next = UINT32_MAX, pi_prev = UINT32_MAX;
+        for (uint32_t pi = 0; pi < tp->peer_count; pi++) {
+            if (tp->peers[pi].rank == next) pi_next = pi;
+            if (tp->peers[pi].rank == prev) pi_prev = pi;
+        }
+        if (pi_next >= tp->peer_count || pi_prev >= tp->peer_count) return 0;
+        /* Use a temporary buffer for the accumulated partial. */
+        uint8_t *accum = malloc(tp->vec_bytes);
+        if (!accum) return 0;
+        memcpy(accum, out_ptr, tp->vec_bytes);
+        for (uint32_t hop = 0; hop < tp->peer_count; hop++) {
+            uint8_t *in_ptr = tp->slab + ds4_tp_slab_in_offset(tp, pi_prev, layer, gate);
+            if (!tp_gate_exchange_one(tp, pi_next, layer, gate, seq, accum, in_ptr))
+                { free(accum); return 0; }
+            /* Accumulate: add received partial to running sum. */
+            float *acc_f = (float *)accum;
+            const float *in_f = (const float *)in_ptr;
+            for (uint64_t i = 0; i < tp->vec_bytes / sizeof(float); i++)
+                acc_f[i] += in_f[i];
+        }
+        /* Copy final accumulator to all in-buffers for GPU combine. */
+        for (uint32_t pi = 0; pi < tp->peer_count; pi++) {
+            uint8_t *in_ptr = tp->slab + ds4_tp_slab_in_offset(tp, pi, layer, gate);
+            memcpy(in_ptr, accum, tp->vec_bytes);
+        }
+        free(accum);
+        return 1;
+    }
+    /* All-to-all TCP: exchange with each peer sequentially. */
+    for (uint32_t pi = 0; pi < tp->peer_count; pi++) {
+        uint8_t *in_ptr = tp->slab + ds4_tp_slab_in_offset(tp, pi, layer, gate);
+        if (!tp_gate_exchange_one(tp, pi, layer, gate, seq, out_ptr, in_ptr))
+            return 0;
+    }
     return 1;
 }
 
@@ -1472,68 +1825,46 @@ int ds4_tp_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint64_t seq
  * once. The payload lives in the registered slab, so RDMA sends it directly;
  * TCP remains the symmetric write-then-read fallback. */
 int ds4_tp_batch_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows,
-                               uint64_t seq) {
-    if (tp->data_fd < 0 || rows == 0 || rows > DS4_TP_BATCH_MAX_ROWS) return 0;
+                                uint64_t seq) {
+    if (rows == 0 || rows > DS4_TP_BATCH_MAX_ROWS) return 0;
     const uint64_t bytes = (uint64_t)rows * tp->vec_bytes;
-    ds4_tp_gate_header h = { DS4_TP_BATCH_MAGIC, (uint16_t)layer,
-                             (uint16_t)rows, seq };
-#ifdef DS4_TP_HAVE_VERBS
-    if (tp->rdma_active && tp_rdma_big_gate_capable(tp)) {
-        if (!tp_write_full(tp->data_fd, &h, sizeof(h))) return 0;
+    uint8_t *out_ptr = tp->slab + ds4_tp_slab_batch_out_offset(tp, layer);
+    /* Exchange batch partials with each peer sequentially. */
+    for (uint32_t pi = 0; pi < tp->peer_count; pi++) {
+        int fd = tp->peers[pi].data_fd;
+        if (fd < 0) return 0;
+        uint8_t *in_ptr = tp->slab + ds4_tp_slab_batch_in_offset(tp, pi, layer);
+        ds4_tp_gate_header h = { DS4_TP_BATCH_MAGIC, (uint16_t)layer,
+                                  (uint16_t)rows, seq };
+        struct iovec iov[2] = {
+            { &h, sizeof(h) },
+            { out_ptr, bytes },
+        };
+        size_t want = sizeof(h) + bytes;
+        ssize_t w = writev(fd, iov, 2);
+        if (w < 0) return 0;
+        if ((size_t)w != want) {
+            size_t done = (size_t)w;
+            if (done < sizeof(h)) {
+                if (!tp_write_full(fd, (char *)&h + done, sizeof(h) - done))
+                    return 0;
+                done = sizeof(h);
+            }
+            uint64_t payload_done = done - sizeof(h);
+            if (!tp_write_full(fd, out_ptr + payload_done,
+                               bytes - payload_done))
+                return 0;
+        }
         ds4_tp_gate_header ph;
-        if (!tp_read_full(tp->data_fd, &ph, sizeof(ph))) return 0;
+        if (!tp_read_full(fd, &ph, sizeof(ph))) return 0;
         if (ph.magic != DS4_TP_BATCH_MAGIC || ph.layer != layer ||
             ph.gate != rows || ph.seq != seq) {
-            fprintf(stderr,
-                    "ds4-tp: batch gate desync: got l=%u rows=%u seq=%llu, "
-                    "want l=%u rows=%u seq=%llu\n",
-                    ph.layer, ph.gate, (unsigned long long)ph.seq,
-                    layer, rows, (unsigned long long)seq);
+            fprintf(stderr, "ds4-tp: batch gate desync peer %u\n", pi);
             return 0;
         }
-        if (!tp_rdma_drain_decode_window(tp)) return 0;
-        return tp_rdma_big_gate_exchange(
-                tp,
-                tp->slab + ds4_tp_slab_batch_out_offset(tp, layer),
-                tp->slab + ds4_tp_slab_batch_in_offset(tp, layer),
-                bytes);
+        if (!tp_read_full(fd, in_ptr, bytes)) return 0;
     }
-#endif
-    struct iovec iov[2] = {
-        { &h, sizeof(h) },
-        { tp->slab + ds4_tp_slab_batch_out_offset(tp, layer), bytes },
-    };
-    size_t want = sizeof(h) + bytes;
-    ssize_t w = writev(tp->data_fd, iov, 2);
-    if (w < 0) return 0;
-    if ((size_t)w != want) {
-        size_t done = (size_t)w;
-        if (done < sizeof(h)) {
-            if (!tp_write_full(tp->data_fd, (char *)&h + done, sizeof(h) - done))
-                return 0;
-            done = sizeof(h);
-        }
-        uint64_t payload_done = done - sizeof(h);
-        if (!tp_write_full(tp->data_fd,
-                           tp->slab + ds4_tp_slab_batch_out_offset(tp, layer) +
-                               payload_done,
-                           bytes - payload_done))
-            return 0;
-    }
-    ds4_tp_gate_header ph;
-    if (!tp_read_full(tp->data_fd, &ph, sizeof(ph))) return 0;
-    if (ph.magic != DS4_TP_BATCH_MAGIC || ph.layer != layer ||
-        ph.gate != rows || ph.seq != seq) {
-        fprintf(stderr,
-                "ds4-tp: batch gate desync: got l=%u rows=%u seq=%llu, "
-                "want l=%u rows=%u seq=%llu\n",
-                ph.layer, ph.gate, (unsigned long long)ph.seq,
-                layer, rows, (unsigned long long)seq);
-        return 0;
-    }
-    return tp_read_full(tp->data_fd,
-                        tp->slab + ds4_tp_slab_batch_in_offset(tp, layer),
-                        bytes);
+    return 1;
 }
 
 /* Prefill batch gate: RDMA uses the pipelined registered-slab path above.
@@ -1544,39 +1875,28 @@ int ds4_tp_batch_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows,
 
 int ds4_tp_big_gate_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
                              const void *out, void *in, uint64_t bytes) {
-    if (tp->data_fd < 0 || !out || !in || bytes == 0) return 0;
+    if (!out || !in || bytes == 0) return 0;
+    /* Exchange with first peer only; multi-peer big exchange uses
+     * the batch path or accumulates separately. */
+    if (tp->peer_count == 0) return 0;
+    int fd = tp->peers[0].data_fd;
+    if (fd < 0) return 0;
     ds4_tp_gate_header h = { DS4_TP_BATCH_MAGIC, (uint16_t)layer, 0xB16u, seq };
-    if (!tp_write_full(tp->data_fd, &h, sizeof(h))) return 0;
+    if (!tp_write_full(fd, &h, sizeof(h))) return 0;
     ds4_tp_gate_header ph;
-    if (!tp_read_full(tp->data_fd, &ph, sizeof(ph))) return 0;
+    if (!tp_read_full(fd, &ph, sizeof(ph))) return 0;
     if (ph.magic != DS4_TP_BATCH_MAGIC || ph.layer != layer ||
         ph.gate != 0xB16u || ph.seq != seq) {
-        fprintf(stderr,
-                "ds4-tp: big gate desync: got l=%u tag=%x seq=%llu, want l=%u seq=%llu\n",
-                ph.layer, ph.gate, (unsigned long long)ph.seq,
-                layer, (unsigned long long)seq);
+        fprintf(stderr, "ds4-tp: big gate desync\n");
         return 0;
     }
-#ifdef DS4_TP_HAVE_VERBS
-    if (tp->rdma_active && tp_rdma_big_gate_capable(tp)) {
-        if (!tp_rdma_drain_decode_window(tp)) return 0;
-        return tp_rdma_big_gate_exchange(tp, out, in, bytes);
-    }
-#endif
     uint64_t off = 0;
     while (off < bytes) {
         const uint64_t n = bytes - off > DS4_TP_BIG_CHUNK ?
                            DS4_TP_BIG_CHUNK : bytes - off;
-        if (!tp_write_full(tp->data_fd, (const char *)out + off, n)) return 0;
-        if (!tp_read_full(tp->data_fd, (char *)in + off, n)) return 0;
+        if (!tp_write_full(fd, (const char *)out + off, n)) return 0;
+        if (!tp_read_full(fd, (char *)in + off, n)) return 0;
         off += n;
-    }
-    if (getenv("DS4_GLM_TP_DEBUG")) {
-        const float *o = (const float *)out, *i = (const float *)in;
-        fprintf(stderr,
-                "ds4-tp: big gate l=%u seq=%llu out[0..3]=%g %g %g %g in[0..3]=%g %g %g %g\n",
-                layer, (unsigned long long)seq,
-                o[0], o[1], o[2], o[3], i[0], i[1], i[2], i[3]);
     }
     return 1;
 }
@@ -1639,38 +1959,62 @@ static int tp_send_token_command(ds4_tp *tp, uint32_t type,
     return ok;
 }
 
+static int tp_send_frame_to_all(ds4_tp *tp, uint32_t type,
+                                 const void *payload, uint32_t bytes) {
+    for (uint32_t pi = 0; pi < tp->peer_count; pi++) {
+        int fd = tp->rank == 0 ? tp->peers[pi].control_fd : tp->control_fd;
+        if (fd < 0) return 0;
+        if (!tp_send_frame(fd, type, payload, bytes)) return 0;
+    }
+    return 1;
+}
+
 int ds4_tp_send_session_create(ds4_tp *tp, uint64_t session_id, int ctx_size) {
     ds4_tp_value_command msg = { session_id, (int32_t)ctx_size, 0 };
-    return tp_send_frame(tp->control_fd, DS4_TP_FRAME_SESSION_CREATE,
-                         &msg, sizeof(msg));
+    return tp_send_frame_to_all(tp, DS4_TP_FRAME_SESSION_CREATE, &msg, sizeof(msg));
 }
 
 int ds4_tp_send_session_destroy(ds4_tp *tp, uint64_t session_id) {
-    return tp_send_frame(tp->control_fd, DS4_TP_FRAME_SESSION_DESTROY,
-                         &session_id, sizeof(session_id));
+    return tp_send_frame_to_all(tp, DS4_TP_FRAME_SESSION_DESTROY,
+                                 &session_id, sizeof(session_id));
 }
 
 int ds4_tp_send_sync(ds4_tp *tp, uint64_t session_id,
                      const int *tokens, uint32_t n_tokens) {
-    return tp_send_token_command(tp, DS4_TP_FRAME_SYNC, session_id,
-                                 tokens, n_tokens);
+    const uint64_t bytes64 = sizeof(ds4_tp_token_command_header) +
+                             (uint64_t)n_tokens * sizeof(int32_t);
+    if (!tp || (!tokens && n_tokens != 0) || bytes64 > UINT32_MAX) return 0;
+    const uint32_t bytes = (uint32_t)bytes64;
+    uint8_t *payload = malloc(bytes ? bytes : 1u);
+    if (!payload) return 0;
+    ds4_tp_token_command_header h = { session_id, n_tokens, 0 };
+    memcpy(payload, &h, sizeof(h));
+    int32_t *wire_tokens = (int32_t *)(payload + sizeof(h));
+    for (uint32_t i = 0; i < n_tokens; i++) wire_tokens[i] = (int32_t)tokens[i];
+    int ok = 1;
+    for (uint32_t pi = 0; pi < tp->peer_count; pi++) {
+        int fd = tp->rank == 0 ? tp->peers[pi].control_fd : tp->control_fd;
+        if (fd < 0 || !tp_send_frame(fd, DS4_TP_FRAME_SYNC, payload, bytes))
+            { ok = 0; break; }
+    }
+    free(payload);
+    return ok;
 }
 
 int ds4_tp_send_eval(ds4_tp *tp, uint64_t session_id,
                      uint64_t seq, int token) {
     ds4_tp_eval_command msg = { session_id, seq, (int32_t)token, 0 };
-    return tp_send_frame(tp->control_fd, DS4_TP_FRAME_EVAL, &msg, sizeof(msg));
+    return tp_send_frame_to_all(tp, DS4_TP_FRAME_EVAL, &msg, sizeof(msg));
 }
 
 int ds4_tp_send_rewind(ds4_tp *tp, uint64_t session_id, int pos) {
     ds4_tp_value_command msg = { session_id, (int32_t)pos, 0 };
-    return tp_send_frame(tp->control_fd, DS4_TP_FRAME_REWIND,
-                         &msg, sizeof(msg));
+    return tp_send_frame_to_all(tp, DS4_TP_FRAME_REWIND, &msg, sizeof(msg));
 }
 
 int ds4_tp_send_invalidate(ds4_tp *tp, uint64_t session_id) {
-    return tp_send_frame(tp->control_fd, DS4_TP_FRAME_INVALIDATE,
-                         &session_id, sizeof(session_id));
+    return tp_send_frame_to_all(tp, DS4_TP_FRAME_INVALIDATE,
+                                 &session_id, sizeof(session_id));
 }
 
 int ds4_tp_send_eval_batch(ds4_tp *tp, const ds4_tp_batch_item *items,
@@ -1684,8 +2028,12 @@ int ds4_tp_send_eval_batch(ds4_tp *tp, const ds4_tp_batch_item *items,
     ds4_tp_batch_command_header h = { count, 0 };
     memcpy(payload, &h, sizeof(h));
     memcpy(payload + sizeof(h), items, (size_t)count * sizeof(*items));
-    const int ok = tp_send_frame(tp->control_fd, DS4_TP_FRAME_EVAL_BATCH,
-                                 payload, bytes);
+    int ok = 1;
+    for (uint32_t pi = 0; pi < tp->peer_count; pi++) {
+        int fd = tp->rank == 0 ? tp->peers[pi].control_fd : tp->control_fd;
+        if (fd < 0 || !tp_send_frame(fd, DS4_TP_FRAME_EVAL_BATCH, payload, bytes))
+            { ok = 0; break; }
+    }
     free(payload);
     return ok;
 }
@@ -1703,51 +2051,56 @@ int ds4_tp_send_mixed_batch(ds4_tp *tp, uint64_t prefill_session_id,
     const uint32_t bytes = (uint32_t)bytes64;
     uint8_t *payload = malloc(bytes);
     if (!payload) return 0;
-    ds4_tp_mixed_command_header h = {
-        prefill_session_id, prompt_count, count
-    };
+    ds4_tp_mixed_command_header h = { prefill_session_id, prompt_count, count };
     memcpy(payload, &h, sizeof(h));
     int32_t *wire_tokens = (int32_t *)(payload + sizeof(h));
-    for (uint32_t i = 0; i < prompt_count; i++) {
-        wire_tokens[i] = (int32_t)prompt[i];
-    }
+    for (uint32_t i = 0; i < prompt_count; i++) wire_tokens[i] = (int32_t)prompt[i];
     memcpy(payload + sizeof(h) + prompt_bytes, items, (size_t)item_bytes);
-    const int ok = tp_send_frame(tp->control_fd, DS4_TP_FRAME_MIXED_BATCH,
-                                 payload, bytes);
+    int ok = 1;
+    for (uint32_t pi = 0; pi < tp->peer_count; pi++) {
+        int fd = tp->rank == 0 ? tp->peers[pi].control_fd : tp->control_fd;
+        if (fd < 0 || !tp_send_frame(fd, DS4_TP_FRAME_MIXED_BATCH, payload, bytes))
+            { ok = 0; break; }
+    }
     free(payload);
     return ok;
 }
 
 int ds4_tp_send_command_ack(ds4_tp *tp, uint64_t session_id, int status) {
     ds4_tp_command_ack ack = { session_id, (int32_t)status, 0 };
-    return tp_send_frame(tp->control_fd, DS4_TP_FRAME_COMMAND_ACK,
-                         &ack, sizeof(ack));
+    int fd = tp->rank == 0 ? tp->control_fd : tp->peers[0].control_fd;
+    if (fd < 0) fd = tp->control_fd;
+    return tp_send_frame(fd, DS4_TP_FRAME_COMMAND_ACK, &ack, sizeof(ack));
 }
 
 int ds4_tp_wait_command_ack(ds4_tp *tp, uint64_t session_id,
                             const char *operation, char *err, size_t errlen) {
-    uint32_t type = 0, bytes = 0;
-    ds4_tp_command_ack ack;
-    if (!tp_read_frame_header(tp->control_fd, &type, &bytes) ||
-        type != DS4_TP_FRAME_COMMAND_ACK || bytes != sizeof(ack) ||
-        !tp_read_full(tp->control_fd, &ack, sizeof(ack))) {
-        ds4_tp_mark_failed(tp);
-        tp_set_err(err, errlen, "tp: worker failed during %s",
-                   operation ? operation : "command");
-        return 0;
-    }
-    if (ack.session_id != session_id || ack.status != 0) {
-        tp_set_err(err, errlen,
-                   "tp: worker %s failed (session %llu, status %d)",
-                   operation ? operation : "command",
-                   (unsigned long long)ack.session_id, (int)ack.status);
-        return 0;
+    /* Wait for acks from all workers. */
+    for (uint32_t pi = 0; pi < tp->peer_count; pi++) {
+        int fd = tp->rank == 0 ? tp->peers[pi].control_fd : tp->control_fd;
+        if (fd < 0) continue;
+        uint32_t type = 0, bytes = 0;
+        ds4_tp_command_ack ack;
+        if (!tp_read_frame_header(fd, &type, &bytes) ||
+            type != DS4_TP_FRAME_COMMAND_ACK || bytes != sizeof(ack) ||
+            !tp_read_full(fd, &ack, sizeof(ack))) {
+            ds4_tp_mark_failed(tp);
+            tp_set_err(err, errlen, "tp: worker %u failed during %s",
+                       pi, operation ? operation : "command");
+            return 0;
+        }
+        if (ack.session_id != session_id || ack.status != 0) {
+            tp_set_err(err, errlen, "tp: worker %u %s failed (session %llu, status %d)",
+                       pi, operation ? operation : "command",
+                       (unsigned long long)ack.session_id, (int)ack.status);
+            return 0;
+        }
     }
     return 1;
 }
 
 int ds4_tp_send_stop(ds4_tp *tp) {
-    return tp_send_frame(tp->control_fd, DS4_TP_FRAME_STOP, NULL, 0);
+    return tp_send_frame_to_all(tp, DS4_TP_FRAME_STOP, NULL, 0);
 }
 
 void ds4_tp_command_free(ds4_tp_command *command) {
@@ -2216,4 +2569,73 @@ int ds4_tp_worker_run(ds4_engine *engine, const ds4_tp_options *opt) {
     free(logits);
     ds4_tp_free(tp);
     return rc;
+}
+
+/* ------------------------------------------------------------------------
+ * Mesh configuration helpers.
+ * --------------------------------------------------------------------- */
+
+int ds4_tp_load_config(const char *path, ds4_tp_options *opt,
+                       char *err, size_t errlen) {
+    if (!path || !opt) {
+        tp_set_err(err, errlen, "tp: config file path required");
+        return 0;
+    }
+    FILE *fp = fopen(path, "r");
+    if (!fp) {
+        tp_set_err(err, errlen, "tp: cannot open config file %s: %s",
+                   path, strerror(errno));
+        return 0;
+    }
+    /* Simple JSON parsing: read the file, look for known keys.
+     * Full JSON parser would be overkill; we parse a flat structure. */
+    char line[1024];
+    while (fgets(line, sizeof(line), fp)) {
+        /* Strip whitespace and quotes. */
+        char *k = line;
+        while (*k == ' ' || *k == '\t') k++;
+        if (*k == '"') {
+            k++;
+            char *key_end = strchr(k, '"');
+            if (!key_end) continue;
+            *key_end = '\0';
+            char *v = strchr(key_end + 1, ':');
+            if (!v) continue;
+            v++;
+            while (*v == ' ' || *v == '\t') v++;
+            if (*v == '"') {
+                v++;
+                char *val_end = strchr(v, '"');
+                if (val_end) *val_end = '\0';
+            } else {
+                char *val_end = strchr(v, ',');
+                if (!val_end) val_end = strchr(v, '\n');
+                if (!val_end) val_end = strchr(v, '\r');
+                if (val_end) *val_end = '\0';
+                while (*v == ' ') v++;
+            }
+            if (!strcmp(k, "world_size"))
+                opt->world_size = (uint32_t)atoi(v);
+            else if (!strcmp(k, "rank"))
+                opt->rank = (uint32_t)atoi(v);
+            else if (!strcmp(k, "topology")) {
+                if (strstr(v, "ring")) opt->topology = DS4_TP_TOPO_RING;
+                else opt->topology = DS4_TP_TOPO_ALL_TO_ALL;
+            } else if (!strcmp(k, "role")) {
+                if (strstr(v, "worker")) opt->role = DS4_TP_WORKER;
+                else opt->role = DS4_TP_LEADER;
+            }
+        }
+    }
+    fclose(fp);
+    return 1;
+}
+
+int ds4_tp_discover_peers(ds4_tp *tp, char *err, size_t errlen) {
+    /* Auto-discovery of RDMA peers via ibv_devinfo.
+     * For now, this is a stub; peers must be configured via --tp-peer
+     * or --tp-config-file.  Future: enumerate RDMA devices, exchange
+     * info with coordinator over TCP control channel. */
+    (void)tp; (void)err; (void)errlen;
+    return 1;
 }

@@ -110,10 +110,29 @@ typedef enum {
     DS4_TP_TRANSPORT_TCP,
 } ds4_tp_transport;
 
+typedef enum {
+    DS4_TP_TOPO_AUTO = 0,
+    DS4_TP_TOPO_ALL_TO_ALL,
+    DS4_TP_TOPO_RING,
+} ds4_tp_topology;
+
+#define DS4_TP_MAX_PEERS 5
+#define DS4_TP_HOST_STRLEN 64
+
+typedef struct {
+    uint32_t rank;
+    char control_host[DS4_TP_HOST_STRLEN];
+    int control_port;
+    char rdma_host[DS4_TP_HOST_STRLEN];
+    char rdma_device[64];
+    int rdma_gid_index;
+    bool rdma_gid_index_set;
+} ds4_tp_peer_config;
+
 typedef struct {
     ds4_tp_role role;
     bool requested;             /* --tensor-parallel with shared role options */
-    const char *listen_host;    /* leader listens here for the worker */
+    const char *listen_host;    /* leader listens here for workers */
     int listen_port;
     const char *leader_host;    /* worker dials the leader */
     int leader_port;
@@ -123,6 +142,12 @@ typedef struct {
     bool rdma_gid_index_set;
     bool glm_token_prefill;
     int debug_hash;             /* cross-check hidden state every N tokens */
+    uint32_t world_size;        /* 0=legacy 2-node, 2-6=explicit mesh */
+    uint32_t rank;              /* 0..world_size-1 */
+    ds4_tp_topology topology;   /* ALL_TO_ALL or RING */
+    const char *config_file;    /* JSON config for mesh peers */
+    ds4_tp_peer_config peers[DS4_TP_MAX_PEERS];
+    uint32_t peer_count;
 } ds4_tp_options;
 
 typedef struct {
