@@ -13296,19 +13296,19 @@ static server_config parse_options(int argc, char **argv) {
     if (c.engine.directional_steering_file && !directional_steering_scale_set) {
         c.engine.directional_steering_ffn = 1.0f;
     }
+    char tp_err[256];
+    if (!ds4_tp_adopt_distributed_options(&c.engine.tp,
+                                          &c.engine.distributed,
+                                          tp_err, sizeof(tp_err))) {
+        server_log(DS4_LOG_DEFAULT, "ds4-server: %s", tp_err);
+        exit(2);
+    }
     char dist_err[256];
     if (ds4_dist_prepare_engine_options(&c.engine.distributed,
                                         &c.engine,
                                         dist_err,
                                         sizeof(dist_err)) != 0) {
         server_log(DS4_LOG_DEFAULT, "ds4-server: %s", dist_err);
-        exit(2);
-    }
-    char tp_err[256];
-    if (!ds4_tp_adopt_distributed_options(&c.engine.tp,
-                                          &c.engine.distributed,
-                                          tp_err, sizeof(tp_err))) {
-        server_log(DS4_LOG_DEFAULT, "ds4-server: %s", tp_err);
         exit(2);
     }
     if (!ds4_tp_validate_engine_options(&c.engine, tp_err, sizeof(tp_err))) {
