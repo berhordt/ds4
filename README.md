@@ -655,21 +655,27 @@ on the Thunderbolt member interface, not the bridge address:
 ```sh
 MODEL=gguf/GLM-5.2-UD-IQ2_XXS_RoutedIQ2XXS_blk78Q2K.gguf
 
-# Machine B: worker.
+# Machine B: worker.  The worker still runs the ds4 CLI.
 ./ds4 -m "$MODEL" --tensor-parallel --role worker \
   --coordinator 10.99.0.2 9911 --transport rdma
 
-# Machine A: coordinator.
+# Machine A: coordinator/head node.  Either the ds4 CLI (prompt queries)
+# or the ds4-server API server can own the frontend.
 ./ds4 -m "$MODEL" --tensor-parallel --role coordinator \
   --listen 10.99.0.2 9911 --transport rdma -c 8192 \
   -p "Tell me something about the sea."
+./ds4-server -m "$MODEL" --tensor-parallel --role coordinator \
+  --listen 10.99.0.2 9911 --transport rdma -c 8192 --port 8000
 ```
 
 The active verbs device and IPv4-mapped GID are selected automatically. If that
 is ambiguous, add `--rdma-device rdma_en6 --rdma-gid-index 1` on the worker and
 the matching `rdma_en1` flags on the coordinator. Use `--transport tcp` on both
-sides to force TCP. Tensor parallel roles are currently exposed by the `ds4`
-CLI, not by `ds4-server` or `ds4-agent`.
+sides to force TCP. The ds4-server head node mirrors every resident session
+sync/eval to the worker and serves the OpenAI/Anthropic API normally; batched
+sessions work too. The disk KV cache is not available in this mode: a disk
+cache restore rewrites the leader's local KV without a matching worker update,
+so `--kv-disk-dir` is rejected when tensor parallelism is enabled.
 
 Startup takes about 9 seconds per machine: each rank pre-faults its
 ~100 GiB shard from SSD and pins it through a Metal residency set.

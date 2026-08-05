@@ -465,6 +465,8 @@ static void print_examples(FILE *fp, const help_colors *c, ds4_help_tool tool, c
     if (topic_is(topic, "distributed")) {
         opt(fp, c, "worker", "./ds4 --role worker --layers 21:output --coordinator 192.168.0.181 9000 -m ds4flash.gguf");
         opt(fp, c, "coordinator", "./ds4 --role coordinator --layers 0:20 --listen 0.0.0.0 9000 -p \"Hello\" -m ds4flash.gguf");
+        opt(fp, c, "TP worker", "./ds4 --tensor-parallel --role worker --coordinator 10.99.0.2 9911 --transport rdma -m ds4flash.gguf");
+        opt(fp, c, "TP server", "./ds4-server --tensor-parallel --role coordinator --listen 10.99.0.2 9911 --transport rdma -m ds4flash.gguf");
     } else if (topic_is(topic, "runtime")) {
         if (tool == DS4_HELP_SERVER) {
             opt(fp, c, "Metal API", "./ds4-server -m ds4flash.gguf --metal --ctx 100000");

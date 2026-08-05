@@ -338,6 +338,11 @@ substitute for this matrix.
   kernels. Also test a Q4-routed GLM file as a negative gate: until Q4 ownership
   kernels are implemented, both ranks must reject it clearly before evaluation
   rather than loading a partial split or hanging.
+- Run the same TP pair with `ds4-server` on the head node (`--role coordinator`,
+  `--listen`) and the ds4 CLI as the worker. Exercise OpenAI chat, Responses, and
+  Anthropic requests over HTTP, including SSE, and confirm a clean server
+  shutdown sends STOP so the worker exits. `--kv-disk-dir` must be rejected in
+  this mode.
 - With explicit permission for the current QA pass, run one resident GLM Q2
   prompt, a long-context prompt, integrated GLM MTP, and concurrent server
   requests on the eight-GPU CUDA host. Use ordinary eight-GPU layer placement

@@ -1,5 +1,6 @@
 #include "ds4.h"
 #include "ds4_distributed.h"
+#include "ds4_tp.h"
 #include "ds4_gpu_args.h"
 #include "ds4_help.h"
 #include "ds4_kvstore.h"
@@ -12835,6 +12836,23 @@ static server_config parse_options(int argc, char **argv) {
         }
         if (dist_parse == DS4_DIST_CLI_MATCHED) continue;
 
+        char tp_parse_err[256] = {0};
+        ds4_tp_cli_parse_result tp_parse =
+            ds4_tp_parse_cli_arg(arg,
+                                  &i,
+                                  argc,
+                                  argv,
+                                  &c.engine.tp,
+                                  tp_parse_err,
+                                  sizeof(tp_parse_err));
+        if (tp_parse == DS4_TP_CLI_ERROR) {
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: %s",
+                       tp_parse_err[0] ? tp_parse_err : "invalid tensor-parallel option");
+            exit(2);
+        }
+        if (tp_parse == DS4_TP_CLI_MATCHED) continue;
+
         if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.engine.model_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp")) {
@@ -12994,12 +13012,35 @@ static server_config parse_options(int argc, char **argv) {
     if (c.engine.directional_steering_file && !directional_steering_scale_set) {
         c.engine.directional_steering_ffn = 1.0f;
     }
+    char tp_err[256];
+    if (!ds4_tp_adopt_distributed_options(&c.engine.tp,
+                                          &c.engine.distributed,
+                                          tp_err,
+                                          sizeof(tp_err))) {
+        server_log(DS4_LOG_DEFAULT, "ds4-server: %s", tp_err);
+        exit(2);
+    }
+    if (c.engine.tp.role != DS4_TP_NONE && c.kv_disk_dir) {
+        /* The worker must stay in lockstep with the leader.  A disk cache
+         * restore rewrites the leader's local KV without a matching worker
+         * update, so the next sync would force a full worker re-prefill and
+         * negate the cache.  Reject the combination instead of silently
+         * degrading it. */
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: tensor parallelism does not support --kv-disk-dir "
+                   "(the worker cannot mirror disk cache restores)");
+        exit(2);
+    }
     char dist_err[256];
     if (ds4_dist_prepare_engine_options(&c.engine.distributed,
                                         &c.engine,
                                         dist_err,
                                         sizeof(dist_err)) != 0) {
         server_log(DS4_LOG_DEFAULT, "ds4-server: %s", dist_err);
+        exit(2);
+    }
+    if (!ds4_tp_validate_engine_options(&c.engine, tp_err, sizeof(tp_err))) {
+        server_log(DS4_LOG_DEFAULT, "ds4-server: %s", tp_err);
         exit(2);
     }
     return c;
@@ -13072,6 +13113,40 @@ int main(int argc, char **argv) {
         }
     } else if (ds4_engine_open(&engine, &cfg.engine) != 0) {
         return 1;
+    }
+
+    if (cfg.engine.tp.role == DS4_TP_WORKER) {
+        int rc = ds4_tp_worker_run(engine, &cfg.engine.tp);
+        ds4_engine_close(engine);
+        return rc;
+    }
+    ds4_tp *tp_leader = NULL;
+    if (cfg.engine.tp.role == DS4_TP_LEADER) {
+        char tp_err[256] = "";
+        ds4_tp_identity tp_id = {
+            .gguf_bytes = ds4_engine_model_bytes(engine),
+            .model_id = (uint32_t)ds4_engine_model_id(engine),
+            .n_layer = (uint32_t)ds4_engine_layer_count(engine),
+            .n_embd = (uint32_t)ds4_engine_embd_dim(engine),
+            .n_vocab = (uint32_t)ds4_engine_vocab_size(engine),
+            .quant_bits = (uint32_t)ds4_engine_routed_quant_bits(engine),
+            .ctx_size = (uint32_t)cfg.ctx_size,
+        };
+        ds4_engine_tp_gate_schedule(engine,
+                                    &tp_id.gate_slot_start,
+                                    &tp_id.gate_slot_step,
+                                    &tp_id.gates_per_token);
+        if (!ds4_tp_create(&tp_leader, &cfg.engine.tp, &tp_id,
+                           tp_err, sizeof(tp_err)) ||
+            !ds4_engine_tp_bind(engine, tp_leader, tp_err, sizeof(tp_err))) {
+            server_log(DS4_LOG_DEFAULT, "ds4-server: %s", tp_err);
+            ds4_tp_free(tp_leader);
+            ds4_engine_close(engine);
+            return 1;
+        }
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: tensor-parallel leader connected; the worker mirrors %s sessions",
+                   cfg.batched_sessions > 0 ? "batched" : "single");
     }
 
     if (cfg.engine.distributed.role == DS4_DISTRIBUTED_WORKER) {
@@ -13281,6 +13356,8 @@ int main(int argc, char **argv) {
         kv_cache_store_current(&s, slot, "shutdown");
     }
     server_close_resources(&s);
+    if (tp_leader) ds4_tp_send_stop(tp_leader);
+    ds4_tp_free(tp_leader);
     return 0;
 }
 #else
@@ -13340,6 +13417,48 @@ static void test_mixed_prefill_quantum_option(void) {
     TEST_ASSERT(server_prefill_quantum_for(&s, true) == 2048);
     s.mixed_prefill_quantum = defaults.mixed_prefill_quantum;
     TEST_ASSERT(server_prefill_quantum_for(&s, true) == 128);
+}
+
+static void test_tensor_parallel_option_parsing(void) {
+    /* The server adopts the distributed --role/--listen/--coordinator
+     * addresses for a 50/50 tensor-parallel pair, exactly like the ds4 CLI. */
+    char *leader_argv[] = {
+        "ds4-server", "--metal",
+        "--tensor-parallel", "--role", "coordinator",
+        "--listen", "0.0.0.0", "9911",
+        "--transport", "rdma",
+    };
+    server_config leader = parse_options(10, leader_argv);
+    TEST_ASSERT(leader.engine.tp.role == DS4_TP_LEADER);
+    TEST_ASSERT(leader.engine.tp.transport == DS4_TP_TRANSPORT_RDMA);
+    TEST_ASSERT(leader.engine.tp.listen_host);
+    TEST_ASSERT(strcmp(leader.engine.tp.listen_host, "0.0.0.0") == 0);
+    TEST_ASSERT(leader.engine.tp.listen_port == 9911);
+    TEST_ASSERT(leader.engine.distributed.role == DS4_DISTRIBUTED_NONE);
+
+    char *worker_argv[] = {
+        "ds4-server", "--metal",
+        "--tensor-parallel", "--role", "worker",
+        "--coordinator", "10.99.0.2", "9911",
+    };
+    server_config worker = parse_options(8, worker_argv);
+    TEST_ASSERT(worker.engine.tp.role == DS4_TP_WORKER);
+    TEST_ASSERT(worker.engine.tp.transport == DS4_TP_TRANSPORT_AUTO);
+    TEST_ASSERT(worker.engine.tp.leader_host);
+    TEST_ASSERT(strcmp(worker.engine.tp.leader_host, "10.99.0.2") == 0);
+    TEST_ASSERT(worker.engine.tp.leader_port == 9911);
+    TEST_ASSERT(worker.engine.distributed.role == DS4_DISTRIBUTED_NONE);
+
+    char *tcp_argv[] = {
+        "ds4-server", "--metal",
+        "--tensor-parallel", "--role", "worker",
+        "--coordinator", "10.99.0.2", "9911",
+        "--transport", "tcp",
+    };
+    server_config tcp = parse_options(10, tcp_argv);
+    TEST_ASSERT(tcp.engine.tp.role == DS4_TP_WORKER);
+    TEST_ASSERT(tcp.engine.tp.transport == DS4_TP_TRANSPORT_TCP);
+    TEST_ASSERT(tcp.engine.tp.leader_port == 9911);
 }
 
 static void test_batched_live_continuation_slot_binding(void) {
@@ -17780,6 +17899,7 @@ static void test_thinking_canonical_non_thinking_mode_noop(void) {
 static void ds4_server_unit_tests_run(void) {
     test_batched_prefill_round_robin();
     test_mixed_prefill_quantum_option();
+    test_tensor_parallel_option_parsing();
     test_batched_live_continuation_slot_binding();
     test_request_defaults_use_min_p_filtering();
     test_reasoning_effort_mapping();
