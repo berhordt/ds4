@@ -13461,6 +13461,76 @@ static void test_tensor_parallel_option_parsing(void) {
     TEST_ASSERT(tcp.engine.tp.leader_port == 9911);
 }
 
+static void test_tp_mesh_topology(void) {
+    /* Link math for a fully connected world-4 mesh: link i of node r
+     * connects to peer (r+i+1) % world. */
+    TEST_ASSERT(tp_link_peer(0, 0, 4) == 1);
+    TEST_ASSERT(tp_link_peer(0, 2, 4) == 3);
+    TEST_ASSERT(tp_link_peer(3, 2, 4) == 2);
+    TEST_ASSERT(tp_link_to(0, 2, 4) == 1);   /* node 0 link 1 -> node 2 */
+    TEST_ASSERT(tp_link_to(2, 0, 4) == 1);   /* node 2 link 1 -> node 0 */
+    TEST_ASSERT(tp_link_to(1, 3, 4) == 1);   /* node 1 link 1 -> node 3 */
+    TEST_ASSERT(tp_link_to(3, 1, 4) == 1);   /* node 3 link 1 -> node 1 */
+    TEST_ASSERT(tp_link_from(1, 0, 4) == 2); /* node 1 link 2 -> node 0 */
+    TEST_ASSERT(tp_link_from(2, 0, 4) == 1);
+    TEST_ASSERT(tp_link_from(3, 0, 4) == 0);
+    TEST_ASSERT(tp_link_from(2, 1, 4) == 2);
+
+    /* A world-4 slab is larger than the world-2 one (per-peer in regions
+     * plus the combined slot). */
+    const uint64_t s2 = ds4_tp_slab_bytes(43, 6144, 2);
+    const uint64_t s4 = ds4_tp_slab_bytes(43, 6144, 4);
+    TEST_ASSERT(s4 > s2);
+
+    const char *path = "/tmp/ds4_tp_mesh_test.txt";
+    FILE *fp = fopen(path, "w");
+    TEST_ASSERT(fp != NULL);
+    fprintf(fp, "# test mesh\nworld 4\n");
+    fprintf(fp, "node 0 10.99.0.2 9911 10.99.1.2 9911 10.99.2.2 9911\n");
+    fprintf(fp, "node 1 10.99.0.1 9911 10.99.3.1 9911 10.99.4.1 9911\n");
+    fprintf(fp, "node 2 10.99.0.1 9912 10.99.3.2 9911 10.99.5.1 9911\n");
+    fprintf(fp, "node 3 10.99.0.1 9913 10.99.4.1 9912 10.99.5.2 9911\n");
+    fclose(fp);
+
+    ds4_tp_topology topo;
+    char terr[256] = "";
+    TEST_ASSERT(ds4_tp_topology_load(path, &topo, terr, sizeof(terr)));
+    TEST_ASSERT(topo.world == 4);
+    TEST_ASSERT(topo.node[0].host[0] &&
+                !strcmp(topo.node[0].host[0], "10.99.0.2"));
+    TEST_ASSERT(topo.node[0].port[2] == 9911);
+    TEST_ASSERT(topo.node[3].host[0] &&
+                !strcmp(topo.node[3].host[0], "10.99.0.1"));
+    TEST_ASSERT(topo.node[3].port[2] == 9911);
+    ds4_tp_topology_free(&topo);
+
+    /* Mesh CLI parsing: --tp-topology replaces --listen/--coordinator and
+     * --tp-rank selects this node's worker rank. */
+    char *mesh_argv[] = {
+        "ds4-server", "--metal",
+        "--tensor-parallel", "--role", "worker",
+        "--tp-topology", (char *)path,
+        "--tp-rank", "2",
+    };
+    server_config mesh = parse_options(9, mesh_argv);
+    TEST_ASSERT(mesh.engine.tp.role == DS4_TP_WORKER);
+    TEST_ASSERT(mesh.engine.tp.topology_path);
+    TEST_ASSERT(strcmp(mesh.engine.tp.topology_path, path) == 0);
+    TEST_ASSERT(mesh.engine.tp.rank == 2);
+    TEST_ASSERT(mesh.engine.tp.world == 0); /* resolved at create time */
+    TEST_ASSERT(mesh.engine.distributed.role == DS4_DISTRIBUTED_NONE);
+
+    /* A topology missing a node must fail to parse. */
+    fp = fopen(path, "w");
+    TEST_ASSERT(fp != NULL);
+    fprintf(fp, "world 4\nnode 0 10.0.0.1 9000 10.0.0.2 9000 10.0.0.3 9000\n");
+    fclose(fp);
+    memset(&topo, 0, sizeof(topo));
+    TEST_ASSERT(!ds4_tp_topology_load(path, &topo, terr, sizeof(terr)));
+
+    remove(path);
+}
+
 static void test_batched_live_continuation_slot_binding(void) {
     server s = {0};
     server_slot slots[3] = {0};
@@ -17900,6 +17970,7 @@ static void ds4_server_unit_tests_run(void) {
     test_batched_prefill_round_robin();
     test_mixed_prefill_quantum_option();
     test_tensor_parallel_option_parsing();
+    test_tp_mesh_topology();
     test_batched_live_continuation_slot_binding();
     test_request_defaults_use_min_p_filtering();
     test_reasoning_effort_mapping();

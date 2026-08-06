@@ -343,6 +343,11 @@ substitute for this matrix.
   Anthropic requests over HTTP, including SSE, and confirm a clean server
   shutdown sends STOP so the worker exits. `--kv-disk-dir` must be rejected in
   this mode.
+- Run a four-node fully connected mesh (ds4-server rank 0, three ds4 workers)
+  with `--tp-topology mesh.txt --tp-rank N` over both TCP and RDMA. Verify the
+  per-link bring-up, the all-reduce decode gates, vocab-chunk logits merge, and
+  DSpark verify fan-out produce byte-identical output across ranks. A GLM GGUF
+  must be rejected for world > 2.
 - With explicit permission for the current QA pass, run one resident GLM Q2
   prompt, a long-context prompt, integrated GLM MTP, and concurrent server
   requests on the eight-GPU CUDA host. Use ordinary eight-GPU layer placement

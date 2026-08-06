@@ -232,9 +232,9 @@ void ds4_gpu_print_memory_report(const char *label);
  * construction.  The exchange callback runs on the service thread and must
  * return nonzero on success. */
 typedef int (*ds4_gpu_tp_exchange_fn)(void *ud, uint32_t layer, uint32_t gate, uint64_t seq);
-/* Bind one rank of the two-way split. slab is the transport slab tensor and
- * gpu_flags_off is the offset of its GPU-written gate-ready flag words. */
-int ds4_gpu_tp_init(uint32_t rank,
+/* Bind one rank of the world-way split. slab is the transport slab tensor
+ * and gpu_flags_off is the offset of its GPU-written gate-ready flag words. */
+int ds4_gpu_tp_init(uint32_t rank, uint32_t world,
                     ds4_gpu_tensor *slab, uint64_t gpu_flags_off,
                     ds4_gpu_tp_exchange_fn fn, void *ud);
 void ds4_gpu_tp_shutdown(void);

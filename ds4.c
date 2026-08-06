@@ -15261,8 +15261,10 @@ typedef struct {
     uint32_t tp_rank;
     ds4_gpu_tensor **tp_out;
     ds4_gpu_tensor **tp_in;
+    ds4_gpu_tensor **tp_combined;       /* canonical sum for world>2 */
     ds4_gpu_tensor **tp_batch_out;
     ds4_gpu_tensor **tp_batch_in;
+    ds4_gpu_tensor **tp_batch_combined;
     uint32_t tp_batch_rows;
     ds4_gpu_tensor *tp_zero;
     ds4_gpu_tensor *tp_logits_half;
@@ -16344,8 +16346,11 @@ static bool metal_graph_ensure_ffn_out(ds4_gpu_graph *g) {
 static bool metal_graph_ensure_batch_ffn_out_on(ds4_gpu_graph *g, int t) {
     if (t < 0 || t >= DS4_MAX_GPUS) return false;
     if (!g->batch_ffn_out_by_tier[t]) {
+        /* world>2: the big gate stages every peer's partial in this buffer,
+         * so it must hold (world-1) full prefill rows. */
+        const uint64_t ways = g->tp_world > 1 ? (uint64_t)g->tp_world - 1 : 1;
         g->batch_ffn_out_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(
-                t, (uint64_t)g->prefill_cap * DS4_N_EMBD * sizeof(float));
+                t, ways * (uint64_t)g->prefill_cap * DS4_N_EMBD * sizeof(float));
     }
     return g->batch_ffn_out_by_tier[t] != NULL;
 }
@@ -21832,9 +21837,9 @@ static bool metal_graph_encode_decode_layer_phase(
     const int cuda_tp_home_tier = g->active_tier;
     const int cuda_tp_partner_tier = g->cuda_tp_decode
         ? metal_graph_cuda_tp_partner_tier(cuda_tp_home_tier) : -1;
-    const bool tp_split_attn = g->tp_world == 2;
+    const bool tp_split_attn = g->tp_world > 1;
     const uint32_t tp_heads = tp_split_attn ?
-        (uint32_t)DS4_N_HEAD / 2u : (uint32_t)DS4_N_HEAD;
+        (uint32_t)DS4_N_HEAD / g->tp_world : (uint32_t)DS4_N_HEAD;
     const uint32_t tp_head0 = tp_split_attn ? g->tp_rank * tp_heads : 0;
 
     bool ok = true;
@@ -23027,11 +23032,11 @@ static bool metal_graph_encode_decode_layer_phase(
                                                         DS4_N_EMBD,
                                                         DS4_N_HC) != 0;
         }
-    } else if (ok && g->tp_world == 2) {
-        /* Group-sliced attention output: this rank computes its half of the
+    } else if (ok && g->tp_world > 1) {
+        /* Group-sliced attention output: this rank computes its share of the
          * output groups and the matching k-window of the expand projection,
          * leaving a partial block output in the gate slot. */
-        const uint32_t tp_groups = n_groups / 2;
+        const uint32_t tp_groups = n_groups / g->tp_world;
         ok = metal_graph_attention_output_dense_quant_tp(
                 g->tp_out[il * DS4_TP_GATES_PER_LAYER + DS4_TP_GATE_ATTN],
                 metal_graph_attn_low(g),
@@ -23045,7 +23050,7 @@ static bool metal_graph_encode_decode_layer_phase(
                 DS4_N_EMBD,
                 metal_graph_heads(g));
     } else if (ok && layer->attn_output_a->type != DS4_TENSOR_Q8_0) {
-        ds4_gpu_tensor *attn_out_dst = g->tp_world == 2 ?
+        ds4_gpu_tensor *attn_out_dst = g->tp_world > 1 ?
                 g->tp_out[il * DS4_TP_GATES_PER_LAYER + DS4_TP_GATE_ATTN] : metal_graph_attn_out(g);
         ok = metal_graph_attention_output_dense_quant_low(metal_graph_attn_low(g),
                                                           g,
@@ -23064,7 +23069,7 @@ static bool metal_graph_encode_decode_layer_phase(
                                                            metal_graph_attn_low(g),
                                                            1);
     } else if (ok) {
-        ds4_gpu_tensor *attn_out_dst = g->tp_world == 2 ?
+        ds4_gpu_tensor *attn_out_dst = g->tp_world > 1 ?
                 g->tp_out[il * DS4_TP_GATES_PER_LAYER + DS4_TP_GATE_ATTN] : metal_graph_attn_out(g);
         ok = ds4_gpu_attention_output_q8_batch_tensor(attn_out_dst,
                                                         metal_graph_attn_low(g),
@@ -23078,23 +23083,34 @@ static bool metal_graph_encode_decode_layer_phase(
                                                         n_groups, DS4_N_EMBD,
                                                         metal_graph_heads(g), 1) != 0;
     }
-    if (ok && g->tp_world == 2) {
-        /* Gate ATTN: exchange the attention block output with the peer and
-         * rebuild the canonical sum (rank0 first, then rank1) in attn_out
-         * on both ranks — identical expression on both machines keeps them
-         * bit-exact. */
+    if (ok && g->tp_world > 1) {
+        /* Gate ATTN: exchange the attention block output and rebuild the
+         * canonical rank-order sum.  World 2 keeps the GPU out+in combine
+         * with the rank-order swap; world>2 reads the transport's combined
+         * slot (the CPU exchange folded the canonical sum). */
         const uint32_t slot = il * DS4_TP_GATES_PER_LAYER + DS4_TP_GATE_ATTN;
         ok = ds4_gpu_tp_gate_encode(il, DS4_TP_GATE_ATTN) != 0;
         if (ok) {
-            ds4_gpu_tensor *first = g->tp_rank == 0 ? g->tp_out[slot] : g->tp_in[slot];
-            if (metal_graph_directional_steering_attn_enabled(g)) {
-                ds4_gpu_tensor *second = g->tp_rank == 0 ? g->tp_in[slot] : g->tp_out[slot];
-                ok = ds4_gpu_add_tensor(metal_graph_attn_out(g), first, second, DS4_N_EMBD) != 0;
+            if (g->tp_world == 2) {
+                ds4_gpu_tensor *first = g->tp_rank == 0 ? g->tp_out[slot] : g->tp_in[slot];
+                if (metal_graph_directional_steering_attn_enabled(g)) {
+                    ds4_gpu_tensor *second = g->tp_rank == 0 ? g->tp_in[slot] : g->tp_out[slot];
+                    ok = ds4_gpu_add_tensor(metal_graph_attn_out(g), first, second, DS4_N_EMBD) != 0;
+                } else {
+                    /* Combine folded into the HC expand below; attn_out is
+                     * not materialized on this path. */
+                    tp_attn_a = first;
+                    tp_attn_b = g->tp_rank == 0 ? g->tp_in[slot] : g->tp_out[slot];
+                }
             } else {
-                /* Combine folded into the HC expand below; attn_out is not
-                 * materialized on this path. */
-                tp_attn_a = first;
-                tp_attn_b = g->tp_rank == 0 ? g->tp_in[slot] : g->tp_out[slot];
+                ds4_gpu_tensor *first = g->tp_combined[slot];
+                if (metal_graph_directional_steering_attn_enabled(g)) {
+                    ok = ds4_gpu_add_tensor(metal_graph_attn_out(g), first, g->tp_zero,
+                                            DS4_N_EMBD) != 0;
+                } else {
+                    tp_attn_a = first;
+                    tp_attn_b = g->tp_zero;
+                }
             }
         }
     }
@@ -23676,7 +23692,7 @@ static bool metal_graph_encode_decode_layer_phase(
     }
     /* Real TP split slices the shared expert by intermediate lanes, which
      * needs the unfused gate/up/swiglu/down sequence. */
-    const bool tp_split_shared = g->tp_world == 2;
+    const bool tp_split_shared = g->tp_world > 1;
     const bool q4_selected_shared_overlap =
         metal_graph_use_q4_selected_shared_overlap(g) &&
         metal_graph_decode_q4_selected_slots_expected(g,
@@ -24354,14 +24370,13 @@ static bool metal_graph_encode_decode_layer_phase(
                 false) != 0;
         DS4_METAL_PROFILE_DECODE_STAGE("routed_moe_folded");
     }
-    ds4_gpu_tensor *tp_ffn_a = NULL;    /* rank0/rank1 partials consumed */
-    ds4_gpu_tensor *tp_ffn_b = NULL;    /* directly by the HC expand */
-    if (ok && g->tp_world == 2) {
+    ds4_gpu_tensor *tp_ffn_a = NULL;    /* rank partials consumed by HC expand */
+    ds4_gpu_tensor *tp_ffn_b = NULL;
+    if (ok && g->tp_world > 1) {
         /* Gate FFN: local partial = shared expert + owned routed experts.
-         * The HC expand below already sums two block vectors, so after the
-         * exchange the two rank partials feed it directly (canonical rank
-         * order) with no separate combine dispatch.  The paths that need
-         * the materialized sum (ffn_out consumers) still builds it in
+         * The HC expand below sums the block vectors, so after the exchange
+         * the canonical rank-order result feeds it directly.  The paths
+         * that need the materialized sum (ffn_out consumers) build it in
          * routed_out. */
         const uint32_t tp_slot = il * DS4_TP_GATES_PER_LAYER + DS4_TP_GATE_FFN;
         if (!tp_fold_ffn) {
@@ -24370,8 +24385,14 @@ static bool metal_graph_encode_decode_layer_phase(
         }
         if (ok) ok = ds4_gpu_tp_gate_encode(il, DS4_TP_GATE_FFN) != 0;
         if (ok) {
-            ds4_gpu_tensor *first = g->tp_rank == 0 ? g->tp_out[tp_slot] : g->tp_in[tp_slot];
-            ds4_gpu_tensor *second = g->tp_rank == 0 ? g->tp_in[tp_slot] : g->tp_out[tp_slot];
+            ds4_gpu_tensor *first, *second;
+            if (g->tp_world == 2) {
+                first = g->tp_rank == 0 ? g->tp_out[tp_slot] : g->tp_in[tp_slot];
+                second = g->tp_rank == 0 ? g->tp_in[tp_slot] : g->tp_out[tp_slot];
+            } else {
+                first = g->tp_combined[tp_slot];
+                second = g->tp_zero;
+            }
             if (keep_ffn_out || metal_graph_directional_steering_ffn_enabled(g)) {
                 ok = ds4_gpu_add_tensor(metal_graph_routed_out(g), first, second, DS4_N_EMBD) != 0;
             } else {
@@ -24383,7 +24404,7 @@ static bool metal_graph_encode_decode_layer_phase(
     if (ok && keep_ffn_out) {
         ok = metal_graph_ensure_ffn_out(g) &&
              ds4_gpu_add_tensor(metal_graph_ffn_out(g),
-                                g->tp_world == 2 ? g->tp_zero : metal_graph_shared_out(g),
+                                g->tp_world > 1 ? g->tp_zero : metal_graph_shared_out(g),
                                 metal_graph_routed_out(g), DS4_N_EMBD) != 0;
     }
     if (ok && keep_ffn_out) {
@@ -24404,7 +24425,7 @@ static bool metal_graph_encode_decode_layer_phase(
         ok = ds4_gpu_hc_expand_add_split_tensor(metal_graph_after_ffn_hc(g),
                                                   tp_ffn_a ? tp_ffn_a : metal_graph_routed_out(g),
                                                   tp_ffn_a ? tp_ffn_b :
-                                                  (g->tp_world == 2 ? g->tp_zero : metal_graph_shared_out(g)),
+                                                  (g->tp_world > 1 ? g->tp_zero : metal_graph_shared_out(g)),
                                                   metal_graph_after_attn_hc(g),
                                                   metal_graph_hc_split(g),
                                                   DS4_N_EMBD,
@@ -24537,12 +24558,12 @@ static bool metal_graph_encode_output_head(
     if (ok) {
         metal_graph_debug_dump_tensor("result_norm", metal_graph_output_norm(g), DS4_N_EMBD, DS4_N_LAYER, 0);
     }
-    if (ok && g->tp_world == 2 && g->tp_logits_half) {
-        /* Vocab-split: this rank computes its half of the head rows into
-         * its logits view; the halves are bit-identical to the full head
-         * (same kernel, same rows) and the worker ships its half to the
-         * leader after the eval. */
-        const uint64_t tp_vhalf = vocab_dim / 2u;
+    if (ok && g->tp_world > 1 && g->tp_logits_half) {
+        /* Vocab-split: this rank computes its share of the head rows into
+         * its logits view; the chunks are bit-identical to the full head
+         * (same kernel, same rows) and the workers ship their chunks to
+         * the leader after the eval. */
+        const uint64_t tp_vchunk = vocab_dim / g->tp_world;
         uint64_t head_row_bytes = 0;
         ok = metal_graph_dense_quant_row_bytes(weights->output,
                                                DS4_N_EMBD,
@@ -24551,9 +24572,9 @@ static bool metal_graph_encode_output_head(
                                                         model,
                                                         weights->output,
                                                         weights->output->abs_offset +
-                                                            (uint64_t)g->tp_rank * tp_vhalf * head_row_bytes,
+                                                            (uint64_t)g->tp_rank * tp_vchunk * head_row_bytes,
                                                         DS4_N_EMBD,
-                                                        tp_vhalf,
+                                                        tp_vchunk,
                                                         metal_graph_output_norm(g),
                                                         1);
     } else if (ok && g->cuda_tp_ep && g->cuda_tp_output) {
@@ -26593,7 +26614,7 @@ static bool metal_graph_encode_token_raw_swa(
         return false;
     }
     /* Under the vocab split both ranks materialize their logits half. */
-    if (g->tp_world == 2 && g->tp_rank == 1 &&
+    if (g->tp_world > 1 && g->tp_rank != 0 &&
         !g->tp_logits_half) need_logits = false;
     const uint32_t raw_row = pos % g->raw_cap;
     const uint32_t n_raw = metal_graph_raw_span_for_batch(g, pos, 1);
@@ -26643,7 +26664,7 @@ static bool metal_graph_encode_token_raw_swa(
          * blocked at an earlier gate, making the transport consume a slab
          * slot before its payload is ready. Keep each TP token in one command
          * buffer; non-TP decode retains the encode/execute overlap. */
-        if (ok && allow_split_flush && g->tp_world != 2 &&
+        if (ok && allow_split_flush && g->tp_world <= 1 &&
             split_after_layers != 0 && il + 1u == split_after_layers) {
             ok = ds4_gpu_flush_commands() != 0;
         }
@@ -27211,6 +27232,9 @@ static bool metal_graph_encode_layer_attention_batch(
         !(ratio == 4 && tp_attn_n_comp > DS4_N_INDEXER_TOP_K);
     const bool tp_attn_indexed = zero_prefix && ratio == 4 &&
         tp_attn_n_comp > DS4_N_INDEXER_TOP_K;
+    /* The prefill attention row split is a world-2 optimization (two
+     * contiguous row halves swapped over the big gate).  world>2 keeps the
+     * attention replicated and only the routed FFN is split. */
     const bool tp_row_split_attn =
         g->tp_world == 2 &&
         g->tp_batch_rows != n_tokens &&
@@ -29270,8 +29294,10 @@ static bool metal_graph_encode_layer_ffn_batch(
      * against its local expert half.  For large chunks the replicated shared
      * expert remains row-split; its rows are folded into the local routed
      * partial before the one all-reduce-style bulk exchange. */
-    const bool tp_split_ffn = g->tp_world == 2;
+    const bool tp_split_ffn = g->tp_world > 1;
+    /* The FFN prefill row split is world-2 only (like the attention one). */
     const bool tp_row_split_ffn =
+        g->tp_world == 2 &&
         tp_split_ffn && g->tp_batch_rows != n_tokens && !keep_ffn_out &&
         !metal_graph_directional_steering_ffn_enabled(g) &&
         n_tokens >= metal_graph_tp_prefill_split_min();
@@ -29362,7 +29388,7 @@ static bool metal_graph_encode_layer_ffn_batch(
 
     const bool tp_split_batch_moe =
         g->tp_batch_rows == n_tokens && n_tokens > 0 &&
-        g->tp_world == 2 &&
+        g->tp_world > 1 &&
         g->tp_batch_out && g->tp_batch_in;
     const bool cuda_tp_owned_batch_moe =
         g->cuda_tp_ep && g->cuda_tp_prefill_ffn;
@@ -29515,12 +29541,22 @@ static bool metal_graph_encode_layer_ffn_batch(
                                         metal_graph_batch_ffn_out(g),
                                         bytes) != 0;
         if (ok) {
-            ds4_gpu_tensor *first = g->tp_rank == 0 ?
-                metal_graph_batch_routed_out(g) : metal_graph_batch_ffn_out(g);
-            ds4_gpu_tensor *second = g->tp_rank == 0 ?
-                metal_graph_batch_ffn_out(g) : metal_graph_batch_routed_out(g);
-            ok = ds4_gpu_add_tensor(metal_graph_batch_routed_out(g), first, second,
-                                    (uint32_t)((uint64_t)n_tokens * DS4_N_EMBD)) != 0;
+            if (g->tp_world == 2) {
+                ds4_gpu_tensor *first = g->tp_rank == 0 ?
+                    metal_graph_batch_routed_out(g) : metal_graph_batch_ffn_out(g);
+                ds4_gpu_tensor *second = g->tp_rank == 0 ?
+                    metal_graph_batch_ffn_out(g) : metal_graph_batch_routed_out(g);
+                ok = ds4_gpu_add_tensor(metal_graph_batch_routed_out(g), first, second,
+                                        (uint32_t)((uint64_t)n_tokens * DS4_N_EMBD)) != 0;
+            } else {
+                /* The big gate folded the canonical rank-order sum into the
+                 * first bytes of batch_ffn_out; materialize it as the
+                 * routed result. */
+                ok = ds4_gpu_add_tensor(metal_graph_batch_routed_out(g),
+                                        metal_graph_batch_ffn_out(g),
+                                        g->tp_zero,
+                                        (uint32_t)((uint64_t)n_tokens * DS4_N_EMBD)) != 0;
+            }
         }
         if (!ok) {
             fprintf(stderr, "ds4: TP prefill FFN all-reduce failed (layer %u)\n", il);
@@ -29830,12 +29866,13 @@ static bool metal_graph_eval_token_raw_swa(
     if (ok) ok = ds4_gpu_end_commands() != 0;
     const double t_done = (profile || throttle) ? now_sec() : 0.0;
 
-    if (ok && logits && g->tp_world == 2 && g->tp_logits_half) {
-        const uint64_t tp_vhalf = (uint64_t)DS4_N_VOCAB / 2u;
-        const uint64_t off = (uint64_t)g->tp_rank * tp_vhalf * sizeof(float);
-        ok = ds4_gpu_tensor_read(metal_graph_logits(g), off, logits + g->tp_rank * tp_vhalf,
-                                 tp_vhalf * sizeof(float)) != 0;
-    } else if (ok && logits && !(g->tp_world == 2 && g->tp_rank == 1)) {
+    if (ok && logits && g->tp_world > 1 && g->tp_logits_half) {
+        const uint64_t tp_vchunk = (uint64_t)DS4_N_VOCAB / g->tp_world;
+        const uint64_t off = (uint64_t)g->tp_rank * tp_vchunk * sizeof(float);
+        ok = ds4_gpu_tensor_read(metal_graph_logits(g), off,
+                                 logits + g->tp_rank * tp_vchunk,
+                                 tp_vchunk * sizeof(float)) != 0;
+    } else if (ok && logits && !(g->tp_world > 1 && g->tp_rank != 0)) {
         ok = ds4_gpu_tensor_read(metal_graph_logits(g), 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
     }
     const double t_read = (profile || throttle) ? now_sec() : 0.0;
@@ -34488,7 +34525,7 @@ static bool metal_graph_verify_suffix_tops_impl(
     /* Under TP, verify every speculative block against the two resident
      * expert halves. Both ranks encode identically, so one batch gate per
      * layer reconstructs the routed result while preserving their KV state. */
-    g->tp_batch_rows = (g->tp_world == 2 &&
+    g->tp_batch_rows = (g->tp_world > 1 &&
                         g->tp_batch_out != NULL && g->tp_batch_in != NULL &&
                         n_tokens <= (uint32_t)DS4_TP_BATCH_MAX_ROWS)
                        ? n_tokens : 0;
@@ -35901,13 +35938,16 @@ typedef struct {
     ds4_gpu_tensor *slab;
     ds4_gpu_tensor **out_views;
     ds4_gpu_tensor **in_views;
+    ds4_gpu_tensor **combined_views;    /* canonical sum for world>2 */
     ds4_gpu_tensor **batch_out_views;   /* [layer] verify-block row partials */
     ds4_gpu_tensor **batch_in_views;
+    ds4_gpu_tensor **batch_combined_views;
     ds4_gpu_tensor *zero_vec;
     uint64_t eval_seq;          /* leader: mirrored eval counter */
     uint64_t next_session_id;   /* leader: stable worker-session handle */
     int rank;
-    bool vocab_split;           /* DS4-only: logits halves cross the wire */
+    int world;
+    bool vocab_split;           /* DS4-only: logits chunks cross the wire */
     bool active;
 } ds4_engine_tp_state;
 
@@ -37945,14 +37985,16 @@ typedef struct {
     bool ssd_streaming_cold;
     bool generic_routed_moe;
     bool streaming_static_decode_map_current;
-    /* Tensor parallelism (50/50 expert sharding): tp_world 2 means
-     * this rank computes only its contiguous half of the routed experts
-     * and exchanges the 24KB routed-FFN partial at one gate per sparse
-     * layer.  Views alias the engine's TP slab slots [layer*2 + FFN]. */
+    /* Tensor parallelism (expert sharding): tp_world>1 means this rank
+     * computes only its contiguous share of the routed experts and
+     * exchanges the routed-FFN partial at one gate per sparse layer.
+     * Views alias the engine's TP slab slots [layer*2 + FFN]. */
     uint32_t tp_world;
     uint32_t tp_rank;
     ds4_gpu_tensor **tp_out;
     ds4_gpu_tensor **tp_in;
+    ds4_gpu_tensor **tp_combined;       /* canonical sum for world>2 */
+    ds4_gpu_tensor *tp_zero;
     /* Prefill batch gate bounce buffers (shared storage; grow on demand). */
     ds4_gpu_tensor *tp_bounce_out;
     ds4_gpu_tensor *tp_bounce_in;
@@ -40224,7 +40266,7 @@ static int glm_graph_routed_moe_one_dispatch(
     /* Under the TP expert split only the ownership-aware kernels may run:
      * the generic mul_mv_id family and the GLM q2_K resident pair/down.
      * Anything else would silently compute the full expert set. */
-    if (g->tp_world == 2 &&
+    if (g->tp_world > 1 &&
         !glm_graph_layer_uses_generic_routed_moe(l) &&
         l->ffn_gate_exps->type != DS4_TENSOR_Q2_K) {
         fprintf(stderr,
@@ -40321,7 +40363,10 @@ static bool glm_graph_tp_batch_bounce_ready(ds4_glm_gpu_graph *g,
         ds4_gpu_tensor_free(g->tp_bounce_out);
         ds4_gpu_tensor_free(g->tp_bounce_in);
         g->tp_bounce_out = ds4_gpu_tensor_alloc(bytes);
-        g->tp_bounce_in = ds4_gpu_tensor_alloc(bytes);
+        /* world>2: the big gate stages every peer's partial in the bounce
+         * in-buffer, so it must hold (world-1) full chunks. */
+        const uint64_t ways = g->tp_world > 1 ? (uint64_t)g->tp_world - 1 : 1;
+        g->tp_bounce_in = ds4_gpu_tensor_alloc(ways * bytes);
     }
     return g->tp_bounce_out && g->tp_bounce_in;
 }
@@ -40346,9 +40391,17 @@ static bool glm_graph_tp_batch_ffn_combine(
                                     bytes)) {
         return false;
     }
+    if (g->tp_world == 2) {
+        return ds4_gpu_add_tensor(ffn_out,
+                                  g->tp_bounce_out,
+                                  g->tp_bounce_in,
+                                  (uint32_t)((uint64_t)n_tokens * DS4_N_EMBD)) != 0;
+    }
+    /* The big gate folded the canonical rank-order sum into the first
+     * bytes of tp_bounce_in; materialize it as the routed result. */
     return ds4_gpu_add_tensor(ffn_out,
-                              g->tp_bounce_out,
                               g->tp_bounce_in,
+                              g->tp_zero,
                               (uint32_t)((uint64_t)n_tokens * DS4_N_EMBD)) != 0;
 }
 
@@ -40890,12 +40943,11 @@ static bool glm_graph_encode_sparse_ffn_one(
             stream_t0 = glm_graph_streaming_async_profile_ms();
         }
     }
-    /* 50/50 TP: this rank's routed partial goes straight into the
-     * slab out slot, the gate exchanges it with the peer's half, and the
-     * commutative add rebuilds the full routed output on both ranks
-     * bit-identically.  The shared expert and everything else stay
-     * replicated, so no other exchange is needed. */
-    const bool tp_split_ffn = g->tp_world == 2 && g->tp_out && g->tp_in;
+    /* TP: this rank's routed partial goes straight into the slab out slot,
+     * the gate all-reduces it, and the canonical combine rebuilds the full
+     * routed output on every rank bit-identically.  The shared expert and
+     * everything else stay replicated, so no other exchange is needed. */
+    const bool tp_split_ffn = g->tp_world > 1 && g->tp_out && g->tp_in;
     const uint32_t tp_ffn_slot = il * DS4_TP_GATES_PER_LAYER + DS4_TP_GATE_FFN;
     ds4_gpu_tensor *routed_dst = tp_split_ffn ? g->tp_out[tp_ffn_slot] : ffn_out;
     if (ok && tp_split_ffn && g->ssd_streaming) {
@@ -40926,10 +40978,17 @@ static bool glm_graph_encode_sparse_ffn_one(
     }
     if (ok && tp_split_ffn) {
         ok = ds4_gpu_tp_gate_encode(il, DS4_TP_GATE_FFN) != 0;
-        if (ok) ok = ds4_gpu_add_tensor(ffn_out,
-                                        g->tp_out[tp_ffn_slot],
-                                        g->tp_in[tp_ffn_slot],
-                                        DS4_N_EMBD) != 0;
+        if (ok && g->tp_world > 1) {
+            ok = ds4_gpu_add_tensor(ffn_out,
+                                    g->tp_out[tp_ffn_slot],
+                                    g->tp_in[tp_ffn_slot],
+                                    DS4_N_EMBD) != 0;
+        } else if (ok) {
+            ok = ds4_gpu_add_tensor(ffn_out,
+                                    g->tp_combined[tp_ffn_slot],
+                                    g->tp_zero,
+                                    DS4_N_EMBD) != 0;
+        }
         if (!ok) fprintf(stderr, "ds4: GLM TP gate/combine failed (layer %u)\n", il);
     } else if (!ok && tp_split_ffn) {
         fprintf(stderr, "ds4: GLM TP routed dispatch failed before the gate (layer %u)\n", il);
@@ -42012,7 +42071,7 @@ static bool glm_graph_encode_sparse_ffn_indexed_batch_routed_moe(
                                   il,
                                   pos0);
 
-    const bool tp_batch_split_ffn2 = g->tp_world == 2;
+    const bool tp_batch_split_ffn2 = g->tp_world > 1;
     if (ok && tp_batch_split_ffn2) {
         ok = glm_graph_tp_batch_bounce_ready(g, n_tokens);
     }
@@ -42463,7 +42522,7 @@ static bool glm_graph_encode_ffn_batch(
                                                           il,
                                                           pos0,
                                                           n_tokens);
-    const bool tp_batch_split_ffn = g->tp_world == 2;
+    const bool tp_batch_split_ffn = g->tp_world > 1;
     if (ok && tp_batch_split_ffn) {
         ok = glm_graph_tp_batch_bounce_ready(g, n_tokens);
     }
@@ -42620,7 +42679,7 @@ static bool glm_graph_encode_ffn_batch(
             (uint32_t)g->ffn_mid_elems,
             full_layer_prefill,
             false) != 0;
-    if (ok && g->tp_world == 2) {
+    if (ok && g->tp_world > 1) {
         ok = glm_graph_tp_batch_ffn_combine(g, il, g->batch_ffn_out, n_tokens);
         if (!ok) fprintf(stderr, "ds4: GLM TP batch gate failed (layer %u)\n", il);
     }
@@ -43028,7 +43087,7 @@ static bool glm_graph_mtp_step(
                     &table, g->router_selected, DS4_N_EXPERT_USED) != 0;
         }
 #endif
-        const bool tp_split = g->tp_world == 2 && g->tp_out && g->tp_in;
+        const bool tp_split = g->tp_world > 1 && g->tp_out && g->tp_in;
         ds4_gpu_tensor *routed_dst = g->ffn_out;
         if (tp_split) {
             ok = glm_graph_tp_batch_bounce_ready(g, 1);
@@ -44438,7 +44497,7 @@ static bool glm_graph_forward_indexed_tokens(
      * exchange (same commutative add as the routed-FFN combine). Only the
      * split-value-proj batch chain has head ownership. */
     const bool tp_attn_head_split =
-        g->tp_world == 2 &&
+        g->tp_world > 1 &&
         use_batch_attn_kernel &&
         use_split_value_proj &&
         (DS4_N_HEAD % 16u) == 0u &&
@@ -57197,20 +57256,41 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
         snprintf(err, errlen, "tensor parallelism already bound");
         return 0;
     }
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA && ds4_tp_world(tp) > 2) {
+        snprintf(err, errlen,
+                 "GLM tensor parallelism is currently world-2 only "
+                 "(the ownership-aware pair+sum6 kernels are not generalized)");
+        return 0;
+    }
+    if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_GLM_DSA &&
+        ds4_tp_world(tp) > 2 && (DS4_N_VOCAB % ds4_tp_world(tp)) != 0) {
+        snprintf(err, errlen,
+                 "tensor parallelism world %d requires the vocabulary (%d) "
+                 "to be divisible by the world size",
+                 ds4_tp_world(tp), DS4_N_VOCAB);
+        return 0;
+    }
     const uint32_t slots = (uint32_t)DS4_N_LAYER * DS4_TP_GATES_PER_LAYER;
     const uint64_t vec_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
-    const uint64_t slab_bytes = ds4_tp_slab_bytes((uint32_t)DS4_N_LAYER, (uint32_t)DS4_N_EMBD);
+    const int world = ds4_tp_world(tp);
+    const uint64_t slab_bytes = ds4_tp_slab_bytes((uint32_t)DS4_N_LAYER,
+                                                  (uint32_t)DS4_N_EMBD,
+                                                  (uint32_t)world);
     e->tp.slab = ds4_gpu_tensor_alloc(slab_bytes);
     e->tp.zero_vec = ds4_gpu_tensor_alloc(vec_bytes);
     e->tp.out_views = calloc(slots, sizeof(*e->tp.out_views));
     e->tp.in_views = calloc(slots, sizeof(*e->tp.in_views));
+    e->tp.combined_views = calloc(slots, sizeof(*e->tp.combined_views));
     e->tp.batch_out_views = calloc((size_t)DS4_N_LAYER, sizeof(*e->tp.batch_out_views));
     e->tp.batch_in_views = calloc((size_t)DS4_N_LAYER, sizeof(*e->tp.batch_in_views));
-    if (!e->tp.batch_out_views || !e->tp.batch_in_views) {
+    e->tp.batch_combined_views = calloc((size_t)DS4_N_LAYER, sizeof(*e->tp.batch_combined_views));
+    if (!e->tp.batch_out_views || !e->tp.batch_in_views ||
+        !e->tp.batch_combined_views) {
         snprintf(err, errlen, "tp: batch view table allocation failed");
         return 0;
     }
-    if (!e->tp.slab || !e->tp.zero_vec || !e->tp.out_views || !e->tp.in_views) {
+    if (!e->tp.slab || !e->tp.zero_vec || !e->tp.out_views || !e->tp.in_views ||
+        !e->tp.combined_views) {
         snprintf(err, errlen, "tp: slab allocation failed (%llu bytes)",
                  (unsigned long long)slab_bytes);
         return 0;
@@ -57226,7 +57306,11 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
                     e->tp.slab, ds4_tp_slab_out_offset(tp, l, gate), vec_bytes);
             e->tp.in_views[slot] = ds4_gpu_tensor_view(
                     e->tp.slab, ds4_tp_slab_in_offset(tp, l, gate), vec_bytes);
-            if (!e->tp.out_views[slot] || !e->tp.in_views[slot]) {
+            e->tp.combined_views[slot] = ds4_gpu_tensor_view(
+                    e->tp.slab, ds4_tp_slab_combined_offset(tp, l, gate),
+                    vec_bytes);
+            if (!e->tp.out_views[slot] || !e->tp.in_views[slot] ||
+                !e->tp.combined_views[slot]) {
                 snprintf(err, errlen, "tp: slab view creation failed");
                 return 0;
             }
@@ -57237,12 +57321,16 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
         e->tp.batch_in_views[l] = ds4_gpu_tensor_view(
                 e->tp.slab, ds4_tp_slab_batch_in_offset(tp, l),
                 (uint64_t)DS4_TP_BATCH_MAX_ROWS * vec_bytes);
-        if (!e->tp.batch_out_views[l] || !e->tp.batch_in_views[l]) {
+        e->tp.batch_combined_views[l] = ds4_gpu_tensor_view(
+                e->tp.slab, ds4_tp_slab_batch_combined_offset(tp, l),
+                (uint64_t)DS4_TP_BATCH_MAX_ROWS * vec_bytes);
+        if (!e->tp.batch_out_views[l] || !e->tp.batch_in_views[l] ||
+            !e->tp.batch_combined_views[l]) {
             snprintf(err, errlen, "tp: batch slab view creation failed");
             return 0;
         }
     }
-    if (!ds4_gpu_tp_init((uint32_t)ds4_tp_rank(tp),
+    if (!ds4_gpu_tp_init((uint32_t)ds4_tp_rank(tp), (uint32_t)world,
                          e->tp.slab, ds4_tp_slab_gpu_flags_offset(tp),
                          ds4_engine_tp_exchange, tp)) {
         snprintf(err, errlen, "tp: gate service init failed");
@@ -57255,11 +57343,12 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
     e->tp.vocab_split = DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_GLM_DSA;
     e->tp.ctx = tp;
     e->tp.rank = ds4_tp_rank(tp);
+    e->tp.world = world;
     e->tp.eval_seq = 0;
     e->tp.active = true;
     ds4_log(stderr, DS4_LOG_OK,
-            "tensor parallelism bound: rank %d, 50/50 expert split, %s transport",
-            e->tp.rank, ds4_tp_is_rdma(tp) ? "rdma" : "tcp");
+            "tensor parallelism bound: rank %d/%d, expert split, %s transport",
+            e->tp.rank, world, ds4_tp_is_rdma(tp) ? "rdma" : "tcp");
     return 1;
 #endif
 }
@@ -57278,15 +57367,19 @@ void ds4_engine_close(ds4_engine *e) {
         for (uint32_t i = 0; i < slots; i++) {
             if (e->tp.out_views) ds4_gpu_tensor_free(e->tp.out_views[i]);
             if (e->tp.in_views) ds4_gpu_tensor_free(e->tp.in_views[i]);
+            if (e->tp.combined_views) ds4_gpu_tensor_free(e->tp.combined_views[i]);
         }
         for (uint32_t i = 0; i < (uint32_t)DS4_N_LAYER; i++) {
             if (e->tp.batch_out_views) ds4_gpu_tensor_free(e->tp.batch_out_views[i]);
             if (e->tp.batch_in_views) ds4_gpu_tensor_free(e->tp.batch_in_views[i]);
+            if (e->tp.batch_combined_views) ds4_gpu_tensor_free(e->tp.batch_combined_views[i]);
         }
         free(e->tp.batch_out_views);
         free(e->tp.batch_in_views);
+        free(e->tp.batch_combined_views);
         free(e->tp.out_views);
         free(e->tp.in_views);
+        free(e->tp.combined_views);
         ds4_gpu_tensor_free(e->tp.zero_vec);
         ds4_gpu_tensor_free(e->tp.slab);
         memset(&e->tp, 0, sizeof(e->tp));
@@ -57517,10 +57610,12 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         s->glm_graph.ssd_streaming_cold = e->ssd_streaming_cold;
 #if !defined(DS4_NO_GPU) && defined(__APPLE__)
         if (e->tp.active) {
-            s->glm_graph.tp_world = 2;
+            s->glm_graph.tp_world = (uint32_t)e->tp.world;
             s->glm_graph.tp_rank = (uint32_t)e->tp.rank;
             s->glm_graph.tp_out = e->tp.out_views;
             s->glm_graph.tp_in = e->tp.in_views;
+            s->glm_graph.tp_combined = e->tp.combined_views;
+            s->glm_graph.tp_zero = e->tp.zero_vec;
         }
 #endif
         if (e->ssd_streaming &&
@@ -57634,18 +57729,20 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     s->graph.ssd_streaming_cold = e->ssd_streaming_cold;
     s->graph.streaming_preload_experts = e->ssd_streaming_preload_experts;
     if (e->tp.active) {
-        s->graph.tp_world = 2;
+        s->graph.tp_world = (uint32_t)e->tp.world;
         s->graph.tp_rank = (uint32_t)e->tp.rank;
         s->graph.tp_out = e->tp.out_views;
         s->graph.tp_in = e->tp.in_views;
+        s->graph.tp_combined = e->tp.combined_views;
         s->graph.tp_batch_out = e->tp.batch_out_views;
         s->graph.tp_batch_in = e->tp.batch_in_views;
+        s->graph.tp_batch_combined = e->tp.batch_combined_views;
         s->graph.tp_zero = e->tp.zero_vec;
-        const uint64_t half = (uint64_t)DS4_N_VOCAB / 2u;
+        const uint64_t vchunk = (uint64_t)DS4_N_VOCAB / (uint64_t)e->tp.world;
         s->graph.tp_logits_half = ds4_gpu_tensor_view(
                 metal_graph_logits(&s->graph),
-                (uint64_t)e->tp.rank * half * sizeof(float),
-                half * sizeof(float));
+                (uint64_t)e->tp.rank * vchunk * sizeof(float),
+                vchunk * sizeof(float));
         if (!s->graph.tp_logits_half) {
             metal_graph_free(&s->graph);
             free(s);
@@ -58751,9 +58848,10 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
          * local prefill failed. Drain them to keep the control stream framed
          * before invalidating the mirrored session. */
         if (worker_ok && s->engine->tp.vocab_split) {
-            const uint32_t vhalf = (uint32_t)DS4_N_VOCAB / 2u;
-            if (!ds4_tp_recv_logits_half(s->engine->tp.ctx, s->logits + vhalf, vhalf)) {
-                snprintf(err, errlen, "tp: worker sync logits half missing");
+            const uint32_t vchunk =
+                (uint32_t)DS4_N_VOCAB / (uint32_t)s->engine->tp.world;
+            if (!ds4_tp_recv_logits(s->engine->tp.ctx, s->logits, vchunk)) {
+                snprintf(err, errlen, "tp: worker sync logits chunk missing");
                 logits_ok = false;
             }
         }
@@ -60593,18 +60691,22 @@ static int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
         return 1;
     }
 #endif
-    /* Vocab-split head: merge the halves after every eval (DS4 only). */
+    /* Vocab-split head: merge the chunks after every eval (DS4 only). */
     if (rc == 0 && s->engine && s->engine->tp.active && s->engine->tp.vocab_split) {
-        const uint32_t vhalf = (uint32_t)DS4_N_VOCAB / 2u;
+        const uint32_t vchunk =
+            (uint32_t)DS4_N_VOCAB / (uint32_t)s->engine->tp.world;
         if (s->engine->tp.rank == 0) {
-            if (!ds4_tp_recv_logits_half(s->engine->tp.ctx, s->logits + vhalf, vhalf)) {
-                snprintf(err, errlen, "tp: worker logits half missing");
+            if (!ds4_tp_recv_logits(s->engine->tp.ctx, s->logits, vchunk)) {
+                snprintf(err, errlen, "tp: worker logits chunk missing");
                 ds4_session_invalidate(s);
                 return 1;
             }
         } else {
-            if (!ds4_tp_send_logits_half(s->engine->tp.ctx, s->logits + vhalf, vhalf)) {
-                snprintf(err, errlen, "tp: logits half send failed");
+            if (!ds4_tp_send_logits(s->engine->tp.ctx,
+                                    s->logits +
+                                        (uint64_t)s->engine->tp.rank * vchunk,
+                                    vchunk)) {
+                snprintf(err, errlen, "tp: logits chunk send failed");
                 return 1;
             }
         }
@@ -60994,18 +61096,16 @@ static bool ds4_sessions_tp_recv_logits(
     if (!e || !e->tp.active || e->tp.rank != 0 || !e->tp.vocab_split) {
         return true;
     }
-    const uint32_t vhalf = (uint32_t)DS4_N_VOCAB / 2u;
+    const uint32_t vchunk = (uint32_t)DS4_N_VOCAB / (uint32_t)e->tp.world;
     if (prefill &&
-        !ds4_tp_recv_logits_half(e->tp.ctx,
-                                 prefill->logits + vhalf, vhalf)) {
+        !ds4_tp_recv_logits(e->tp.ctx, prefill->logits, vchunk)) {
         if (err && errlen) snprintf(err, errlen,
                                     "tp: worker mixed-prefill logits missing");
         return false;
     }
     for (int i = 0; i < count; i++) {
-        if (!ds4_tp_recv_logits_half(e->tp.ctx,
-                                     items[i].session->logits + vhalf,
-                                     vhalf)) {
+        if (!ds4_tp_recv_logits(e->tp.ctx,
+                                items[i].session->logits, vchunk)) {
             if (err && errlen) {
                 snprintf(err, errlen,
                          "tp: worker batch logits missing for item %d", i);
@@ -61801,12 +61901,12 @@ static int ds4_session_eval_dspark_speculative_argmax(
     if (stats_enabled) {
         s->dspark_stats.replay_ms += (now_sec() - replay_t0) * 1000.0;
     }
-    /* Vocab-split head: the last replay eval produced only our logits half;
-     * merge the worker's before installing them as the session logits. */
+    /* Vocab-split head: the last replay eval produced only our logits chunk;
+     * merge the workers' before installing them as the session logits. */
     if (replayed_drafts > 0 && tp_verify_sent && e->tp.vocab_split) {
-        const uint32_t vhalf = (uint32_t)DS4_N_VOCAB / 2u;
-        if (!ds4_tp_recv_logits_half(e->tp.ctx, row_logits + vhalf, vhalf)) {
-            snprintf(err, errlen, "tp: replay logits half missing");
+        const uint32_t vchunk = (uint32_t)DS4_N_VOCAB / (uint32_t)e->tp.world;
+        if (!ds4_tp_recv_logits(e->tp.ctx, row_logits, vchunk)) {
+            snprintf(err, errlen, "tp: replay logits chunk missing");
             s->checkpoint_valid = false;
             spec_frontier_free(&frontier);
             DS4_DSPARK_STATS_FINISH();
@@ -61860,7 +61960,7 @@ int ds4_session_tp_spec_cycle(ds4_session *s, const int *drafts, int draft_n,
     return 1;
 #else
     ds4_engine *e = s ? s->engine : NULL;
-    if (!e || !e->tp.active || e->tp.rank != 1) {
+    if (!e || !e->tp.active || e->tp.rank == 0) {
         snprintf(err, errlen, "tp: spec cycle outside worker mode");
         return 1;
     }
@@ -61952,10 +62052,12 @@ int ds4_session_tp_spec_cycle(ds4_session *s, const int *drafts, int draft_n,
     if (replay_n > 0) {
         s->checkpoint_valid = true;
         if (e->tp.vocab_split) {
-            const uint32_t vhalf = (uint32_t)DS4_N_VOCAB / 2u;
-            if (!ds4_tp_send_logits_half(e->tp.ctx, logits + vhalf, vhalf)) {
+            const uint32_t vchunk = (uint32_t)DS4_N_VOCAB / (uint32_t)e->tp.world;
+            if (!ds4_tp_send_logits(e->tp.ctx,
+                                    logits + (uint64_t)e->tp.rank * vchunk,
+                                    vchunk)) {
                 free(scratch);
-                snprintf(err, errlen, "tp: replay logits half send failed");
+                snprintf(err, errlen, "tp: replay logits chunk send failed");
                 return 1;
             }
         }

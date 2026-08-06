@@ -20,6 +20,7 @@
 #include <mach/mach.h>
 
 #include "ds4.h"
+#include "ds4_tp.h"
 #include "ds4_gpu.h"
 
 /*
@@ -8378,28 +8379,30 @@ static uint64_t g_tp_batch_seq;
  * not bound; world 2 assigns each rank one contiguous expert range. */
 static int32_t g_tp_split_rank;
 static int32_t g_tp_split_world = 1;
+static int32_t g_tp_split_world_saved;  /* suspend/resume keeps the real world */
 static int32_t g_tp_session_batch_mode;
 
 static int ds4_gpu_tp_world_is_two(void) {
     return g_tp_split_world == 2;
 }
 
-/* Return the contiguous routed-expert range backed by this process. Rank 1
- * owns the high range and receives any odd-count remainder. */
+/* Return the contiguous routed-expert range backed by this process, matching
+ * the kernel formula (metal/moe.metal ds4_tp_owns_expert): first =
+ * rank*(total/world), last = (rank+1)==world ? total : first + total/world.
+ * World 1 means TP is not bound. */
 static void ds4_gpu_tp_expert_range(uint32_t n_total_expert,
                                     uint32_t *first_expert,
                                     uint32_t *n_expert) {
     *first_expert = 0;
     *n_expert = n_total_expert;
-    if (g_tp_split_world != 2) return;
+    if (g_tp_split_world <= 1) return;
 
-    const uint32_t low_experts = n_total_expert / 2u;
-    if (g_tp_split_rank == 1) {
-        *first_expert = low_experts;
-        *n_expert = n_total_expert - low_experts;
-    } else {
-        *n_expert = low_experts;
-    }
+    const uint32_t base = n_total_expert / (uint32_t)g_tp_split_world;
+    const uint32_t first = (uint32_t)g_tp_split_rank * base;
+    const uint32_t last = g_tp_split_rank + 1 == g_tp_split_world ?
+        n_total_expert : first + base;
+    *first_expert = first;
+    *n_expert = last - first;
 }
 
 /* Attention head split for GLM batch prefill: each rank computes a
@@ -8419,11 +8422,12 @@ static void ds4_gpu_tp_attn_head_range(uint32_t n_head,
                                        uint32_t *head_count) {
     *head_base = 0;
     *head_count = n_head;
-    if (!g_tp_attn_head_split || g_tp_split_world != 2) return;
-    const uint32_t half = n_head / 2u;
-    if (half == 0u || (half % group) != 0u || (n_head % 2u) != 0u) return;
-    *head_count = half;
-    *head_base = g_tp_split_rank == 1 ? half : 0u;
+    if (!g_tp_attn_head_split || g_tp_split_world <= 1) return;
+    const uint32_t base = n_head / (uint32_t)g_tp_split_world;
+    if (base == 0u || (base % group) != 0u || (n_head % (uint32_t)g_tp_split_world) != 0u)
+        return;
+    *head_count = base;
+    *head_base = (uint32_t)g_tp_split_rank * base;
 }
 /* Flag gates (DS4_TP_FLAG_GATES): the GPU publishes gate arrival by storing
  * the sequence number into a slab word instead of signaling the shared
@@ -8623,13 +8627,14 @@ static void *ds4_gpu_tp_service_thread(void *arg) {
     return NULL;
 }
 
-int ds4_gpu_tp_init(uint32_t rank,
+int ds4_gpu_tp_init(uint32_t rank, uint32_t world,
                     ds4_gpu_tensor *slab, uint64_t gpu_flags_off,
                     ds4_gpu_tp_exchange_fn fn, void *ud) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
-    if (g_tp_thread_running || rank > 1) return 0;
+    if (g_tp_thread_running || world < 2 || world > DS4_TP_MAX_WORLD ||
+        rank >= world) return 0;
     g_tp_split_rank = (int32_t)rank;
-    g_tp_split_world = 2;
+    g_tp_split_world = (int32_t)world;
     g_tp_slab_buffer = slab ? ds4_gpu_tensor_buffer(slab) : nil;
     g_tp_slab_buffer_off = slab ? ds4_gpu_tensor_offset(slab) : 0;
     g_tp_gpu_flags_off = gpu_flags_off;
@@ -8707,7 +8712,13 @@ void ds4_gpu_tp_shutdown(void) {
 
 void ds4_gpu_tp_suspend_expert_sharding(int suspend) {
     if (!g_tp_thread_running) return;
-    g_tp_split_world = suspend ? 1 : 2;
+    if (suspend) {
+        g_tp_split_world_saved = g_tp_split_world;
+        g_tp_split_world = 1;
+    } else {
+        g_tp_split_world = g_tp_split_world_saved ? g_tp_split_world_saved : 2;
+        g_tp_split_world_saved = 0;
+    }
 }
 
 int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {
@@ -38372,7 +38383,7 @@ int ds4_gpu_routed_moe_batch_tensor(
             use_mm_id &&
             !(gate_type == DS4_METAL_TENSOR_IQ2_XXS &&
               (ds4_gpu_routed_mm_mpp_mask() & 3) == 3) &&
-            g_tp_split_world != 2 &&    /* pair-swiglu mm kernel lacks expert ownership */
+            g_tp_split_world <= 1 &&    /* pair-swiglu mm kernel lacks expert ownership */
             request_mid_f16 &&
             n_expert == 6 &&
             ((gate_type == DS4_METAL_TENSOR_IQ2_XXS &&

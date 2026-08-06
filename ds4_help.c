@@ -249,6 +249,8 @@ static void print_distributed(FILE *fp, const help_colors *c) {
     opt(fp, c, "--rdma-gid-index N", "Select the local verbs GID index.");
     opt(fp, c, "--tensor-parallel-token-prefill", "GLM diagnostic: prefill one token at a time for exact arithmetic.");
     opt(fp, c, "--debug-hash N", "Cross-check hidden state every N tokens.");
+    opt(fp, c, "--tp-topology FILE", "Fully connected N-node mesh descriptor (see misc/tp-mesh.example).");
+    opt(fp, c, "--tp-rank N", "This node's rank in the mesh (0 leader, 1..world-1 workers).");
     fputc('\n', fp);
 }
 
@@ -467,6 +469,7 @@ static void print_examples(FILE *fp, const help_colors *c, ds4_help_tool tool, c
         opt(fp, c, "coordinator", "./ds4 --role coordinator --layers 0:20 --listen 0.0.0.0 9000 -p \"Hello\" -m ds4flash.gguf");
         opt(fp, c, "TP worker", "./ds4 --tensor-parallel --role worker --coordinator 10.99.0.2 9911 --transport rdma -m ds4flash.gguf");
         opt(fp, c, "TP server", "./ds4-server --tensor-parallel --role coordinator --listen 10.99.0.2 9911 --transport rdma -m ds4flash.gguf");
+        opt(fp, c, "TP mesh", "./ds4-server --tensor-parallel --role coordinator --tp-topology mesh.txt --tp-rank 0 --transport rdma -m ds4flash.gguf");
     } else if (topic_is(topic, "runtime")) {
         if (tool == DS4_HELP_SERVER) {
             opt(fp, c, "Metal API", "./ds4-server -m ds4flash.gguf --metal --ctx 100000");

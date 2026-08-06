@@ -677,6 +677,41 @@ sessions work too. The disk KV cache is not available in this mode: a disk
 cache restore rewrites the leader's local KV without a matching worker update,
 so `--kv-disk-dir` is rejected when tensor parallelism is enabled.
 
+### Four-node fully connected mesh
+
+Tensor parallelism also runs on a fully connected mesh of identical machines
+(one node runs `ds4-server` as rank 0, the others run `ds4` as workers).  Each
+node has one RDMA link per peer (3 links for a 4-node mesh), and the links are
+not bridged: each interface carries its own IPv4 address.  A small topology
+descriptor file lists every node's per-link addresses; all nodes read the same
+file and each selects its own rank with `--tp-rank`.  The format is `world N`
+followed by one `node R H0 P0 H1 P1 H2 P2` line per node: node R's LOCAL
+addresses on its W-1 links, where link i of node R connects to peer
+(R+i+1) % world and the port is the one node R listens on for that link (see
+`misc/tp-mesh.example`).  At every gate the partial sums are all-reduced with
+a direct broadcast/gather over the per-peer links, and the canonical
+rank-order sum is folded on the CPU for world > 2.
+
+```sh
+# Machine A (rank 0, head node):
+./ds4-server -m "$MODEL" --tensor-parallel --role coordinator \
+  --tp-topology mesh.txt --tp-rank 0 --transport rdma --port 8000
+
+# Machines B, C, D (workers 1, 2, 3):
+./ds4 -m "$MODEL" --tensor-parallel --role worker \
+  --tp-topology mesh.txt --tp-rank 1 --transport rdma
+./ds4 -m "$MODEL" --tensor-parallel --role worker \
+  --tp-topology mesh.txt --tp-rank 2 --transport rdma
+./ds4 -m "$MODEL" --tensor-parallel --role worker \
+  --tp-topology mesh.txt --tp-rank 3 --transport rdma
+```
+
+Start the workers first; they retry while the leader loads.  The mesh reuses
+the same RDMA-over-Thunderbolt setup per link, and `--transport tcp` forces the
+TCP fallback over the mesh.  GLM routed-expert decode kernels are currently
+world-2 only, so a GLM GGUF is rejected for world > 2 until the ownership-aware
+pair+sum6 kernels are generalized.
+
 Startup takes about 9 seconds per machine: each rank pre-faults its
 ~100 GiB shard from SSD and pins it through a Metal residency set.
 DeepSeek V4 Flash works the same way with its own GGUF on both machines.

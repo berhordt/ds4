@@ -122,6 +122,15 @@ typedef struct {
     bool rdma_gid_index_set;
     bool glm_token_prefill;
     int debug_hash;             /* cross-check hidden state every N tokens */
+    /* x4 mesh: a topology descriptor file supplies the world size and every
+     * node's per-link addresses (each node has one RDMA link per peer, not
+     * bridged). --tp-rank selects this node's rank; world is resolved from
+     * the topology file. When topology_path is set it replaces the 2-node
+     * --listen/--coordinator addresses. */
+    const char *topology_path;
+    int rank;
+    bool rank_set;
+    int world;
 } ds4_tp_options;
 
 typedef struct {
