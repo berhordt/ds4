@@ -692,6 +692,21 @@ addresses on its W-1 links, where link i of node R connects to peer
 a direct broadcast/gather over the per-peer links, and the canonical
 rank-order sum is folded on the CPU for world > 2.
 
+The link-local (169.254/16) addresses on the Thunderbolt links change on
+every reboot, so mesh.txt must be regenerated whenever the cluster comes back
+up.  `gen-mesh.py` does that automatically: it ssh's to each node (in
+rank order; rank 0 must be the leader), reads the node's link-local addresses,
+maps every link to its peer from the ARP table (MAC/IP matching, with a
+ping -S fallback), validates that the mesh is complete and symmetric, and
+writes the topology file.  `--verify` ping-probes every link, `--check`
+compares an existing file against the live cluster, and `--deploy` scp's the
+result to every node.
+
+```sh
+# from the workstation (nodes resolve via ~/.ssh/config):
+python3 gen-mesh.py --hosts nemo,gloria,dory,fanny --verify --deploy
+```
+
 ```sh
 # Machine A (rank 0, head node):
 ./ds4-server -m "$MODEL" --tensor-parallel --role coordinator \
