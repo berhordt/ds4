@@ -6175,9 +6175,9 @@ static void model_map_span_vec_include_layer_decode_static(ds4_model_map_span_ve
     DS4_INCLUDE_TENSOR(l->ffn_down);
     DS4_INCLUDE_TENSOR(l->ffn_gate_inp);
     DS4_INCLUDE_TENSOR(l->ffn_exp_probs_b);
-    DS4_INCLUDE_TENSOR(l->ffn_gate_shexp);
-    DS4_INCLUDE_TENSOR(l->ffn_up_shexp);
-    DS4_INCLUDE_TENSOR(l->ffn_down_shexp);
+    /* The shared expert is replicated under tensor parallelism (every rank
+     * needs it); it is appended as isolated spans in the sharded builder so
+     * the exact tensor range is always mapped. */
     DS4_INCLUDE_TENSOR(l->nextn_eh_proj);
     DS4_INCLUDE_TENSOR(l->nextn_enorm);
     DS4_INCLUDE_TENSOR(l->nextn_hnorm);
@@ -6417,8 +6417,10 @@ static DS4_MAYBE_UNUSED bool weights_model_map_sharded_spans(
         const ds4_weights *w,
         const ds4_model   *m,
         int                rank,
+        int                world,
         ds4_model_map_span_vec *spans) {
-    if (!w || !m || !spans || (rank != 0 && rank != 1)) return false;
+    if (!w || !m || !spans || world < 2 || rank < 0 || rank >= world)
+        return false;
     memset(spans, 0, sizeof(*spans));
     model_map_span_vec_include_one(spans, w->token_embd);
     for (uint32_t il = 0; il < (uint32_t)DS4_N_LAYER; il++) {
@@ -6434,22 +6436,67 @@ static DS4_MAYBE_UNUSED bool weights_model_map_sharded_spans(
             uint64_t in_dim = 0, out_dim = 0, row_bytes = 0;
             (void)tensor_expert_bytes(m, x, 0, &in_dim, &out_dim, &row_bytes);
             const uint64_t expert_bytes = out_dim * row_bytes;
-            const uint64_t low_experts = x->dim[2] / 2;
-            const uint64_t first_expert = rank == 1 ? low_experts : 0;
-            const uint64_t owned_experts = rank == 1 ?
-                x->dim[2] - low_experts : low_experts;
+            /* Match ds4_tp_owns_expert: rank r owns [r*base, (r+1)*base),
+             * the last rank takes any odd-count remainder. */
+            const uint64_t base = x->dim[2] / (uint64_t)world;
+            const uint64_t first_expert = (uint64_t)rank * base;
+            const uint64_t owned_experts = rank + 1 == world ?
+                x->dim[2] - first_expert : base;
             const uint64_t owned_bytes = owned_experts * expert_bytes;
             const uint64_t lo = x->abs_offset + first_expert * expert_bytes;
             /* Kernels index experts from the blob base, so the owned range
-             * must sit in one contiguous view. Rank 1 takes any remainder. */
+             * must sit in one contiguous view. The last rank takes any
+             * remainder. */
             model_map_span_vec_append(spans, lo, lo + owned_bytes, true);
             if (owned_bytes > spans->max_tensor_bytes) {
                 spans->max_tensor_bytes = owned_bytes;
             }
         }
+        /* Shared expert: replicated, so map the exact tensor range as an
+         * isolated span (it must never be merged away or misaligned). */
+        const ds4_tensor *shexp[3] = { l->ffn_gate_shexp,
+                                       l->ffn_up_shexp,
+                                       l->ffn_down_shexp };
+        for (int t = 0; t < 3; t++) {
+            const ds4_tensor *x = shexp[t];
+            if (!x || x->bytes == 0) continue;
+            model_map_span_vec_append(spans, x->abs_offset,
+                                      x->abs_offset + x->bytes, true);
+            if (x->bytes > spans->max_tensor_bytes)
+                spans->max_tensor_bytes = x->bytes;
+        }
     }
     model_map_span_vec_include_output(spans, w);
-    return model_map_span_vec_finish(spans);
+    if (getenv("DS4_TP_SHARD_TRACE")) {
+        for (uint32_t il = 0; il < (uint32_t)DS4_N_LAYER; il++) {
+            const ds4_layer_weights *l = &w->layer[il];
+            if (!l->ffn_up_shexp) continue;
+            fprintf(stderr,
+                    "ds4: shared il=%u gate=%llu/%llu up=%llu/%llu down=%llu/%llu\n",
+                    il,
+                    (unsigned long long)l->ffn_gate_shexp->abs_offset,
+                    (unsigned long long)l->ffn_gate_shexp->bytes,
+                    (unsigned long long)l->ffn_up_shexp->abs_offset,
+                    (unsigned long long)l->ffn_up_shexp->bytes,
+                    (unsigned long long)l->ffn_down_shexp->abs_offset,
+                    (unsigned long long)l->ffn_down_shexp->bytes);
+        }
+    }
+    const bool ok_spans = model_map_span_vec_finish(spans);
+    if (ok_spans && getenv("DS4_TP_SHARD_TRACE")) {
+        for (uint32_t i = 0; i < spans->len; i++) {
+            if (spans->v[i].end < 136ull * 1024ull * 1024ull * 1024ull)
+                continue;
+            fprintf(stderr,
+                    "ds4: shard span[%u] %.2f..%.2f GiB (off=%llu len=%llu)\n",
+                    i,
+                    (double)spans->v[i].off / 1073741824.0,
+                    (double)spans->v[i].end / 1073741824.0,
+                    (unsigned long long)spans->v[i].off,
+                    (unsigned long long)(spans->v[i].end - spans->v[i].off));
+        }
+    }
+    return ok_spans;
 }
 
 static DS4_MAYBE_UNUSED bool weights_model_map_decode_layer_spans(
@@ -20937,6 +20984,17 @@ static bool metal_graph_decode_cpu_router(
     for (uint32_t i = 0; i < DS4_N_EXPERT; i++) {
         probs[i] = sqrtf(softplus_stable(logits[i]));
     }
+    if (g->tp_world > 1 && !layer->ffn_gate_tid2eid) {
+        /* TP: each rank routes within its owned expert shard so the
+         * selected-expert views stay inside its mapped model range. */
+        const uint32_t base = DS4_N_EXPERT / g->tp_world;
+        const uint32_t first = g->tp_rank * base;
+        const uint32_t n_bind = g->tp_rank + 1 == g->tp_world ?
+            DS4_N_EXPERT - first : base;
+        for (uint32_t i = 0; i < DS4_N_EXPERT; i++) {
+            if (i < first || i >= first + n_bind) probs[i] = -FLT_MAX;
+        }
+    }
     if (layer->ffn_gate_tid2eid) {
         layer_hash_selected_experts(selected, model, layer, (int)token);
         layer_hash_router_weights_from_probs(weights, probs, selected);
@@ -24136,19 +24194,22 @@ static bool metal_graph_encode_decode_layer_phase(
     }
     if (ok && tp_split_shared) {
         /* Shared expert lane slice: the fused gate/up/swiglu kernel covers
-         * this rank's half of the intermediate (row slicing is pure offset
+         * this rank's slice of the intermediate (row slicing is pure offset
          * math), compact at the buffer base; the down k-slice below turns
-         * it into a partial output. */
-        const uint32_t tp_half = shared_dim / 2;
+         * it into a partial output.  The slice width is shared_dim/tp_world
+         * so the design generalises the world==2 half-split to the mesh. */
+        const uint32_t tp_slice = shared_dim / (uint32_t)g->tp_world;
         uint64_t shexp_row_bytes = 0;
         ok = metal_graph_dense_quant_row_bytes(layer->ffn_gate_shexp,
                                                DS4_N_EMBD,
                                                &shexp_row_bytes) &&
              layer->ffn_gate_shexp->type == layer->ffn_up_shexp->type;
-        const uint64_t tp_lane_off = (uint64_t)g->tp_rank * tp_half * shexp_row_bytes;
-        ok = ok && (tp_half % 32u) == 0;
+        const uint64_t tp_lane_off = (uint64_t)g->tp_rank * tp_slice * shexp_row_bytes;
+        ok = ok && (shared_dim % (uint32_t)g->tp_world) == 0u &&
+             (tp_slice % 32u) == 0u;
         if (!ok) {
-            fprintf(stderr, "ds4: TP shared expert width %u is not sliceable\n", shared_dim);
+            fprintf(stderr, "ds4: TP shared expert width %u is not sliceable into %u lanes\n",
+                    shared_dim, g->tp_world);
         }
         if (ok && layer->ffn_gate_shexp->type == DS4_TENSOR_Q8_0) {
             ok = ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(metal_graph_shared_gate(g),
@@ -24159,7 +24220,7 @@ static bool metal_graph_encode_decode_layer_phase(
                                                            layer->ffn_gate_shexp->abs_offset + tp_lane_off,
                                                            layer->ffn_up_shexp->abs_offset + tp_lane_off,
                                                            DS4_N_EMBD,
-                                                           tp_half,
+                                                           tp_slice,
                                                            metal_graph_ffn_norm(g),
                                                            DS4_SWIGLU_CLAMP_EXP) != 0;
         } else if (ok) {
@@ -24168,7 +24229,7 @@ static bool metal_graph_encode_decode_layer_phase(
                                                     layer->ffn_gate_shexp,
                                                     layer->ffn_gate_shexp->abs_offset + tp_lane_off,
                                                     DS4_N_EMBD,
-                                                    tp_half,
+                                                    tp_slice,
                                                     metal_graph_ffn_norm(g),
                                                     1);
             if (ok) ok = metal_graph_matmul_dense_quant_abs(metal_graph_shared_up(g),
@@ -24176,11 +24237,11 @@ static bool metal_graph_encode_decode_layer_phase(
                                                             layer->ffn_up_shexp,
                                                             layer->ffn_up_shexp->abs_offset + tp_lane_off,
                                                             DS4_N_EMBD,
-                                                            tp_half,
+                                                            tp_slice,
                                                             metal_graph_ffn_norm(g),
                                                             1);
             if (ok) ok = ds4_gpu_swiglu_tensor(metal_graph_shared_mid(g), metal_graph_shared_gate(g), metal_graph_shared_up(g),
-                                               tp_half, DS4_SWIGLU_CLAMP_EXP, 1.0f) != 0;
+                                               tp_slice, DS4_SWIGLU_CLAMP_EXP, 1.0f) != 0;
         }
     } else if (ok && fuse_shared_gate_up) {
         ok = ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(metal_graph_shared_gate(g),
@@ -24326,8 +24387,8 @@ static bool metal_graph_encode_decode_layer_phase(
                                                    model,
                                                    layer->ffn_down_shexp,
                                                    shared_dim,
-                                                   (uint64_t)g->tp_rank * (shared_dim / 2),
-                                                   shared_dim / 2,
+                                                   (uint64_t)g->tp_rank * (shared_dim / (uint64_t)g->tp_world),
+                                                   shared_dim / (uint64_t)g->tp_world,
                                                    DS4_N_EMBD,
                                                    metal_graph_shared_mid(g),
                                                    0);
@@ -29448,11 +29509,18 @@ static bool metal_graph_encode_layer_ffn_batch(
             ds4_gpu_tensor_free(out_row);
         }
         if (ok) ok = ds4_gpu_tp_batch_gate_encode(il, n_tokens) != 0;
-        if (ok) {
+        if (ok && g->tp_world == 2) {
             ok = ds4_gpu_add_tensor(metal_graph_batch_routed_out(g),
                                     g->tp_batch_out[il],
                                     g->tp_batch_in[il],
                                     (uint32_t)((uint64_t)n_tokens * DS4_N_EMBD)) != 0;
+        } else if (ok && g->tp_world > 2) {
+            /* The transport folded the canonical rank-order sum into
+             * batch_combined; copy it as the routed result. */
+            ok = ds4_gpu_tensor_copy(metal_graph_batch_routed_out(g), 0,
+                                     g->tp_batch_combined[il], 0,
+                                     (uint64_t)n_tokens * DS4_N_EMBD *
+                                         sizeof(float)) != 0;
         }
     } else if (ok) {
         ok = ds4_gpu_routed_moe_batch_tensor(metal_graph_batch_routed_out(g),
@@ -29550,12 +29618,12 @@ static bool metal_graph_encode_layer_ffn_batch(
                                         (uint32_t)((uint64_t)n_tokens * DS4_N_EMBD)) != 0;
             } else {
                 /* The big gate folded the canonical rank-order sum into the
-                 * first bytes of batch_ffn_out; materialize it as the
-                 * routed result. */
-                ok = ds4_gpu_add_tensor(metal_graph_batch_routed_out(g),
-                                        metal_graph_batch_ffn_out(g),
-                                        g->tp_zero,
-                                        (uint32_t)((uint64_t)n_tokens * DS4_N_EMBD)) != 0;
+                 * first bytes of batch_ffn_out; copy it as the routed
+                 * result (a per-row zero add would need a batch-sized zero). */
+                ok = ds4_gpu_tensor_copy(metal_graph_batch_routed_out(g), 0,
+                                         metal_graph_batch_ffn_out(g), 0,
+                                         (uint64_t)n_tokens * DS4_N_EMBD *
+                                             sizeof(float)) != 0;
             }
         }
         if (!ok) {
@@ -40398,11 +40466,10 @@ static bool glm_graph_tp_batch_ffn_combine(
                                   (uint32_t)((uint64_t)n_tokens * DS4_N_EMBD)) != 0;
     }
     /* The big gate folded the canonical rank-order sum into the first
-     * bytes of tp_bounce_in; materialize it as the routed result. */
-    return ds4_gpu_add_tensor(ffn_out,
-                              g->tp_bounce_in,
-                              g->tp_zero,
-                              (uint32_t)((uint64_t)n_tokens * DS4_N_EMBD)) != 0;
+     * bytes of tp_bounce_in; copy it as the routed result. */
+    return ds4_gpu_tensor_copy(ffn_out, 0, g->tp_bounce_in, 0,
+                               (uint64_t)n_tokens * DS4_N_EMBD *
+                                   sizeof(float)) != 0;
 }
 
 static int glm_graph_routed_moe_batch_dispatch(
@@ -54857,10 +54924,12 @@ static bool ds4_engine_preload_pro_q4_expert_tables(
  * rank will ever read is pre-faulted here. */
 static void model_warm_weights_sharded(const ds4_model *m,
                                        const ds4_weights *w,
-                                       int rank) {
+                                       int rank, int world) {
     typedef struct { uint64_t off, len; } skip_range;
-    if (rank != 0 && rank != 1) return;
-    skip_range *skips = xmalloc((size_t)DS4_N_LAYER * 3 * sizeof(*skips));
+    if (world < 2 || rank < 0 || rank >= world) return;
+    /* A middle rank owns a contiguous expert range, so its unowned bytes
+     * are two segments (before and after). */
+    skip_range *skips = xmalloc((size_t)DS4_N_LAYER * 3 * 2 * sizeof(*skips));
     uint32_t n_skips = 0;
     uint64_t skip_bytes = 0;
     for (uint32_t il = 0; il < (uint32_t)DS4_N_LAYER; il++) {
@@ -54874,13 +54943,25 @@ static void model_warm_weights_sharded(const ds4_model *m,
             (void)tensor_expert_bytes(m, x, 0, &in_dim, &out_dim, &row_bytes);
             const uint64_t expert_bytes = out_dim * row_bytes;
             const uint64_t total_bytes = x->dim[2] * expert_bytes;
-            const uint64_t low_bytes = (x->dim[2] / 2) * expert_bytes;
-            /* Unowned range: rank 0 owns the low ids; rank 1 owns the high
-             * ids and takes any odd-count remainder. */
-            skips[n_skips].off = x->abs_offset + (rank == 0 ? low_bytes : 0);
-            skips[n_skips].len = rank == 0 ? total_bytes - low_bytes : low_bytes;
-            skip_bytes += skips[n_skips].len;
-            n_skips++;
+            const uint64_t base = x->dim[2] / (uint64_t)world;
+            const uint64_t first = (uint64_t)rank * base;
+            const uint64_t owned = rank + 1 == world ?
+                x->dim[2] - first : base;
+            const uint64_t first_bytes = first * expert_bytes;
+            const uint64_t owned_bytes = owned * expert_bytes;
+            /* Unowned segments: below the owned range and above it. */
+            if (first_bytes > 0) {
+                skips[n_skips].off = x->abs_offset;
+                skips[n_skips].len = first_bytes;
+                skip_bytes += first_bytes;
+                n_skips++;
+            }
+            if (first_bytes + owned_bytes < total_bytes) {
+                skips[n_skips].off = x->abs_offset + first_bytes + owned_bytes;
+                skips[n_skips].len = total_bytes - first_bytes - owned_bytes;
+                skip_bytes += skips[n_skips].len;
+                n_skips++;
+            }
         }
     }
     /* File order should already ascend, but do not rely on it. */
@@ -56146,6 +56227,21 @@ static int ds4_engine_open_internal(ds4_engine **out,
                                     const ds4_engine_options *opt,
                                     const ds4_gpu_config *gpu_cfg);
 
+/* Resolve the mesh world size before the transport is created: the engine
+ * must map the per-rank expert shard at open time, but the topology file is
+ * parsed later by ds4_tp_create.  World 2 is the classic pair. */
+static int tp_effective_world(const ds4_tp_options *tp) {
+    if (!tp || !tp->topology_path) return 2;
+    ds4_tp_topology topo;
+    char err[128];
+    if (ds4_tp_topology_load(tp->topology_path, &topo, err, sizeof(err))) {
+        const int w = topo.world;
+        ds4_tp_topology_free(&topo);
+        return w;
+    }
+    return 2;
+}
+
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     return ds4_engine_open_internal(out, opt, NULL);
 }
@@ -56308,14 +56404,18 @@ static int ds4_engine_open_internal(ds4_engine **out,
                  load_output,
                  load_output_optional);
 
-    /* TP always maps one contiguous routed-expert half per rank. Decide
+    /* TP always maps one contiguous routed-expert range per rank. Decide
      * immediately after binding so memory guards account only the bytes this
-     * rank owns (replicated dense weights plus its expert shard). */
+     * rank owns (replicated dense weights plus its expert shard).  The world
+     * comes from the topology file when the mesh is used. */
 #ifndef DS4_NO_GPU
     const bool tp_shard =
         opt->tp.role != DS4_TP_NONE &&
         !e->ssd_streaming;
-    const int tp_shard_rank = opt->tp.role == DS4_TP_WORKER ? 1 : 0;
+    const int tp_shard_rank = opt->tp.role == DS4_TP_WORKER ?
+        (opt->tp.rank_set ? opt->tp.rank : 1) : 0;
+    const int tp_shard_world = opt->tp.topology_path ?
+        tp_effective_world(&opt->tp) : 2;
     if (tp_shard && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         uint32_t bad_layer = 0;
         uint32_t bad_type = 0;
@@ -56336,7 +56436,8 @@ static int ds4_engine_open_internal(ds4_engine **out,
     if (tp_shard) {
         ds4_model_map_span_vec shard_spans;
         if (weights_model_map_sharded_spans(&e->weights, &e->model,
-                                            tp_shard_rank, &shard_spans)) {
+                                            tp_shard_rank, tp_shard_world,
+                                            &shard_spans)) {
             g_tp_shard_model_bytes =
                 model_map_span_vec_total_bytes(&shard_spans);
             free(shard_spans.v);
@@ -56936,7 +57037,8 @@ static int ds4_engine_open_internal(ds4_engine **out,
         } else if (tp_shard) {
             ds4_model_map_span_vec spans;
             if (!weights_model_map_sharded_spans(&e->weights, &e->model,
-                                                 tp_shard_rank, &spans)) {
+                                                 tp_shard_rank, tp_shard_world,
+                                                 &spans)) {
                 fprintf(stderr, "ds4: sharded model span build failed\n");
                 ds4_engine_close(e);
                 *out = NULL;
@@ -56989,7 +57091,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
         }
         if (tp_shard) {
             model_warm_weights_sharded(&e->model, &e->weights,
-                                       tp_shard_rank);
+                                       tp_shard_rank, tp_shard_world);
         }
         const bool support_model_runtime_ready =
             e->mtp_ready ||

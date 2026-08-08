@@ -18,6 +18,7 @@
 #include <sys/mman.h>
 #include <sys/sysctl.h>
 #include <mach/mach.h>
+#include <dlfcn.h>
 
 #include "ds4.h"
 #include "ds4_tp.h"
@@ -5372,6 +5373,8 @@ typedef struct {
     uint32_t use_token_buffer;
     uint32_t token;
     uint32_t hash_rows;
+    int32_t  first_expert;   /* TP shard: owned expert range */
+    int32_t  n_bind_expert;
 } ds4_gpu_dsv4_router_select_one_args;
 
 typedef struct {
@@ -10343,10 +10346,29 @@ static id<MTLBuffer> ds4_gpu_wrap_model_range(
         }
     }
 
+    uint64_t near_start = 0, near_end = 0;
+    for (uint32_t i = 0; i < g_model_view_count; i++) {
+        if (g_model_views[i].model_map != model_map ||
+            g_model_views[i].model_size != model_size) continue;
+        const uint64_t vs = g_model_views[i].model_offset;
+        const uint64_t ve = vs + g_model_views[i].bytes;
+        if (ve <= offset) {
+            if (vs >= near_start) { near_start = vs; near_end = ve; }
+        } else if (vs >= end) {
+            if (near_end == 0 || vs < near_start) { near_start = vs; near_end = ve; }
+        }
+    }
+    Dl_info di;
+    const char *caller = dladdr(__builtin_return_address(0), &di) && di.dli_sname
+        ? di.dli_sname : "?";
     fprintf(stderr,
-            "ds4: Metal model range %.2f..%.2f GiB is not covered by mapped model views\n",
+            "ds4: Metal model range %.2f..%.2f GiB (off=%llu len=%llu, model %llu bytes, views %u) "
+            "is not covered by mapped model views; nearest view %.2f..%.2f GiB caller=%s\n",
             ds4_gpu_gib(offset),
-            ds4_gpu_gib(end));
+            ds4_gpu_gib(end),
+            (unsigned long long)offset, (unsigned long long)len,
+            (unsigned long long)model_size, g_model_view_count,
+            ds4_gpu_gib(near_start), ds4_gpu_gib(near_end), caller);
     return nil;
 }
 
@@ -17964,7 +17986,17 @@ static int ds4_gpu_shared_gate_up_swiglu_q8_0_impl(
                                      up_offset,
                                      weight_bytes,
                                      &up_inner);
-        if (!gate_wbuf || !up_wbuf) return 0;
+        if (!gate_wbuf || !up_wbuf) {
+            Dl_info di;
+            const char *caller = dladdr(__builtin_return_address(0), &di) && di.dli_sname
+                ? di.dli_sname : "?";
+            fprintf(stderr,
+                    "ds4: shared gate/up wrap fail gate_off=%llu up_off=%llu bytes=%llu caller2=%s\n",
+                    (unsigned long long)gate_offset,
+                    (unsigned long long)up_offset,
+                    (unsigned long long)weight_bytes, caller);
+            return 0;
+        }
 
         ds4_gpu_q8_0_matvec_args args = ds4_gpu_make_q8_0_mv_args(in_dim, out_dim);
         ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_q8_0_mv_dispatch();
@@ -29764,12 +29796,19 @@ static int ds4_gpu_encode_router_select(
         if (!ok) return 0;
 
         const bool use_token_buffer = single_token == NULL;
+        uint32_t tp_first_expert = 0, tp_n_bind_expert = 0;
+        if (g_tp_split_world > 1 && !hash_mode) {
+            ds4_gpu_tp_expert_range(n_expert, &tp_first_expert,
+                                    &tp_n_bind_expert);
+        }
         ds4_gpu_dsv4_router_select_one_args args = {
             .has_bias = has_bias ? 1u : 0u,
             .hash_mode = hash_mode ? 1u : 0u,
             .use_token_buffer = use_token_buffer ? 1u : 0u,
             .token = single_token ? (uint32_t)*single_token : 0u,
             .hash_rows = hash_rows,
+            .first_expert = (int32_t)tp_first_expert,
+            .n_bind_expert = (int32_t)tp_n_bind_expert,
         };
 
         const float zero_f32 = 0.0f;
@@ -36610,14 +36649,33 @@ int ds4_gpu_routed_moe_one_tensor(
                 }
 
                 for (uint32_t i = 0; i < n_expert; i++) {
-                    const uint64_t expert_id = (uint64_t)(uint32_t)selected_ids[i];
+                    const int32_t selected_expert = selected_ids[i];
+                    /* Skip experts this rank does not own: the kernels
+                     * filter them, and their model views are not mapped. */
+                    const int32_t owned_lo = (int32_t)first_expert;
+                    const int32_t owned_hi = (int32_t)(first_expert + n_bind_expert);
+                    if (selected_expert < owned_lo ||
+                        selected_expert >= owned_hi) {
+                        gate_slot_bufs[i] = nil;
+                        up_slot_bufs[i] = nil;
+                        down_slot_bufs[i] = nil;
+                        gate_slot_offsets[i] = 0;
+                        up_slot_offsets[i] = 0;
+                        down_slot_offsets[i] = 0;
+                        continue;
+                    }
+                    const uint64_t expert_id = (uint64_t)(uint32_t)selected_expert;
                     if (expert_id > UINT64_MAX / gate_expert_bytes ||
                         expert_id > UINT64_MAX / down_expert_bytes) {
                         fprintf(stderr, "ds4: Metal routed MoE selected expert offset overflow\n");
                         return 0;
                     }
-                    const uint64_t gate_rel = expert_id * gate_expert_bytes;
-                    const uint64_t down_rel = expert_id * down_expert_bytes;
+                    /* selected ids are global; gate_offset already includes
+                     * first_expert, so the relative slot is id - first. */
+                    const uint64_t gate_rel =
+                        (expert_id - (uint64_t)first_expert) * gate_expert_bytes;
+                    const uint64_t down_rel =
+                        (expert_id - (uint64_t)first_expert) * down_expert_bytes;
                     if (gate_rel > UINT64_MAX - gate_offset ||
                         gate_rel > UINT64_MAX - up_offset ||
                         down_rel > UINT64_MAX - down_offset) {
@@ -36918,7 +36976,17 @@ int ds4_gpu_routed_moe_one_tensor(
             gate_buf = ds4_gpu_wrap_model_range(model_map, model_size, gate_offset, gate_tensor_bytes, &gate_inner);
             up_buf = ds4_gpu_wrap_model_range(model_map, model_size, up_offset, gate_tensor_bytes, &up_inner);
             down_buf = ds4_gpu_wrap_model_range(model_map, model_size, down_offset, down_tensor_bytes, &down_inner);
-            if (!gate_buf || !up_buf || !down_buf) { if (getenv("DS4_GLM_TP_DEBUG")) fprintf(stderr, "ds4: routed_moe_one silent return at line %d\n", 33326); return 0; }
+            if (!gate_buf || !up_buf || !down_buf) {
+                fprintf(stderr,
+                        "ds4: routed_moe_one wrap fail rank=%d n_total=%u first=%u n_bind=%u "
+                        "gate_off=%llu up_off=%llu down_off=%llu gbytes=%llu dbytes=%llu\n",
+                        g_tp_split_rank, n_total_expert, first_expert, n_bind_expert,
+                        (unsigned long long)gate_offset, (unsigned long long)up_offset,
+                        (unsigned long long)down_offset,
+                        (unsigned long long)gate_tensor_bytes,
+                        (unsigned long long)down_tensor_bytes);
+                return 0;
+            }
         }
         if (q4_grouped_boundary || q4_exact_boundary || q4_table_boundary) {
             if (ds4_gpu_end_commands() == 0 || ds4_gpu_begin_commands() == 0) {

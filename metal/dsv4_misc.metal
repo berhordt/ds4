@@ -102,6 +102,8 @@ struct ds4_metal_args_dsv4_router_select_one {
     uint32_t use_token_buffer;
     uint32_t token;
     uint32_t hash_rows;
+    int32_t  first_expert;   /* TP shard: owned expert range [first, first+n) */
+    int32_t  n_bind_expert;
 };
 
 struct ds4_metal_args_glm_router_select_one {
@@ -4704,6 +4706,11 @@ kernel void kernel_dsv4_router_finalize_one(
     threadgroup int32_t *idx = (threadgroup int32_t *)(scratch + 256);
     const float p = probs[tid];
     sel_scores[tid] = args.has_bias ? p + bias[tid] : p;
+    if (args.n_bind_expert > 0 &&
+        ((int32_t)tid < args.first_expert ||
+         (int32_t)tid >= args.first_expert + args.n_bind_expert)) {
+        sel_scores[tid] = -FLT_MAX;   /* TP: only the owned shard routes */
+    }
     idx[tid] = (int32_t)tid;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -4771,6 +4778,11 @@ kernel void kernel_dsv4_router_finalize_one_simd(
         (threadgroup int32_t *)(scratch + 768);
     const float p = probs[tid];
     float score = args.has_bias ? p + bias[tid] : p;
+    if (args.n_bind_expert > 0 &&
+        ((int32_t)tid < args.first_expert ||
+         (int32_t)tid >= args.first_expert + args.n_bind_expert)) {
+        score = -FLT_MAX;   /* TP: only the owned shard routes */
+    }
     int32_t idx = (int32_t)tid;
     uint cross_stage = 0;
 
@@ -4847,6 +4859,11 @@ kernel void kernel_dsv4_router_finalize_weights_one_simd(
         (threadgroup int32_t *)(scratch + 768);
     const float p = probs[tid];
     float score = args.has_bias ? p + bias[tid] : p;
+    if (args.n_bind_expert > 0 &&
+        ((int32_t)tid < args.first_expert ||
+         (int32_t)tid >= args.first_expert + args.n_bind_expert)) {
+        score = -FLT_MAX;   /* TP: only the owned shard routes */
+    }
     int32_t idx = (int32_t)tid;
     uint cross_stage = 0;
 

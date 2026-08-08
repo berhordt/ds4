@@ -1250,6 +1250,7 @@ static int tp_rdma_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint
             } else {
                 r->send_outstanding++;
             }
+            off += len;
         }
         pthread_mutex_unlock(&r->post_lock);
     }
