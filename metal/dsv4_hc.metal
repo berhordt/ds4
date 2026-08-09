@@ -12,6 +12,8 @@ struct ds4_metal_args_dsv4_hc_weighted_sum {
     int64_t  n_embd;
     int64_t  n_hc;
     int64_t  n_tokens;
+    int64_t  embd0;    /* TP mesh: this rank's first embedding index */
+    int64_t  embd_n;   /* TP mesh: this rank's embedding count */
     uint64_t nb_x0;
     uint64_t nb_x1;
     uint64_t nb_x2;
@@ -79,6 +81,8 @@ struct ds4_metal_args_dsv4_hc_expand {
     int64_t  n_embd;
     int64_t  n_hc;
     int64_t  n_tokens;
+    int64_t  embd0;    /* TP mesh: this rank's first embedding index */
+    int64_t  embd_n;   /* TP mesh: this rank's embedding count */
     uint64_t nb_block0;
     uint64_t nb_block1;
     uint64_t nb_add0;
@@ -615,13 +619,13 @@ kernel void kernel_dsv4_hc_expand4(
         return;
     }
 
-    const int64_t n_elem = args.n_embd * args.n_tokens;
+    const int64_t n_elem = args.embd_n * args.n_tokens;
     if ((int64_t) gid >= n_elem) {
         return;
     }
 
-    const int64_t d = ((int64_t) gid) % args.n_embd;
-    const int64_t t = ((int64_t) gid) / args.n_embd;
+    const int64_t d = args.embd0 + ((int64_t) gid) % args.embd_n;
+    const int64_t t = ((int64_t) gid) / args.embd_n;
 
     float block_v = *((device const float *) (block_out + d*args.nb_block0 + t*args.nb_block1));
     if (args.has_add) {
@@ -892,13 +896,13 @@ kernel void kernel_dsv4_hc_weighted_sum(
         device  const char * weights,
         device        char * dst,
         uint gid [[thread_position_in_grid]]) {
-    const int64_t n_elem = args.n_embd * args.n_tokens;
+    const int64_t n_elem = args.embd_n * args.n_tokens;
     if ((int64_t) gid >= n_elem) {
         return;
     }
 
-    const int64_t d = ((int64_t) gid) % args.n_embd;
-    const int64_t t = ((int64_t) gid) / args.n_embd;
+    const int64_t d = args.embd0 + ((int64_t) gid) % args.embd_n;
+    const int64_t t = ((int64_t) gid) / args.embd_n;
 
     float acc = 0.0f;
     for (int64_t h = 0; h < args.n_hc; ++h) {

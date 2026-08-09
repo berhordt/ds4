@@ -4594,6 +4594,8 @@ typedef struct {
     int64_t n_embd;
     int64_t n_hc;
     int64_t n_tokens;
+    int64_t embd0;    /* TP mesh: this rank's first embedding index */
+    int64_t embd_n;   /* TP mesh: this rank's embedding count */
     uint64_t nb_x0;
     uint64_t nb_x1;
     uint64_t nb_x2;
@@ -4661,6 +4663,8 @@ typedef struct {
     int64_t n_embd;
     int64_t n_hc;
     int64_t n_tokens;
+    int64_t embd0;    /* TP mesh: this rank's first embedding index */
+    int64_t embd_n;   /* TP mesh: this rank's embedding count */
     uint64_t nb_block0;
     uint64_t nb_block1;
     uint64_t nb_add0;
@@ -39391,6 +39395,8 @@ static int ds4_gpu_hc_weighted_sum_strided(
             .n_embd = n_embd,
             .n_hc = n_hc,
             .n_tokens = (int64_t)n_tokens64,
+            .embd0 = 0,
+            .embd_n = (int64_t)n_embd,
             .nb_x0 = sizeof(float),
             .nb_x1 = (uint64_t)n_embd * sizeof(float),
             .nb_x2 = (uint64_t)n_hc * n_embd * sizeof(float),
@@ -40071,6 +40077,8 @@ int ds4_gpu_hc_expand_tensor(
             .n_embd = n_embd,
             .n_hc = n_hc,
             .n_tokens = (int64_t)n_tokens64,
+            .embd0 = 0,
+            .embd_n = (int64_t)n_embd,
             .nb_block0 = sizeof(float),
             .nb_block1 = (uint64_t)n_embd * sizeof(float),
             .nb_add0 = sizeof(float),
@@ -40188,6 +40196,8 @@ int ds4_gpu_hc_expand_add_tensor(
             .n_embd = n_embd,
             .n_hc = n_hc,
             .n_tokens = (int64_t)n_tokens64,
+            .embd0 = 0,
+            .embd_n = (int64_t)n_embd,
             .nb_block0 = sizeof(float),
             .nb_block1 = (uint64_t)n_embd * sizeof(float),
             .nb_add0 = sizeof(float),
@@ -40294,6 +40304,8 @@ int ds4_gpu_hc_expand_split_tensor(
             .n_embd = n_embd,
             .n_hc = n_hc,
             .n_tokens = (int64_t)n_tokens64,
+            .embd0 = 0,
+            .embd_n = (int64_t)n_embd,
             .nb_block0 = sizeof(float),
             .nb_block1 = (uint64_t)n_embd * sizeof(float),
             .nb_add0 = sizeof(float),
@@ -40415,6 +40427,8 @@ int ds4_gpu_hc_expand_add_split_tensor(
             .n_embd = n_embd,
             .n_hc = n_hc,
             .n_tokens = (int64_t)n_tokens64,
+            .embd0 = 0,
+            .embd_n = (int64_t)n_embd,
             .nb_block0 = sizeof(float),
             .nb_block1 = (uint64_t)n_embd * sizeof(float),
             .nb_add0 = sizeof(float),

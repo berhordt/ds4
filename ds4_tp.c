@@ -190,6 +190,8 @@ struct ds4_tp {
     uint64_t batch_out_off;     /* [layer][row] verify-block local partials */
     uint64_t batch_in_off;      /* [layer][row] verify-block peer partials */
     uint64_t batch_combined_off;/* canonical batch sum for world>2 */
+    uint64_t bulk_stage_off;    /* per-peer bulk RDMA staging (send+recv) */
+    uint64_t bulk_stage_bytes;  /* one peer's staging size (BULK_SLOTS x MAX_MSG) */
     uint64_t timeout_sec;
     atomic_bool failed;
 #ifdef DS4_TP_HAVE_VERBS
@@ -701,7 +703,8 @@ uint64_t ds4_tp_slab_bytes(uint32_t n_layer, uint32_t n_embd, uint32_t world) {
            slots * 8 +                       /* out flag staging */
            16 +                              /* token slot */
            slots * 4 +                       /* GPU-written gate-ready flags */
-           (uint64_t)n_layer * DS4_TP_BATCH_MAX_ROWS * vec * (1 + peers + 1);
+           (uint64_t)n_layer * DS4_TP_BATCH_MAX_ROWS * vec * (1 + peers + 1) +
+           peers * DS4_TP_RDMA_BULK_SLOTS * DS4_TP_RDMA_MAX_MSG * 2;
 }
 
 static void tp_slab_layout(ds4_tp *tp) {
@@ -721,8 +724,10 @@ static void tp_slab_layout(ds4_tp *tp) {
                        (uint64_t)tp->n_layer * DS4_TP_BATCH_MAX_ROWS * vec;
     tp->batch_combined_off = tp->batch_in_off +
                        (uint64_t)tp->n_layer * DS4_TP_BATCH_MAX_ROWS * peers * vec;
-    tp->slab_bytes = tp->batch_combined_off +
-                     (uint64_t)tp->n_layer * DS4_TP_BATCH_MAX_ROWS * vec;
+    tp->bulk_stage_bytes = (uint64_t)DS4_TP_RDMA_BULK_SLOTS * DS4_TP_RDMA_MAX_MSG;
+    tp->bulk_stage_off = tp->batch_combined_off +
+                         (uint64_t)tp->n_layer * DS4_TP_BATCH_MAX_ROWS * vec;
+    tp->slab_bytes = tp->bulk_stage_off + tp->bulk_stage_bytes * peers * 2;
 }
 
 uint64_t ds4_tp_slab_gpu_flags_offset(const ds4_tp *tp) {
@@ -1405,150 +1410,196 @@ static int tp_rdma_drain_decode_window(ds4_tp *tp, int peer) {
  * staging memory and is idle during normal prefill.  Per-link: sends `out`
  * to peer and receives the peer's `in` into `in` (world>2 callers provide a
  * per-peer buffer of (world-1)*bytes). */
-static int tp_rdma_big_gate_exchange(ds4_tp *tp, int peer,
-                                     const void *out,
-                                     void *in,
-                                     uint64_t bytes) {
+/* Parallel bulk exchange state: each peer's 25 MB prefill gate is chunked
+ * into rounds of DS4_TP_RDMA_BULK_SLOTS x 16 KB messages.  The per-peer
+ * transfers are posted on their own QP/link so all peers advance
+ * concurrently; the previous implementation ran the three peers strictly
+ * one after another, making the gate latency 3x the round-trip count. */
+typedef struct {
+    int        peer;
+    const void *out;
+    void       *in;
+    uint64_t   bytes;
+    int        direct;
+    uint64_t   stage_send_off;
+    uint64_t   stage_recv_off;
+    uint64_t   off;
+    uint32_t   chunks;
+    uint64_t   round_bytes;
+    uint64_t   chunk_off[DS4_TP_RDMA_BULK_SLOTS];
+    uint32_t   lens[DS4_TP_RDMA_BULK_SLOTS];
+    uint32_t   recv_done;
+    int        send_done;
+    int        posted;
+} tp_rdma_bulk_peer;
+
+static int tp_rdma_bulk_peer_init(ds4_tp *tp, tp_rdma_bulk_peer *st,
+                                  int peer, const void *out, void *in,
+                                  uint64_t bytes) {
     ds4_tp_rdma_link *r = &tp->rdma[peer];
     if (!tp_rdma_big_gate_capable(tp, peer) || r->recv_window_active) return 0;
-
-    /* Payloads already inside the registered slab (verify batches) can ride
-     * directly. Ordinary prefill tensors use the idle verify regions as
-     * registered staging because their standalone MTLBuffers are not in the
-     * NIC memory region. */
     const uintptr_t slab_lo = (uintptr_t)tp->slab;
     const uintptr_t slab_hi = slab_lo + tp->slab_bytes;
     const uintptr_t out_lo = (uintptr_t)out;
     const uintptr_t in_lo = (uintptr_t)in;
-    const bool direct =
+    memset(st, 0, sizeof(*st));
+    st->peer = peer;
+    st->out = out;
+    st->in = in;
+    st->bytes = bytes;
+    st->direct =
         out_lo >= slab_lo && out_lo <= slab_hi && bytes <= slab_hi - out_lo &&
         in_lo >= slab_lo && in_lo <= slab_hi && bytes <= slab_hi - in_lo;
-    uint8_t *stage_send = tp->slab + tp->batch_out_off;
-    uint8_t *stage_recv = tp->slab + tp->batch_in_off;
-    uint64_t off = 0;
-    while (off < bytes) {
-        const uint64_t remaining = bytes - off;
-        uint32_t chunks = (uint32_t)((remaining + DS4_TP_RDMA_MAX_MSG - 1u) /
-                                     DS4_TP_RDMA_MAX_MSG);
-        if (chunks > DS4_TP_RDMA_BULK_SLOTS)
-            chunks = DS4_TP_RDMA_BULK_SLOTS;
+    const uint64_t pidx = tp_in_peer_index(tp, peer);
+    st->stage_send_off = tp->bulk_stage_off + pidx * tp->bulk_stage_bytes;
+    st->stage_recv_off = tp->bulk_stage_off +
+                         (uint64_t)(tp->world - 1) * tp->bulk_stage_bytes +
+                         pidx * tp->bulk_stage_bytes;
+    return 1;
+}
 
-        uint32_t lens[DS4_TP_RDMA_BULK_SLOTS];
-        uint64_t chunk_off[DS4_TP_RDMA_BULK_SLOTS];
-        uint64_t round_bytes = 0;
-        for (uint32_t i = 0; i < chunks; i++) {
-            const uint64_t left = remaining - round_bytes;
-            lens[i] = (uint32_t)(left > DS4_TP_RDMA_MAX_MSG ?
+/* Post one round of chunks for this peer (non-blocking). */
+static int tp_rdma_bulk_peer_post(ds4_tp *tp, tp_rdma_bulk_peer *st) {
+    ds4_tp_rdma_link *r = &tp->rdma[st->peer];
+    if (st->posted || st->off >= st->bytes) return 1;
+    const uint64_t remaining = st->bytes - st->off;
+    uint32_t chunks = (uint32_t)((remaining + DS4_TP_RDMA_MAX_MSG - 1u) /
+                                 DS4_TP_RDMA_MAX_MSG);
+    if (chunks > DS4_TP_RDMA_BULK_SLOTS) chunks = DS4_TP_RDMA_BULK_SLOTS;
+    uint8_t *stage_send = tp->slab + st->stage_send_off;
+    uint8_t *stage_recv = tp->slab + st->stage_recv_off;
+    uint64_t round_bytes = 0;
+    for (uint32_t i = 0; i < chunks; i++) {
+        const uint64_t left = remaining - round_bytes;
+        st->lens[i] = (uint32_t)(left > DS4_TP_RDMA_MAX_MSG ?
                                  DS4_TP_RDMA_MAX_MSG : left);
-            chunk_off[i] = direct ? round_bytes :
-                (uint64_t)i * DS4_TP_RDMA_MAX_MSG;
-            if (!direct) {
-                memcpy(stage_send + chunk_off[i],
-                       (const uint8_t *)out + off + round_bytes, lens[i]);
-            }
-            round_bytes += lens[i];
+        st->chunk_off[i] = st->direct ? round_bytes :
+            (uint64_t)i * DS4_TP_RDMA_MAX_MSG;
+        if (!st->direct) {
+            memcpy(stage_send + st->chunk_off[i],
+                   (const uint8_t *)st->out + st->off + round_bytes,
+                   st->lens[i]);
         }
+        round_bytes += st->lens[i];
+    }
+    st->chunks = chunks;
+    st->round_bytes = round_bytes;
+    st->recv_done = 0;
+    st->send_done = 0;
 
-        struct ibv_sge recv_sge[DS4_TP_RDMA_BULK_SLOTS];
-        struct ibv_recv_wr recv_wr[DS4_TP_RDMA_BULK_SLOTS];
-        memset(recv_wr, 0, sizeof(recv_wr));
-        for (uint32_t i = 0; i < chunks; i++) {
-            recv_sge[i] = (struct ibv_sge) {
-                .addr = direct ? in_lo + off + chunk_off[i] :
-                                 (uintptr_t)(stage_recv + chunk_off[i]),
-                .length = lens[i],
-                .lkey = r->mr->lkey,
-            };
-            recv_wr[i].wr_id = DS4_TP_RDMA_BULK_WR_TAG | ((uint64_t)i + 1u);
-            recv_wr[i].sg_list = &recv_sge[i];
-            recv_wr[i].num_sge = 1;
-            recv_wr[i].next = i + 1u < chunks ? &recv_wr[i + 1u] : NULL;
-        }
-        struct ibv_recv_wr *bad_recv = NULL;
-        if (ibv_post_recv(r->qp, recv_wr, &bad_recv) != 0) {
-            fprintf(stderr, "ds4-tp: bulk rdma post_recv: %s\n",
-                    strerror(errno));
+    struct ibv_sge recv_sge[DS4_TP_RDMA_BULK_SLOTS];
+    struct ibv_recv_wr recv_wr[DS4_TP_RDMA_BULK_SLOTS];
+    memset(recv_wr, 0, sizeof(recv_wr));
+    for (uint32_t i = 0; i < chunks; i++) {
+        recv_sge[i] = (struct ibv_sge) {
+            .addr = st->direct ?
+                (uintptr_t)((uint8_t *)st->in + st->off + st->chunk_off[i]) :
+                (uintptr_t)(stage_recv + st->chunk_off[i]),
+            .length = st->lens[i],
+            .lkey = r->mr->lkey,
+        };
+        recv_wr[i].wr_id = DS4_TP_RDMA_BULK_WR_TAG | ((uint64_t)i + 1u);
+        recv_wr[i].sg_list = &recv_sge[i];
+        recv_wr[i].num_sge = 1;
+        recv_wr[i].next = i + 1u < chunks ? &recv_wr[i + 1u] : NULL;
+    }
+    struct ibv_recv_wr *bad_recv = NULL;
+    if (ibv_post_recv(r->qp, recv_wr, &bad_recv) != 0) {
+        fprintf(stderr, "ds4-tp: bulk rdma post_recv: %s\n", strerror(errno));
+        return 0;
+    }
+    atomic_thread_fence(memory_order_release);
+    struct ibv_sge send_sge[DS4_TP_RDMA_BULK_SLOTS];
+    struct ibv_send_wr send_wr[DS4_TP_RDMA_BULK_SLOTS];
+    memset(send_wr, 0, sizeof(send_wr));
+    for (uint32_t i = 0; i < chunks; i++) {
+        send_sge[i] = (struct ibv_sge) {
+            .addr = st->direct ?
+                (uintptr_t)((uint8_t *)st->out + st->off + st->chunk_off[i]) :
+                (uintptr_t)(stage_send + st->chunk_off[i]),
+            .length = st->lens[i],
+            .lkey = r->mr->lkey,
+        };
+        send_wr[i].wr_id = DS4_TP_RDMA_BULK_WR_TAG | ((uint64_t)i + 1u);
+        send_wr[i].sg_list = &send_sge[i];
+        send_wr[i].num_sge = 1;
+        send_wr[i].opcode = IBV_WR_SEND;
+        send_wr[i].send_flags = i + 1u == chunks ? IBV_SEND_SIGNALED : 0;
+        send_wr[i].next = i + 1u < chunks ? &send_wr[i + 1u] : NULL;
+    }
+    struct ibv_send_wr *bad_send = NULL;
+    if (ibv_post_send(r->qp, send_wr, &bad_send) != 0) {
+        fprintf(stderr, "ds4-tp: bulk rdma post_send: %s\n", strerror(errno));
+        return 0;
+    }
+    st->posted = 1;
+    return 1;
+}
+
+/* Poll this peer's CQ; advance the round when its chunks complete. */
+static int tp_rdma_bulk_peer_poll(ds4_tp *tp, tp_rdma_bulk_peer *st) {
+    ds4_tp_rdma_link *r = &tp->rdma[st->peer];
+    struct ibv_wc wc[DS4_TP_RDMA_BULK_SLOTS + 1u];
+    int n = ibv_poll_cq(r->cq, (int)(DS4_TP_RDMA_BULK_SLOTS + 1u), wc);
+    if (n < 0) return 0;
+    for (int i = 0; i < n; i++) {
+        if (wc[i].status != IBV_WC_SUCCESS) {
+            fprintf(stderr, "ds4-tp: bulk rdma completion error: %s\n",
+                    tp_wc_status_str(wc[i].status));
             return 0;
         }
-        atomic_thread_fence(memory_order_release);
-        struct ibv_sge send_sge[DS4_TP_RDMA_BULK_SLOTS];
-        struct ibv_send_wr send_wr[DS4_TP_RDMA_BULK_SLOTS];
-        memset(send_wr, 0, sizeof(send_wr));
-        for (uint32_t i = 0; i < chunks; i++) {
-            send_sge[i] = (struct ibv_sge) {
-                .addr = direct ? out_lo + off + chunk_off[i] :
-                                 (uintptr_t)(stage_send + chunk_off[i]),
-                .length = lens[i],
-                .lkey = r->mr->lkey,
-            };
-            send_wr[i].wr_id = DS4_TP_RDMA_BULK_WR_TAG | ((uint64_t)i + 1u);
-            send_wr[i].sg_list = &send_sge[i];
-            send_wr[i].num_sge = 1;
-            send_wr[i].opcode = IBV_WR_SEND;
-            send_wr[i].send_flags = i + 1u == chunks ? IBV_SEND_SIGNALED : 0;
-            send_wr[i].next = i + 1u < chunks ? &send_wr[i + 1u] : NULL;
+        if ((wc[i].wr_id & DS4_TP_RDMA_BULK_WR_TAG) == 0) {
+            /* A final latency-QP send completion can remain queued when a
+             * later prompt starts a bulk gate. */
+            if (wc[i].opcode & IBV_WC_RECV) {
+                if (wc[i].wr_id > r->recv_done) r->recv_done = wc[i].wr_id;
+            } else if (r->send_outstanding > 0) {
+                r->send_outstanding--;
+            }
+            continue;
         }
-        struct ibv_send_wr *bad_send = NULL;
-        if (ibv_post_send(r->qp, send_wr, &bad_send) != 0) {
-            fprintf(stderr, "ds4-tp: bulk rdma post_send: %s\n",
-                    strerror(errno));
+        if (wc[i].opcode & IBV_WC_RECV) st->recv_done++;
+        else st->send_done = 1;
+    }
+    if (st->posted && st->recv_done >= st->chunks && st->send_done) {
+        if (!st->direct) {
+            uint64_t round_bytes = 0;
+            for (uint32_t i = 0; i < st->chunks; i++) {
+                memcpy((uint8_t *)st->in + st->off + round_bytes,
+                       tp->slab + st->stage_recv_off + st->chunk_off[i],
+                       st->lens[i]);
+                round_bytes += st->lens[i];
+            }
+        }
+        st->off += st->round_bytes;
+        st->posted = 0;
+    }
+    return 1;
+}
+
+/* Drive one peer's bulk transfer to completion, posting each next round as
+ * the previous finishes so its rounds interleave with the other peers'. */
+static int tp_rdma_bulk_peer_finish(ds4_tp *tp, tp_rdma_bulk_peer *st) {
+    const double deadline = tp_now_sec() + (double)tp->timeout_sec;
+    uint32_t peer_poll = 0;
+    while (st->off < st->bytes) {
+        if (!st->posted) {
+            if (!tp_rdma_bulk_peer_post(tp, st)) return 0;
+        }
+        if (!tp_rdma_bulk_peer_poll(tp, st)) return 0;
+        if ((peer_poll++ & 0x3fffu) == 0 && tp_peer_closed(tp, st->peer)) {
+            fprintf(stderr,
+                    "ds4-tp: peer %d disconnected during bulk RDMA gate\n",
+                    st->peer);
             return 0;
         }
-
-        uint32_t recv_done = 0;
-        int send_done = 0;
-        const double deadline = tp_now_sec() + (double)tp->timeout_sec;
-        uint32_t peer_poll = 0;
-        while (recv_done < chunks || !send_done) {
-            struct ibv_wc wc[DS4_TP_RDMA_BULK_SLOTS + 1u];
-            int n = ibv_poll_cq(r->cq,
-                               (int)(DS4_TP_RDMA_BULK_SLOTS + 1u), wc);
-            if (n < 0) return 0;
-            for (int i = 0; i < n; i++) {
-                if (wc[i].status != IBV_WC_SUCCESS) {
-                    fprintf(stderr,
-                            "ds4-tp: bulk rdma completion error: %s\n",
-                            tp_wc_status_str(wc[i].status));
-                    return 0;
-                }
-                if ((wc[i].wr_id & DS4_TP_RDMA_BULK_WR_TAG) == 0) {
-                    /* A final latency-QP send completion can remain queued
-                     * when a later prompt starts a bulk gate. */
-                    if (wc[i].opcode & IBV_WC_RECV) {
-                        if (wc[i].wr_id > r->recv_done)
-                            r->recv_done = wc[i].wr_id;
-                    } else if (r->send_outstanding > 0) {
-                        r->send_outstanding--;
-                    }
-                    continue;
-                }
-                if (wc[i].opcode & IBV_WC_RECV) recv_done++;
-                else send_done = 1;
-            }
-            if ((peer_poll++ & 0x3fffu) == 0 && tp_peer_closed(tp, peer)) {
-                fprintf(stderr,
-                        "ds4-tp: peer %d disconnected during bulk RDMA gate\n",
-                        peer);
-                return 0;
-            }
-            if (tp_now_sec() > deadline) {
-                fprintf(stderr,
-                        "ds4-tp: timeout waiting for bulk RDMA round "
-                        "(%u/%u recvs, send=%d)\n",
-                        recv_done, chunks, send_done);
-                return 0;
-            }
+        if (tp_now_sec() > deadline) {
+            fprintf(stderr,
+                    "ds4-tp: timeout waiting for bulk RDMA round (%u/%u "
+                    "recvs, send=%d)\n",
+                    st->recv_done, st->chunks, st->send_done);
+            return 0;
         }
-        atomic_thread_fence(memory_order_acquire);
-        if (!direct) {
-            round_bytes = 0;
-            for (uint32_t i = 0; i < chunks; i++) {
-                memcpy((uint8_t *)in + off + round_bytes,
-                       stage_recv + chunk_off[i], lens[i]);
-                round_bytes += lens[i];
-            }
-        }
-        off += round_bytes;
     }
     return 1;
 }
@@ -2034,13 +2085,23 @@ int ds4_tp_batch_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows,
             }
             if (!tp_rdma_drain_decode_window(tp, m)) return 0;
         }
+        tp_rdma_bulk_peer st[DS4_TP_MAX_WORLD];
+        int npeers = 0;
         for (int m = 0; m < tp->world; m++) {
             if (m == tp->rank) continue;
             uint8_t *in_peer = tp->slab +
                 tp_slab_batch_in_peer_offset(tp, layer, m);
-            if (!tp_rdma_big_gate_exchange(tp, m,
+            if (!tp_rdma_bulk_peer_init(tp, &st[npeers], m,
                     tp->slab + ds4_tp_slab_batch_out_offset(tp, layer),
-                    in_peer, bytes)) return 0;
+                    in_peer, bytes))
+                return 0;
+            npeers++;
+        }
+        for (int i = 0; i < npeers; i++) {
+            if (!tp_rdma_bulk_peer_post(tp, &st[i])) return 0;
+        }
+        for (int i = 0; i < npeers; i++) {
+            if (!tp_rdma_bulk_peer_finish(tp, &st[i])) return 0;
         }
         if (tp->world > 2) tp_batch_combine(tp, layer, rows);
         return 1;
@@ -2107,7 +2168,9 @@ int ds4_tp_big_gate_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
     ds4_tp_gate_header h = { DS4_TP_BATCH_MAGIC, (uint16_t)layer, 0xB16u, seq };
 #ifdef DS4_TP_HAVE_VERBS
     if (tp->rdma_active) {
-        /* Per-link header barrier and drain, then the bulk exchange. */
+        /* Per-link header barrier and drain, then the bulk exchange with all
+         * peers in flight (each link is its own QP, so the transfers run
+         * concurrently instead of serially). */
         for (int m = 0; m < tp->world; m++) {
             if (m == tp->rank) continue;
             if (!tp_write_full(tp->data_fd[m], &h, sizeof(h))) return 0;
@@ -2123,12 +2186,21 @@ int ds4_tp_big_gate_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
             }
             if (!tp_rdma_drain_decode_window(tp, m)) return 0;
         }
+        tp_rdma_bulk_peer st[DS4_TP_MAX_WORLD];
+        int npeers = 0;
         for (int m = 0; m < tp->world; m++) {
             if (m == tp->rank) continue;
             uint8_t *in_peer = (uint8_t *)in +
                 (tp->world > 2 ? (uint64_t)tp_in_peer_index(tp, m) * bytes : 0);
-            if (!tp_rdma_big_gate_exchange(tp, m, out, in_peer, bytes))
+            if (!tp_rdma_bulk_peer_init(tp, &st[npeers], m, out, in_peer, bytes))
                 return 0;
+            npeers++;
+        }
+        for (int i = 0; i < npeers; i++) {
+            if (!tp_rdma_bulk_peer_post(tp, &st[i])) return 0;
+        }
+        for (int i = 0; i < npeers; i++) {
+            if (!tp_rdma_bulk_peer_finish(tp, &st[i])) return 0;
         }
         if (getenv("DS4_GLM_TP_DEBUG")) {
             const float *o = (const float *)out;
