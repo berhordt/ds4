@@ -49,6 +49,8 @@ struct ds4_metal_args_dsv4_hc_split_weighted_sum {
     int32_t  sinkhorn_iters;
     int64_t  n_rows;
     int64_t  mix_hc;
+    int64_t  embd0;    /* TP mesh: this rank's first embedding index */
+    int64_t  embd_n;   /* TP mesh: this rank's embedding count */
     uint64_t nb_mix1;
     uint64_t nb_split1;
     uint64_t nb_x0;
@@ -58,6 +60,131 @@ struct ds4_metal_args_dsv4_hc_split_weighted_sum {
     uint64_t nb1;
     float    eps;
 };
+
+/* TP mesh partial RMS: one thread per slice element accumulates its squared
+ * HC value into the per-token slot with a float atomic.  Deliberately no
+ * threadgroup reduction: the tree/simd-sum reductions were miscompiled in the
+ * full-library build for a subset of threadgroups. */
+struct ds4_metal_args_dsv4_hc_rms_partial {
+    int64_t  n_embd;
+    int64_t  n_hc;
+    int64_t  n_tokens;
+    int64_t  embd0;
+    int64_t  embd_n;
+    uint64_t nb_x0;
+    uint64_t nb_x1;
+    uint64_t nb_x2;
+    uint64_t nb_out0;
+};
+
+kernel void kernel_dsv4_hc_rms_partial_sums(
+        constant ds4_metal_args_dsv4_hc_rms_partial & args,
+        device  const char * x,
+        device  atomic<float> * partial,
+        uint gid [[thread_position_in_grid]]) {
+    if (args.n_hc != 4) {
+        return;
+    }
+    const int64_t n_elem = args.embd_n * args.n_hc * args.n_tokens;
+    if ((int64_t) gid >= n_elem) {
+        return;
+    }
+
+    const int64_t d = args.embd0 + (int64_t) gid % args.embd_n;
+    const int64_t h = ((int64_t) gid / args.embd_n) % args.n_hc;
+    const int64_t t = (int64_t) gid / (args.embd_n * args.n_hc);
+    const float xv = *((device const float *)(
+        x + (uint64_t)t * args.nb_x2 + (uint64_t)h * args.nb_x1 +
+        (uint64_t)d * args.nb_x0));
+    const float sq = xv * xv;
+    atomic_fetch_add_explicit(&partial[t], sq, memory_order_relaxed);
+}
+
+/* TP mesh HC pre projection: given the all-reduced full-row sum of squares,
+ * normalize this rank's n_embd slice and compute its partial out_dim
+ * projection (24 for the attention/FFN mixer, 4 for the output head). */
+struct ds4_metal_args_dsv4_hc_rms_norm_matmul_partial {
+    int64_t  n_embd;
+    int64_t  n_hc;
+    int64_t  n_tokens;
+    int64_t  embd0;
+    int64_t  embd_n;
+    int64_t  out_dim;
+    uint64_t nb_x0;
+    uint64_t nb_x1;
+    uint64_t nb_x2;
+    uint64_t nb_w0;
+    uint64_t nb_out0;
+    uint64_t nb_out1;
+    float    eps;
+};
+
+kernel void kernel_dsv4_hc_rms_norm_matmul_partial(
+        constant ds4_metal_args_dsv4_hc_rms_norm_matmul_partial & args,
+        device  const char * x,
+        device  const float * rms_sums,
+        device  const char * w,
+        device        float * out,
+        uint gid [[thread_position_in_grid]]) {
+    const int64_t n_elem = args.n_tokens * args.out_dim;
+    if ((int64_t)gid >= n_elem) {
+        return;
+    }
+    if (args.n_hc != 4) {
+        return;
+    }
+
+    const int64_t t = gid / args.out_dim;
+    const int64_t j = gid % args.out_dim;
+    const float mean_inv = 1.0f / (float)(args.n_hc * args.n_embd);
+    const float scale = 1.0f / sqrt(rms_sums[t] * mean_inv + args.eps);
+
+    float acc = 0.0f;
+    for (int64_t h = 0; h < args.n_hc; ++h) {
+        const uint64_t xbase = (uint64_t)t * args.nb_x2 + (uint64_t)h * args.nb_x1 +
+                               (uint64_t)args.embd0 * args.nb_x0;
+        /* The F16 projection is [out_dim][in_dim] row-major: row j holds the
+         * in_dim weights, so the per-element stride is sizeof(half) and the
+         * row stride nb_w0 == in_dim * sizeof(half). */
+        const uint64_t wbase = (uint64_t)j * args.nb_w0 +
+                               ((uint64_t)h * args.n_embd + (uint64_t)args.embd0) * sizeof(half);
+        for (int64_t d = 0; d < args.embd_n; ++d) {
+            const float xv = *((device const float *)(x + xbase + (uint64_t)d * args.nb_x0));
+            const half wv = *((device const half *)(w + wbase + (uint64_t)d * sizeof(half)));
+            acc += (xv * scale) * (float)wv;
+        }
+    }
+    *((device float *)(out + (uint64_t)j * args.nb_out0 + (uint64_t)t * args.nb_out1)) = acc;
+}
+
+/* TP mesh HC split helper: zero the HC channels' embedding columns outside
+ * this rank's n_embd slice so a sum-based all-reduce of the (zero-padded)
+ * slice reconstructs the full row.  Used for the single final prefill row
+ * before the output head; the slice columns are left untouched. */
+struct ds4_metal_args_dsv4_hc_zero_slice {
+    int64_t  n_embd;
+    int64_t  n_hc;
+    int64_t  embd0;
+    int64_t  embd_n;
+    uint64_t nb_x0;
+    uint64_t nb_x1;
+    uint64_t nb_x2;
+};
+
+kernel void kernel_dsv4_hc_zero_outsides_slice(
+        constant ds4_metal_args_dsv4_hc_zero_slice & args,
+        device        char * x,
+        uint gid [[thread_position_in_grid]]) {
+    if (args.n_hc != 4) {
+        return;
+    }
+    const int64_t d = (int64_t)(gid % (uint)args.n_embd);
+    const int64_t h = (int64_t)(gid / (uint)args.n_embd);
+    if (d >= args.embd0 && d < args.embd0 + args.embd_n) {
+        return;
+    }
+    *((device float *)(x + (uint64_t)d * args.nb_x0 + (uint64_t)h * args.nb_x1)) = 0.0f;
+}
 
 struct ds4_metal_args_dsv4_hc_split_weighted_sum_norm {
     int64_t  n_embd;
@@ -398,13 +525,21 @@ kernel void kernel_dsv4_hc_split_weighted_sum(
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
+    /* TP mesh slice: compute this rank's n_embd slice of the collapsed row and
+     * zero the rest, so the sum-based all-reduce reconstructs the full row.
+     * With the full-range defaults (embd0 == 0, embd_n == n_embd) every d is
+     * in-slice and the code below is bit-identical to the historical loop. */
     for (int64_t d = tid; d < args.n_embd; d += ntg) {
-        float acc = 0.0f;
-        acc += *((device const float *) (x + d*args.nb_x0 + 0*args.nb_x1 + (uint64_t)row*args.nb_x2)) * pre_shmem[0];
-        acc += *((device const float *) (x + d*args.nb_x0 + 1*args.nb_x1 + (uint64_t)row*args.nb_x2)) * pre_shmem[1];
-        acc += *((device const float *) (x + d*args.nb_x0 + 2*args.nb_x1 + (uint64_t)row*args.nb_x2)) * pre_shmem[2];
-        acc += *((device const float *) (x + d*args.nb_x0 + 3*args.nb_x1 + (uint64_t)row*args.nb_x2)) * pre_shmem[3];
-        *((device float *) (dst + d*args.nb0 + (uint64_t)row*args.nb1)) = acc;
+        if (d >= args.embd0 && d < args.embd0 + args.embd_n) {
+            float acc = 0.0f;
+            acc += *((device const float *) (x + d*args.nb_x0 + 0*args.nb_x1 + (uint64_t)row*args.nb_x2)) * pre_shmem[0];
+            acc += *((device const float *) (x + d*args.nb_x0 + 1*args.nb_x1 + (uint64_t)row*args.nb_x2)) * pre_shmem[1];
+            acc += *((device const float *) (x + d*args.nb_x0 + 2*args.nb_x1 + (uint64_t)row*args.nb_x2)) * pre_shmem[2];
+            acc += *((device const float *) (x + d*args.nb_x0 + 3*args.nb_x1 + (uint64_t)row*args.nb_x2)) * pre_shmem[3];
+            *((device float *) (dst + d*args.nb0 + (uint64_t)row*args.nb1)) = acc;
+        } else {
+            *((device float *) (dst + d*args.nb0 + (uint64_t)row*args.nb1)) = 0.0f;
+        }
     }
 }
 
@@ -896,22 +1031,28 @@ kernel void kernel_dsv4_hc_weighted_sum(
         device  const char * weights,
         device        char * dst,
         uint gid [[thread_position_in_grid]]) {
-    const int64_t n_elem = args.embd_n * args.n_tokens;
+    const int64_t n_elem = args.n_embd * args.n_tokens;
     if ((int64_t) gid >= n_elem) {
         return;
     }
 
-    const int64_t d = args.embd0 + ((int64_t) gid) % args.embd_n;
-    const int64_t t = ((int64_t) gid) / args.embd_n;
-
-    float acc = 0.0f;
-    for (int64_t h = 0; h < args.n_hc; ++h) {
-        const float xv = *((device const float *) (x       + d*args.nb_x0 + h*args.nb_x1 + t*args.nb_x2));
-        const float wv = *((device const float *) (weights + h*args.nb_w0 + t*args.nb_w1));
-        acc += xv * wv;
+    const int64_t d = (int64_t) gid % args.n_embd;
+    const int64_t t = (int64_t) gid / args.n_embd;
+    /* TP mesh slice: compute this rank's n_embd slice of the collapsed row and
+     * zero the rest so the sum-based all-reduce reconstructs the full row.
+     * With the full-range defaults (embd0 == 0, embd_n == n_embd) every d is
+     * in-slice and the code is bit-identical to the historical loop. */
+    if (d >= args.embd0 && d < args.embd0 + args.embd_n) {
+        float acc = 0.0f;
+        for (int64_t h = 0; h < args.n_hc; ++h) {
+            const float xv = *((device const float *) (x       + d*args.nb_x0 + h*args.nb_x1 + t*args.nb_x2));
+            const float wv = *((device const float *) (weights + h*args.nb_w0 + t*args.nb_w1));
+            acc += xv * wv;
+        }
+        *((device float *) (dst + d*args.nb0 + t*args.nb1)) = acc;
+    } else {
+        *((device float *) (dst + d*args.nb0 + t*args.nb1)) = 0.0f;
     }
-
-    *((device float *) (dst + d*args.nb0 + t*args.nb1)) = acc;
 }
 
 // The one-row output head immediately applies a learned RMSNorm after reducing

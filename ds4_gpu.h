@@ -2420,6 +2420,17 @@ int ds4_gpu_hc_weighted_sum_tensor(
         uint32_t                n_embd,
         uint32_t                n_hc);
 
+/* TP mesh slice variant: computes this rank's n_embd slice of the collapsed
+ * row and zeroes the rest for a sum-based all-reduce. */
+int ds4_gpu_hc_weighted_sum_slice_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *weights,
+        uint32_t                n_embd,
+        uint32_t                n_hc,
+        int64_t                 embd0,
+        int64_t                 embd_n);
+
 int ds4_gpu_hc_weighted_sum_norm_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *norm_out,
@@ -2453,7 +2464,42 @@ int ds4_gpu_hc_split_weighted_sum_tensor(
         uint32_t                n_embd,
         uint32_t                n_hc,
         uint32_t                sinkhorn_iters,
+        float                   eps,
+        int64_t                 embd0,
+        int64_t                 embd_n);
+
+/* TP mesh partial RMS sums over this rank's n_embd slice of the HC state
+ * (per-element float atomics; no threadgroup reduction). */
+int ds4_gpu_hc_rms_partial_sums_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        uint32_t                n_embd,
+        uint32_t                n_hc,
+        uint32_t                n_tokens);
+
+/* TP mesh HC pre projection partial: normalize the rank's n_embd slice with
+ * the all-reduced full-row RMS and compute its partial out_dim projection. */
+int ds4_gpu_hc_rms_norm_matmul_partial_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *rms_sums,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint32_t                n_embd,
+        uint32_t                n_hc,
+        uint32_t                n_tokens,
+        uint32_t                out_dim,
         float                   eps);
+
+/* TP mesh HC split helper: zero the HC channels' embedding columns outside
+ * this rank's n_embd slice on a single token row. */
+int ds4_gpu_hc_zero_outsides_slice_tensor(
+        ds4_gpu_tensor       *x,
+        uint32_t                n_embd,
+        uint32_t                n_hc,
+        int64_t                 embd0,
+        int64_t                 embd_n);
 
 int ds4_gpu_hc_split_weighted_sum_norm_tensor(
         ds4_gpu_tensor       *out,
@@ -2532,7 +2578,9 @@ int ds4_gpu_hc_expand_split_tensor(
         const ds4_gpu_tensor *residual_hc,
         const ds4_gpu_tensor *split,
         uint32_t                n_embd,
-        uint32_t                n_hc);
+        uint32_t                n_hc,
+        int64_t                 embd0,
+        int64_t                 embd_n);
 
 int ds4_gpu_hc_expand_split_half_tensor(
         ds4_gpu_tensor       *out_hc,
@@ -2549,7 +2597,9 @@ int ds4_gpu_hc_expand_add_split_tensor(
         const ds4_gpu_tensor *residual_hc,
         const ds4_gpu_tensor *split,
         uint32_t                n_embd,
-        uint32_t                n_hc);
+        uint32_t                n_hc,
+        int64_t                 embd0,
+        int64_t                 embd_n);
 
 int ds4_gpu_hc_expand_add_split_half_add_tensor(
         ds4_gpu_tensor       *out_hc,

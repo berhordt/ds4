@@ -90,6 +90,9 @@ static id<MTLComputePipelineState> g_rms_norm_scale_pipeline;
 static id<MTLComputePipelineState> g_dsv4_qkv_rms_norm_pipeline;
 static id<MTLComputePipelineState> g_hc_split_sinkhorn_pipeline;
 static id<MTLComputePipelineState> g_hc_split_weighted_sum_pipeline;
+static id<MTLComputePipelineState> g_hc_rms_partial_sums_pipeline;
+static id<MTLComputePipelineState> g_hc_rms_norm_matmul_partial_pipeline;
+static id<MTLComputePipelineState> g_hc_zero_outsides_slice_pipeline;
 static id<MTLComputePipelineState> g_hc_split_weighted_sum_norm_pipeline;
 static id<MTLComputePipelineState> g_hc_weighted_sum_pipeline;
 static id<MTLComputePipelineState> g_hc_weighted_sum_norm_pipeline;
@@ -4631,6 +4634,8 @@ typedef struct {
     int32_t sinkhorn_iters;
     int64_t n_rows;
     int64_t mix_hc;
+    int64_t embd0;    /* TP mesh: this rank's first embedding index */
+    int64_t embd_n;   /* TP mesh: this rank's embedding count */
     uint64_t nb_mix1;
     uint64_t nb_split1;
     uint64_t nb_x0;
@@ -7439,6 +7444,54 @@ int ds4_gpu_init(void) {
             return 0;
         }
 
+        fn = [library newFunctionWithName:@"kernel_dsv4_hc_rms_partial_sums"];
+        if (!fn) {
+            fprintf(stderr, "ds4: Metal kernel_dsv4_hc_rms_partial_sums function not found\n");
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+        g_hc_rms_partial_sums_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        if (!g_hc_rms_partial_sums_pipeline) {
+            fprintf(stderr, "ds4: Metal kernel_dsv4_hc_rms_partial_sums pipeline failed: %s\n",
+                    [[error localizedDescription] UTF8String]);
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+
+        fn = [library newFunctionWithName:@"kernel_dsv4_hc_rms_norm_matmul_partial"];
+        if (!fn) {
+            fprintf(stderr, "ds4: Metal kernel_dsv4_hc_rms_norm_matmul_partial function not found\n");
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+        g_hc_rms_norm_matmul_partial_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        if (!g_hc_rms_norm_matmul_partial_pipeline) {
+            fprintf(stderr, "ds4: Metal kernel_dsv4_hc_rms_norm_matmul_partial pipeline failed: %s\n",
+                    [[error localizedDescription] UTF8String]);
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+
+        fn = [library newFunctionWithName:@"kernel_dsv4_hc_zero_outsides_slice"];
+        if (!fn) {
+            fprintf(stderr, "ds4: Metal kernel_dsv4_hc_zero_outsides_slice function not found\n");
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+        g_hc_zero_outsides_slice_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        if (!g_hc_zero_outsides_slice_pipeline) {
+            fprintf(stderr, "ds4: Metal kernel_dsv4_hc_zero_outsides_slice pipeline failed: %s\n",
+                    [[error localizedDescription] UTF8String]);
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+
         fn = [library newFunctionWithName:@"kernel_dsv4_hc_weighted_sum"];
         if (!fn) {
             fprintf(stderr, "ds4: Metal kernel_dsv4_hc_weighted_sum function not found\n");
@@ -8389,6 +8442,22 @@ static int32_t g_tp_split_world = 1;
 static int32_t g_tp_split_world_saved;  /* suspend/resume keeps the real world */
 static int32_t g_tp_session_batch_mode;
 
+/* TP mesh HC split helpers.  The n_embd slice is active only for world>2
+ * (world<=2 keeps the full-range defaults so the kernels stay bit-identical
+ * to the historical single-node shape).  Returns the rank's contiguous
+ * embedding slice for the HC state, which is strided across the n_hc
+ * channels in the [t][h][d] layout. */
+static void ds4_gpu_hc_slice(uint32_t n_embd, int64_t *embd0, int64_t *embd_n) {
+    const int32_t world = g_tp_split_world > 2 ? g_tp_split_world : 1;
+    if (world > 1) {
+        *embd_n = (int64_t)(n_embd / (uint32_t)world);
+        *embd0 = (int64_t)g_tp_split_rank * *embd_n;
+    } else {
+        *embd0 = 0;
+        *embd_n = (int64_t)n_embd;
+    }
+}
+
 static int ds4_gpu_tp_world_is_two(void) {
     return g_tp_split_world == 2;
 }
@@ -9148,6 +9217,9 @@ void ds4_gpu_cleanup(void) {
         g_dsv4_qkv_rms_norm_pipeline = nil;
         g_hc_split_sinkhorn_pipeline = nil;
         g_hc_split_weighted_sum_pipeline = nil;
+        g_hc_rms_partial_sums_pipeline = nil;
+        g_hc_rms_norm_matmul_partial_pipeline = nil;
+        g_hc_zero_outsides_slice_pipeline = nil;
         g_hc_split_weighted_sum_norm_pipeline = nil;
         g_hc_weighted_sum_pipeline = nil;
         g_hc_weighted_sum_norm_pipeline = nil;
@@ -39347,6 +39419,8 @@ static int ds4_gpu_hc_weighted_sum_strided(
         uint64_t                weight_row_stride,
         uint32_t                n_embd,
         uint32_t                n_hc,
+        int64_t                 embd0,
+        int64_t                 embd_n,
         const char             *label) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!out || !residual_hc || !weights || n_embd == 0 || n_hc == 0 ||
@@ -39395,8 +39469,8 @@ static int ds4_gpu_hc_weighted_sum_strided(
             .n_embd = n_embd,
             .n_hc = n_hc,
             .n_tokens = (int64_t)n_tokens64,
-            .embd0 = 0,
-            .embd_n = (int64_t)n_embd,
+            .embd0 = embd0,
+            .embd_n = embd_n,
             .nb_x0 = sizeof(float),
             .nb_x1 = (uint64_t)n_embd * sizeof(float),
             .nb_x2 = (uint64_t)n_hc * n_embd * sizeof(float),
@@ -39441,7 +39515,33 @@ int ds4_gpu_hc_weighted_sum_tensor(
                                              (uint64_t)n_hc * sizeof(float),
                                              n_embd,
                                              n_hc,
+                                             0,
+                                             (int64_t)n_embd,
                                              "HC weighted sum");
+}
+
+/* TP mesh slice variant: computes this rank's n_embd slice of the collapsed
+ * row and zeroes the rest, so a sum-based all-reduce reconstructs the full
+ * row.  Used by the prefill output head in the split path; everything else
+ * keeps the full-range ds4_gpu_hc_weighted_sum_tensor. */
+int ds4_gpu_hc_weighted_sum_slice_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *weights,
+        uint32_t                n_embd,
+        uint32_t                n_hc,
+        int64_t                 embd0,
+        int64_t                 embd_n) {
+    return ds4_gpu_hc_weighted_sum_strided(out,
+                                             residual_hc,
+                                             weights,
+                                             0,
+                                             (uint64_t)n_hc * sizeof(float),
+                                             n_embd,
+                                             n_hc,
+                                             embd0,
+                                             embd_n,
+                                             "HC weighted sum slice");
 }
 
 int ds4_gpu_hc_weighted_sum_norm_tensor(
@@ -39575,6 +39675,8 @@ int ds4_gpu_hc_weighted_sum_split_tensor(
                                              mix_hc * sizeof(float),
                                              n_embd,
                                              n_hc,
+                                             0,
+                                             (int64_t)n_embd,
                                              "HC weighted sum split");
 }
 
@@ -39592,7 +39694,9 @@ int ds4_gpu_hc_split_weighted_sum_tensor(
         uint32_t                n_embd,
         uint32_t                n_hc,
         uint32_t                sinkhorn_iters,
-        float                   eps) {
+        float                   eps,
+        int64_t                 embd0,
+        int64_t                 embd_n) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!out || !split || !mix || !residual_hc || !model_map ||
         n_embd == 0 || n_hc == 0) {
@@ -39666,7 +39770,8 @@ int ds4_gpu_hc_split_weighted_sum_tensor(
             .nb1 = out_row_bytes,
             .eps = eps,
         };
-
+        args.embd0 = embd0;
+        args.embd_n = embd_n;
         NSUInteger nth = g_hc_split_weighted_sum_pipeline.maxTotalThreadsPerThreadgroup;
         if (nth > 256u) nth = 256u;
         if (nth > (NSUInteger)n_embd) nth = (NSUInteger)n_embd;
@@ -39691,6 +39796,245 @@ int ds4_gpu_hc_split_weighted_sum_tensor(
         ds4_gpu_end_compute_encoder(cb, enc);
 
         if (!ds4_gpu_finish_command_buffer(cb, owned, "HC split/sum fused")) return 0;
+    }
+
+    return 1;
+}
+
+/* TP mesh partial RMS sums: one thread per slice element accumulates its
+ * squared HC value into the per-token slot with a float atomic (no threadgroup
+ * reduction, so the full-library miscompilation seen with the tree/simd-sum
+ * reductions cannot apply).  The caller all-reduces the partials to obtain
+ * the full-row sums for the HC pre projection. */
+int ds4_gpu_hc_rms_partial_sums_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        uint32_t                n_embd,
+        uint32_t                n_hc,
+        uint32_t                n_tokens) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!out || !x || n_embd == 0 || n_hc != 4 || n_tokens == 0) return 0;
+
+    @autoreleasepool {
+        id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
+        id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out);
+        const uint64_t x_bytes = (uint64_t)n_hc * n_embd * n_tokens * sizeof(float);
+        const uint64_t out_bytes = (uint64_t)n_tokens * sizeof(float);
+        if (!xbuf || !outbuf ||
+            ds4_gpu_tensor_bytes(x) < x_bytes ||
+            ds4_gpu_tensor_bytes(out) < out_bytes) {
+            fprintf(stderr, "ds4: Metal HC partial RMS received undersized activation buffers\n");
+            return 0;
+        }
+
+        int64_t embd0 = 0, embd_n = 0;
+        ds4_gpu_hc_slice(n_embd, &embd0, &embd_n);
+
+        typedef struct {
+            int64_t n_embd;
+            int64_t n_hc;
+            int64_t n_tokens;
+            int64_t embd0;
+            int64_t embd_n;
+            uint64_t nb_x0;
+            uint64_t nb_x1;
+            uint64_t nb_x2;
+            uint64_t nb_out0;
+        } hc_rms_partial_args_t;
+        hc_rms_partial_args_t args = {
+            .n_embd = (int64_t)n_embd,
+            .n_hc = (int64_t)n_hc,
+            .n_tokens = (int64_t)n_tokens,
+            .embd0 = embd0,
+            .embd_n = embd_n,
+            .nb_x0 = sizeof(float),
+            .nb_x1 = (uint64_t)n_embd * sizeof(float),
+            .nb_x2 = (uint64_t)n_hc * n_embd * sizeof(float),
+            .nb_out0 = sizeof(float),
+        };
+
+        const uint64_t n_elem = (uint64_t)embd_n * n_hc * n_tokens;
+        const NSUInteger nth = MIN((NSUInteger)256, MAX((NSUInteger)1, (NSUInteger)n_elem));
+        const NSUInteger n_tg = ((NSUInteger)n_elem + nth - 1u) / nth;
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:g_hc_rms_partial_sums_pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:1];
+        [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:2];
+        [enc dispatchThreadgroups:MTLSizeMake(n_tg, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "HC partial RMS sums")) return 0;
+    }
+
+    return 1;
+}
+
+/* TP mesh HC pre projection partial: normalize this rank's n_embd slice with
+ * the all-reduced full-row RMS and compute its partial out_dim projection.
+ * The caller all-reduces the partials to form the full mix. */
+int ds4_gpu_hc_rms_norm_matmul_partial_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *rms_sums,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint32_t                n_embd,
+        uint32_t                n_hc,
+        uint32_t                n_tokens,
+        uint32_t                out_dim,
+        float                   eps) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!out || !x || !rms_sums || !model_map ||
+        n_embd == 0 || n_hc != 4 || n_tokens == 0 || out_dim == 0) {
+        return 0;
+    }
+
+    @autoreleasepool {
+        id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
+        id<MTLBuffer> rmsbuf = ds4_gpu_tensor_buffer(rms_sums);
+        id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out);
+        const uint64_t x_bytes = (uint64_t)n_hc * n_embd * n_tokens * sizeof(float);
+        const uint64_t rms_bytes = (uint64_t)n_tokens * sizeof(float);
+        const uint64_t out_bytes = (uint64_t)n_tokens * out_dim * sizeof(float);
+        if (!xbuf || !rmsbuf || !outbuf ||
+            ds4_gpu_tensor_bytes(x) < x_bytes ||
+            ds4_gpu_tensor_bytes(rms_sums) < rms_bytes ||
+            ds4_gpu_tensor_bytes(out) < out_bytes) {
+            fprintf(stderr, "ds4: Metal HC partial matmul received undersized activation buffers\n");
+            return 0;
+        }
+
+        const uint64_t row_bytes = (uint64_t)n_hc * n_embd * sizeof(uint16_t);
+        const uint64_t weight_bytes = row_bytes * out_dim;
+        if (weight_offset > model_size || weight_bytes > model_size - weight_offset) {
+            fprintf(stderr, "ds4: Metal HC partial matmul weight range is outside the mapped model\n");
+            return 0;
+        }
+        uint64_t weight_inner = 0;
+        id<MTLBuffer> weightbuf = ds4_gpu_wrap_model_range(
+            model_map, model_size, weight_offset, weight_bytes, &weight_inner);
+        if (!weightbuf) return 0;
+
+        int64_t embd0 = 0, embd_n = 0;
+        ds4_gpu_hc_slice(n_embd, &embd0, &embd_n);
+
+        typedef struct {
+            int64_t n_embd;
+            int64_t n_hc;
+            int64_t n_tokens;
+            int64_t embd0;
+            int64_t embd_n;
+            int64_t out_dim;
+            uint64_t nb_x0;
+            uint64_t nb_x1;
+            uint64_t nb_x2;
+            uint64_t nb_w0;
+            uint64_t nb_out0;
+            uint64_t nb_out1;
+            float eps;
+        } hc_rms_norm_matmul_partial_args_t;
+        hc_rms_norm_matmul_partial_args_t args = {
+            .n_embd = (int64_t)n_embd,
+            .n_hc = (int64_t)n_hc,
+            .n_tokens = (int64_t)n_tokens,
+            .embd0 = embd0,
+            .embd_n = embd_n,
+            .out_dim = (int64_t)out_dim,
+            .nb_x0 = sizeof(float),
+            .nb_x1 = (uint64_t)n_embd * sizeof(float),
+            .nb_x2 = (uint64_t)n_hc * n_embd * sizeof(float),
+            .nb_w0 = (uint64_t)n_hc * n_embd * sizeof(uint16_t),
+            .nb_out0 = sizeof(float),
+            .nb_out1 = (uint64_t)out_dim * sizeof(float),
+            .eps = eps,
+        };
+
+        const NSUInteger nth = MIN((NSUInteger)256, MAX((NSUInteger)1, (NSUInteger)out_dim));
+        const uint64_t n_elem = (uint64_t)n_tokens * out_dim;
+        const NSUInteger n_tg = ((NSUInteger)n_elem + nth - 1u) / nth;
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:g_hc_rms_norm_matmul_partial_pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:1];
+        [enc setBuffer:rmsbuf offset:ds4_gpu_tensor_offset(rms_sums) atIndex:2];
+        [enc setBuffer:weightbuf offset:(NSUInteger)weight_inner atIndex:3];
+        [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:4];
+        [enc dispatchThreadgroups:MTLSizeMake(n_tg, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "HC partial RMS matmul")) return 0;
+    }
+
+    return 1;
+}
+
+/* TP mesh HC split helper: zero the HC channels' embedding columns outside
+ * this rank's n_embd slice on a single token row, so a sum-based all-reduce
+ * reconstructs the full row for the output head. */
+int ds4_gpu_hc_zero_outsides_slice_tensor(
+        ds4_gpu_tensor       *x,
+        uint32_t                n_embd,
+        uint32_t                n_hc,
+        int64_t                 embd0,
+        int64_t                 embd_n) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!x || n_embd == 0 || n_hc != 4 || embd_n <= 0) return 0;
+
+    @autoreleasepool {
+        id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
+        const uint64_t x_bytes = (uint64_t)n_hc * n_embd * sizeof(float);
+        if (!xbuf || ds4_gpu_tensor_bytes(x) < x_bytes) {
+            fprintf(stderr, "ds4: Metal HC zero-outside-slice received undersized buffer\n");
+            return 0;
+        }
+
+        typedef struct {
+            int64_t n_embd;
+            int64_t n_hc;
+            int64_t embd0;
+            int64_t embd_n;
+            uint64_t nb_x0;
+            uint64_t nb_x1;
+            uint64_t nb_x2;
+        } hc_zero_slice_args_t;
+        hc_zero_slice_args_t args = {
+            .n_embd = (int64_t)n_embd,
+            .n_hc = (int64_t)n_hc,
+            .embd0 = embd0,
+            .embd_n = embd_n,
+            .nb_x0 = sizeof(float),
+            .nb_x1 = (uint64_t)n_embd * sizeof(float),
+            .nb_x2 = (uint64_t)n_hc * n_embd * sizeof(float),
+        };
+
+        const uint64_t n_elem = (uint64_t)n_hc * n_embd;
+        const NSUInteger nth = MIN((NSUInteger)256, MAX((NSUInteger)1, (NSUInteger)n_elem));
+        const NSUInteger n_tg = ((NSUInteger)n_elem + nth - 1u) / nth;
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:g_hc_zero_outsides_slice_pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:1];
+        [enc dispatchThreadgroups:MTLSizeMake(n_tg, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "HC zero outside slice")) return 0;
     }
 
     return 1;
@@ -40254,7 +40598,9 @@ int ds4_gpu_hc_expand_split_tensor(
         const ds4_gpu_tensor *residual_hc,
         const ds4_gpu_tensor *split,
         uint32_t                n_embd,
-        uint32_t                n_hc) {
+uint32_t                n_hc,
+        int64_t                 embd0,
+        int64_t                 embd_n) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!out_hc || !block_out || !residual_hc || !split || n_embd == 0 || n_hc == 0) return 0;
 
@@ -40304,8 +40650,8 @@ int ds4_gpu_hc_expand_split_tensor(
             .n_embd = n_embd,
             .n_hc = n_hc,
             .n_tokens = (int64_t)n_tokens64,
-            .embd0 = 0,
-            .embd_n = (int64_t)n_embd,
+.embd0 = embd0,
+.embd_n = embd_n,
             .nb_block0 = sizeof(float),
             .nb_block1 = (uint64_t)n_embd * sizeof(float),
             .nb_add0 = sizeof(float),
@@ -40375,7 +40721,9 @@ int ds4_gpu_hc_expand_add_split_tensor(
         const ds4_gpu_tensor *residual_hc,
         const ds4_gpu_tensor *split,
         uint32_t                n_embd,
-        uint32_t                n_hc) {
+        uint32_t                n_hc,
+        int64_t                 embd0,
+        int64_t                 embd_n) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!out_hc || !block_out || !block_add || !residual_hc || !split || n_embd == 0 || n_hc == 0) return 0;
 
@@ -40427,8 +40775,8 @@ int ds4_gpu_hc_expand_add_split_tensor(
             .n_embd = n_embd,
             .n_hc = n_hc,
             .n_tokens = (int64_t)n_tokens64,
-            .embd0 = 0,
-            .embd_n = (int64_t)n_embd,
+.embd0 = embd0,
+.embd_n = embd_n,
             .nb_block0 = sizeof(float),
             .nb_block1 = (uint64_t)n_embd * sizeof(float),
             .nb_add0 = sizeof(float),
