@@ -123,11 +123,27 @@ void ds4_tp_mark_failed(ds4_tp *tp);
  */
 #define DS4_TP_LINKS(world) ((world) - 1)
 
+/* One directed data link on a node: which peer it connects to, plus this
+ * node's local listen address for that link.  A fully-connected mesh has
+ * world-1 links per node; a ring/partial mesh has fewer (the ring needs
+ * exactly the next and prev peers). */
+typedef struct {
+    int peer;                       /* peer rank this link connects to */
+    char *host;                     /* local listen host for this link */
+    int port;                       /* local listen port for this link */
+} ds4_tp_topology_link;
+
 typedef struct {
     int world;
     struct {
-        char *host[DS4_TP_MAX_WORLD];   /* local listen host per link */
-        int   port[DS4_TP_MAX_WORLD];   /* local listen port per link */
+        /* Control-plane listener (used by rank 0; workers dial it).  On a
+         * ring the data links only reach two neighbours, so control rides
+         * the shared LAN.  Rank 0 listens on control_base_port + m for
+         * worker m (m=1..world-1); worker m dials base_port + m. */
+        char *control_host;
+        int control_port;
+        int n_links;
+        ds4_tp_topology_link link[DS4_TP_MAX_WORLD];
     } node[DS4_TP_MAX_WORLD];
 } ds4_tp_topology;
 
@@ -238,6 +254,8 @@ typedef enum {
     /* Leader broadcasts the mesh-wide RDMA decision to workers after the
      * hello barrier (u32: 1 = RDMA, 0 = TCP fallback). */
     DS4_TP_FRAME_RDMA_MODE = 18,
+    /* Ring-mode hello exchange (relayed control plane). */
+    DS4_TP_FRAME_HELLO = 19,
 } ds4_tp_frame_type;
 
 typedef struct {
