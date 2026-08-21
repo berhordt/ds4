@@ -39853,7 +39853,8 @@ int ds4_gpu_hc_rms_partial_sums_tensor(
             .nb_out0 = sizeof(float),
         };
 
-        const uint64_t n_elem = (uint64_t)embd_n * n_hc * n_tokens;
+        const uint64_t n_chunks = (uint64_t)embd_n / 64u;
+        const uint64_t n_elem = n_chunks * n_hc * n_tokens;
         const NSUInteger nth = MIN((NSUInteger)256, MAX((NSUInteger)1, (NSUInteger)n_elem));
         const NSUInteger n_tg = ((NSUInteger)n_elem + nth - 1u) / nth;
         int owned = 0;

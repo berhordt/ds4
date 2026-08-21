@@ -82,22 +82,28 @@ kernel void kernel_dsv4_hc_rms_partial_sums(
         device  const char * x,
         device  atomic<float> * partial,
         uint gid [[thread_position_in_grid]]) {
-    if (args.n_hc != 4) {
+    if (args.n_hc != 4 || args.embd_n <= 0 || (args.embd_n & 63) != 0) {
         return;
     }
-    const int64_t n_elem = args.embd_n * args.n_hc * args.n_tokens;
+    constexpr short CHUNK = 64;
+    const int64_t n_chunks = args.embd_n / CHUNK;
+    const int64_t n_elem = args.n_tokens * args.n_hc * n_chunks;
     if ((int64_t) gid >= n_elem) {
         return;
     }
 
-    const int64_t d = args.embd0 + (int64_t) gid % args.embd_n;
-    const int64_t h = ((int64_t) gid / args.embd_n) % args.n_hc;
-    const int64_t t = (int64_t) gid / (args.embd_n * args.n_hc);
-    const float xv = *((device const float *)(
-        x + (uint64_t)t * args.nb_x2 + (uint64_t)h * args.nb_x1 +
-        (uint64_t)d * args.nb_x0));
-    const float sq = xv * xv;
-    atomic_fetch_add_explicit(&partial[t], sq, memory_order_relaxed);
+    const int64_t t = (int64_t) gid / (args.n_hc * n_chunks);
+    const int64_t h = ((int64_t) gid / n_chunks) % args.n_hc;
+    const int64_t c = (int64_t) gid % n_chunks;
+    const uint64_t base = (uint64_t)t * args.nb_x2 + (uint64_t)h * args.nb_x1 +
+                          ((uint64_t)args.embd0 + (uint64_t)c * CHUNK) * args.nb_x0;
+
+    float acc = 0.0f;
+    for (short i = 0; i < CHUNK; ++i) {
+        const float xv = *((device const float *)(x + base + (uint64_t)i * args.nb_x0));
+        acc += xv * xv;
+    }
+    atomic_fetch_add_explicit(&partial[t], acc, memory_order_relaxed);
 }
 
 /* TP mesh HC pre projection: given the all-reduced full-row sum of squares,
@@ -154,7 +160,8 @@ kernel void kernel_dsv4_hc_rms_norm_matmul_partial(
             acc += (xv * scale) * (float)wv;
         }
     }
-    *((device float *)(out + (uint64_t)j * args.nb_out0 + (uint64_t)t * args.nb_out1)) = acc;
+    *((device float *)((device char *)out + (uint64_t)j * args.nb_out0 +
+                       (uint64_t)t * args.nb_out1)) = acc;
 }
 
 /* TP mesh HC split helper: zero the HC channels' embedding columns outside
