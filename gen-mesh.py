@@ -366,6 +366,97 @@ def check_mesh(path, hosts, resolved):
     return 1
 
 
+def validate_ring(nodes, hosts, resolved):
+    """Ring mode: every node must be directly linked to its ring next and
+    prev neighbours (rank order).  Extra links are allowed but unused."""
+    world = len(hosts)
+    problems = []
+    for r in range(world):
+        peers = set(resolved[r].keys())
+        nxt = (r + 1) % world
+        prv = (r + world - 1) % world
+        for need in (nxt, prv):
+            if need not in peers:
+                problems.append(
+                    "node %d (%s): no link to ring neighbour %d" %
+                    (r, hosts[r], need))
+            elif r not in resolved[need]:
+                problems.append(
+                    "asymmetric: node %d links to %d but not vice versa" %
+                    (r, need))
+    if problems:
+        for p in problems:
+            print("ERROR: " + p)
+        return False
+    return True
+
+
+def write_ring(path, hosts, resolved, port):
+    """Write the ring topology file (peer-labeled links)."""
+    world = len(hosts)
+    lines = []
+    lines.append("# ds4 TP ring topology - generated %s" %
+                 datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    lines.append("# hosts (rank order): %s" % ", ".join(hosts))
+    lines.append("# ring order: %s" % " -> ".join(
+        [str(r) for r in range(world)] + ["0"]))
+    lines.append("# link-local IPv4 changes on every reboot; regenerate "
+                 "this file after each cluster reboot")
+    lines.append("# each node lists its ring neighbours as 'peer host port'")
+    lines.append("world %d" % world)
+    for r in range(world):
+        nxt = (r + 1) % world
+        prv = (r + world - 1) % world
+        nxt_ip = resolved[r][nxt][1]
+        prv_ip = resolved[r][prv][1]
+        lines.append("node %d %d %s %d %d %s %d" %
+                     (r, nxt, nxt_ip, port, prv, prv_ip, port))
+    with open(path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    print("wrote %s (ring, %d nodes)" % (path, world))
+
+
+def check_ring(path, hosts, resolved):
+    """Check a ring file against the live cluster (peer-labeled)."""
+    world = None
+    nodes = {}
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            toks = line.split()
+            if toks[0] == "world":
+                world = int(toks[1])
+            elif toks[0] == "node":
+                r = int(toks[1])
+                links = {}
+                i = 2
+                while i + 2 < len(toks):
+                    links[int(toks[i])] = toks[i + 1]
+                    i += 3
+                nodes[r] = links
+    if world is None or len(nodes) != world:
+        raise ValueError("malformed ring file %s" % path)
+    changed = []
+    for r in range(world):
+        nxt = (r + 1) % world
+        prv = (r + world - 1) % world
+        for need in (nxt, prv):
+            file_ip = nodes[r].get(need)
+            live_ip = resolved[r][need][1]
+            if file_ip != live_ip:
+                changed.append((r, need, file_ip, live_ip))
+    if not changed:
+        print("OK: %s matches the live cluster" % path)
+        return 0
+    print("STALE: %s differs from the live cluster:" % path)
+    for r, peer, file_ip, live_ip in changed:
+        print("  node %d link to %d: file %s != live %s" %
+              (r, peer, file_ip, live_ip))
+    return 1
+
+
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
@@ -397,6 +488,10 @@ def main():
                     help="ssh/connect timeout in seconds (default 10)")
     ap.add_argument("--no-ping", action="store_true",
                     help="disable the ping fallback for unresolved links")
+    ap.add_argument("--ring", action="store_true",
+                    help="generate a ring topology (peer-labeled links to "
+                         "each node's next/prev neighbours) instead of the "
+                         "fully-connected mesh")
     ap.add_argument("--verbose", action="store_true", help="verbose output")
     args = ap.parse_args()
 
@@ -424,7 +519,7 @@ def main():
     # sanity: each node must report exactly world-1 link-local interfaces
     world = len(hosts)
     for r, n in enumerate(nodes):
-        if len(n["links"]) != world - 1:
+        if not args.ring and len(n["links"]) != world - 1:
             print("WARNING: node %d (%s) has %d link-local interfaces, "
                   "expected %d" % (r, n["host"], len(n["links"]), world - 1))
 
@@ -447,13 +542,18 @@ def main():
                     print("  node %d %s %-14s -> rank %d NO REPLY" %
                           (r, iface, ip, peer))
 
-    if not validate_mesh(nodes, hosts, resolved):
-        return 2
-
-    if args.check:
-        return check_mesh(args.check, hosts, resolved)
-
-    write_mesh(args.out, hosts, resolved, args.port)
+    if args.ring:
+        if not validate_ring(nodes, hosts, resolved):
+            return 2
+        if args.check:
+            return check_ring(args.check, hosts, resolved)
+        write_ring(args.out, hosts, resolved, args.port)
+    else:
+        if not validate_mesh(nodes, hosts, resolved):
+            return 2
+        if args.check:
+            return check_mesh(args.check, hosts, resolved)
+        write_mesh(args.out, hosts, resolved, args.port)
 
     if args.deploy:
         for h in hosts:
