@@ -3383,27 +3383,39 @@ int ds4_tp_recv_command(ds4_tp *tp, ds4_tp_command *command,
     return 1;
 }
 
-int ds4_tp_send_logits(ds4_tp *tp, const float *chunk, uint32_t count) {
-    /* Worker ships its vocab chunk to the leader (rank 0). */
+int ds4_tp_send_logits(ds4_tp *tp, const float *chunk, uint32_t vocab) {
+    /* Worker ships its vocab chunk to the leader (rank 0).  The chunk slice
+     * for this rank is derived from the full vocab (remainder-aware). */
+    if (!tp || !chunk || vocab == 0 || tp->world <= 1) return 0;
+    uint32_t off = 0, count = 0;
+    ds4_tp_vocab_slice(vocab, (uint32_t)tp->world, (uint32_t)tp->rank,
+                       &off, &count);
+    if (count == 0) return 0;
     return tp_send_control(tp, DS4_TP_FRAME_LOGITS,
-                           chunk, count * sizeof(float));
+                           chunk + (uint64_t)off, count * sizeof(float));
 }
 
-int ds4_tp_recv_logits(ds4_tp *tp, float *dst, uint32_t count) {
-    /* Leader receives each worker's chunk into dst + worker_rank * count;
-     * dst is the base of the leader's full logits buffer (its own chunk is
-     * already computed locally at offset 0). */
+int ds4_tp_recv_logits(ds4_tp *tp, float *dst, uint32_t vocab) {
+    /* Leader receives each worker's chunk into dst at its vocab-split
+     * offset; dst is the base of the leader's full logits buffer (its own
+     * chunk is already computed locally at its own offset). */
+    if (!tp || !dst || vocab == 0) return 0;
     for (int m = 0; m < tp->world; m++) {
         if (m == tp->rank) continue;
+        uint32_t off = 0, count = 0;
+        ds4_tp_vocab_slice(vocab, (uint32_t)tp->world, (uint32_t)m,
+                           &off, &count);
+        if (count == 0) continue;
+        const uint32_t want_bytes = count * sizeof(float);
         uint32_t type = 0, bytes = 0;
         uint8_t *payload = NULL;
         if (tp->ring) {
             if (!tp_ctrl_recv(tp, m, &type, &payload, &bytes)) return 0;
         } else if (tp->control_fd[m] >= 0) {
             if (!tp_read_frame_header(tp->control_fd[m], &type, &bytes)) return 0;
-            if (type == DS4_TP_FRAME_LOGITS && bytes == count * sizeof(float)) {
+            if (type == DS4_TP_FRAME_LOGITS && bytes == want_bytes) {
                 if (!tp_read_full(tp->control_fd[m],
-                                  dst + (uint64_t)m * count, bytes))
+                                  dst + (uint64_t)off, bytes))
                     return 0;
                 continue;
             }
@@ -3411,13 +3423,13 @@ int ds4_tp_recv_logits(ds4_tp *tp, float *dst, uint32_t count) {
         } else {
             continue;
         }
-        if (type != DS4_TP_FRAME_LOGITS || bytes != count * sizeof(float)) {
+        if (type != DS4_TP_FRAME_LOGITS || bytes != want_bytes) {
             free(payload);
             fprintf(stderr, "ds4-tp: bad logits frame (link %d type %u bytes %u)\n",
                     m, type, bytes);
             return 0;
         }
-        memcpy(dst + (uint64_t)m * count, payload, bytes);
+        memcpy(dst + (uint64_t)off, payload, bytes);
         free(payload);
     }
     return 1;
@@ -3577,11 +3589,13 @@ static void tp_worker_session_remove(ds4_tp_worker_sessions *sessions,
 
 static int tp_worker_send_logits(ds4_tp *tp, ds4_session *session,
                                  float *logits, int vocab) {
-    if (!logits || vocab <= 0 || (vocab % tp->world) != 0) return 0;
-    const uint32_t vchunk = (uint32_t)vocab / (uint32_t)tp->world;
-    if (vchunk == 0) return 0;
+    if (!logits || vocab <= 0) return 0;
+    uint32_t off = 0, count = 0;
+    ds4_tp_vocab_slice((uint32_t)vocab, (uint32_t)tp->world,
+                       (uint32_t)tp->rank, &off, &count);
+    if (count == 0) return 0;
     return ds4_session_copy_logits(session, logits, vocab) == vocab &&
-           ds4_tp_send_logits(tp, logits + tp->rank * vchunk, vchunk);
+           ds4_tp_send_logits(tp, logits, vocab);
 }
 
 int ds4_tp_worker_run(ds4_engine *engine, const ds4_tp_options *opt) {

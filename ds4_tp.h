@@ -107,6 +107,17 @@ uint32_t ds4_tp_peer_ctx(const ds4_tp *tp);
 bool ds4_tp_failed(const ds4_tp *tp);
 void ds4_tp_mark_failed(ds4_tp *tp);
 
+/* Vocab-split slice for one rank.  Handles vocab % world != 0 by giving
+ * the first `rem` ranks one extra token each (offsets are cumulative). */
+static inline void ds4_tp_vocab_slice(uint32_t vocab, uint32_t world,
+                                      uint32_t rank, uint32_t *off,
+                                      uint32_t *count) {
+    const uint32_t base = vocab / world;
+    const uint32_t rem = vocab % world;
+    *count = base + (rank < rem ? 1u : 0u);
+    *off = rank * base + (rank < rem ? rank : rem);
+}
+
 /* Mesh topology descriptor.
  *
  * A small file describes the fully connected mesh: `world N`, then one
@@ -284,8 +295,8 @@ int ds4_tp_hash_check(ds4_tp *tp, uint64_t seq, uint64_t hash, char *err, size_t
  * to the leader after each eval and sync; the leader folds the chunks into
  * its full logits buffer at dst + worker_rank * count.  count is the
  * per-worker chunk size. */
-int ds4_tp_send_logits(ds4_tp *tp, const float *chunk, uint32_t count);
-int ds4_tp_recv_logits(ds4_tp *tp, float *dst, uint32_t count);
+int ds4_tp_send_logits(ds4_tp *tp, const float *chunk, uint32_t vocab);
+int ds4_tp_recv_logits(ds4_tp *tp, float *dst, uint32_t vocab);
 
 /* Speculative verify mirroring.  The leader announces a draft block right
  * before both ranks run the expert-split batch verify; the worker then blocks

@@ -16492,7 +16492,11 @@ static ds4_gpu_tensor *metal_graph_tp_hc_last_in(ds4_gpu_graph *g, uint32_t n) {
  * columns of the HC state) is active only for world>2 and when no DSpark
  * capture consumes the full HC rows (the capture would need a gather). */
 static bool metal_graph_hc_split_enabled(const ds4_gpu_graph *g) {
-    return g->tp_world > 2 && !g->dspark_capture_enabled;
+    if (g->tp_world <= 2 || g->dspark_capture_enabled) return false;
+    /* Debug/transport escape: the split is gated off so the Pro TP smoke
+     * test can run with the pre-split path until the gather issue is fixed. */
+    if (getenv("DS4_METAL_DISABLE_HC_SPLIT")) return false;
+    return true;
 }
 
 /* TP mesh HC slice for the main-model prefill path.  The prefill HC state is
@@ -24886,7 +24890,9 @@ static bool metal_graph_encode_output_head(
          * its logits view; the chunks are bit-identical to the full head
          * (same kernel, same rows) and the workers ship their chunks to
          * the leader after the eval. */
-        const uint64_t tp_vchunk = vocab_dim / g->tp_world;
+        uint32_t tp_off = 0, tp_count = 0;
+        ds4_tp_vocab_slice(vocab_dim, g->tp_world, g->tp_rank,
+                           &tp_off, &tp_count);
         uint64_t head_row_bytes = 0;
         ok = metal_graph_dense_quant_row_bytes(weights->output,
                                                DS4_N_EMBD,
@@ -24895,9 +24901,9 @@ static bool metal_graph_encode_output_head(
                                                         model,
                                                         weights->output,
                                                         weights->output->abs_offset +
-                                                            (uint64_t)g->tp_rank * tp_vchunk * head_row_bytes,
+                                                            (uint64_t)tp_off * head_row_bytes,
                                                         DS4_N_EMBD,
-                                                        tp_vchunk,
+                                                        tp_count,
                                                         metal_graph_output_norm(g),
                                                         1);
     } else if (ok && g->cuda_tp_ep && g->cuda_tp_output) {
@@ -30291,11 +30297,13 @@ static bool metal_graph_eval_token_raw_swa(
     const double t_done = (profile || throttle) ? now_sec() : 0.0;
 
     if (ok && logits && g->tp_world > 1 && g->tp_logits_half) {
-        const uint64_t tp_vchunk = (uint64_t)DS4_N_VOCAB / g->tp_world;
-        const uint64_t off = (uint64_t)g->tp_rank * tp_vchunk * sizeof(float);
-        ok = ds4_gpu_tensor_read(metal_graph_logits(g), off,
-                                 logits + g->tp_rank * tp_vchunk,
-                                 tp_vchunk * sizeof(float)) != 0;
+        uint32_t tp_off = 0, tp_count = 0;
+        ds4_tp_vocab_slice((uint32_t)DS4_N_VOCAB, g->tp_world, g->tp_rank,
+                           &tp_off, &tp_count);
+        ok = ds4_gpu_tensor_read(metal_graph_logits(g),
+                                 (uint64_t)tp_off * sizeof(float),
+                                 logits + tp_off,
+                                 (uint64_t)tp_count * sizeof(float)) != 0;
     } else if (ok && logits && !(g->tp_world > 1 && g->tp_rank != 0)) {
         ok = ds4_gpu_tensor_read(metal_graph_logits(g), 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
     }
@@ -57728,14 +57736,6 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
                  "(the ownership-aware pair+sum6 kernels are not generalized)");
         return 0;
     }
-    if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_GLM_DSA &&
-        ds4_tp_world(tp) > 2 && (DS4_N_VOCAB % ds4_tp_world(tp)) != 0) {
-        snprintf(err, errlen,
-                 "tensor parallelism world %d requires the vocabulary (%d) "
-                 "to be divisible by the world size",
-                 ds4_tp_world(tp), DS4_N_VOCAB);
-        return 0;
-    }
     const uint32_t slots = (uint32_t)DS4_N_LAYER * DS4_TP_GATES_PER_LAYER;
     const uint64_t vec_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
     const int world = ds4_tp_world(tp);
@@ -58204,11 +58204,15 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         s->graph.tp_batch_in = e->tp.batch_in_views;
         s->graph.tp_batch_combined = e->tp.batch_combined_views;
         s->graph.tp_zero = e->tp.zero_vec;
-        const uint64_t vchunk = (uint64_t)DS4_N_VOCAB / (uint64_t)e->tp.world;
+        uint32_t tp_off = 0, tp_count = 0;
+        ds4_tp_vocab_slice((uint32_t)DS4_N_VOCAB,
+                            (uint32_t)e->tp.world,
+                            (uint32_t)e->tp.rank,
+                            &tp_off, &tp_count);
         s->graph.tp_logits_half = ds4_gpu_tensor_view(
                 metal_graph_logits(&s->graph),
-                (uint64_t)e->tp.rank * vchunk * sizeof(float),
-                vchunk * sizeof(float));
+                (uint64_t)tp_off * sizeof(float),
+                (uint64_t)tp_count * sizeof(float));
         if (!s->graph.tp_logits_half) {
             metal_graph_free(&s->graph);
             free(s);
@@ -59314,9 +59318,8 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
          * local prefill failed. Drain them to keep the control stream framed
          * before invalidating the mirrored session. */
         if (worker_ok && s->engine->tp.vocab_split) {
-            const uint32_t vchunk =
-                (uint32_t)DS4_N_VOCAB / (uint32_t)s->engine->tp.world;
-            if (!ds4_tp_recv_logits(s->engine->tp.ctx, s->logits, vchunk)) {
+            if (!ds4_tp_recv_logits(s->engine->tp.ctx, s->logits,
+                                     (uint32_t)DS4_N_VOCAB)) {
                 snprintf(err, errlen, "tp: worker sync logits chunk missing");
                 logits_ok = false;
             }
@@ -61159,19 +61162,16 @@ static int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
 #endif
     /* Vocab-split head: merge the chunks after every eval (DS4 only). */
     if (rc == 0 && s->engine && s->engine->tp.active && s->engine->tp.vocab_split) {
-        const uint32_t vchunk =
-            (uint32_t)DS4_N_VOCAB / (uint32_t)s->engine->tp.world;
         if (s->engine->tp.rank == 0) {
-            if (!ds4_tp_recv_logits(s->engine->tp.ctx, s->logits, vchunk)) {
+            if (!ds4_tp_recv_logits(s->engine->tp.ctx, s->logits,
+                                     (uint32_t)DS4_N_VOCAB)) {
                 snprintf(err, errlen, "tp: worker logits chunk missing");
                 ds4_session_invalidate(s);
                 return 1;
             }
         } else {
             if (!ds4_tp_send_logits(s->engine->tp.ctx,
-                                    s->logits +
-                                        (uint64_t)s->engine->tp.rank * vchunk,
-                                    vchunk)) {
+                                    s->logits, (uint32_t)DS4_N_VOCAB)) {
                 snprintf(err, errlen, "tp: logits chunk send failed");
                 return 1;
             }
@@ -61562,16 +61562,17 @@ static bool ds4_sessions_tp_recv_logits(
     if (!e || !e->tp.active || e->tp.rank != 0 || !e->tp.vocab_split) {
         return true;
     }
-    const uint32_t vchunk = (uint32_t)DS4_N_VOCAB / (uint32_t)e->tp.world;
     if (prefill &&
-        !ds4_tp_recv_logits(e->tp.ctx, prefill->logits, vchunk)) {
+        !ds4_tp_recv_logits(e->tp.ctx, prefill->logits,
+                             (uint32_t)DS4_N_VOCAB)) {
         if (err && errlen) snprintf(err, errlen,
                                     "tp: worker mixed-prefill logits missing");
         return false;
     }
     for (int i = 0; i < count; i++) {
         if (!ds4_tp_recv_logits(e->tp.ctx,
-                                items[i].session->logits, vchunk)) {
+                                items[i].session->logits,
+                                (uint32_t)DS4_N_VOCAB)) {
             if (err && errlen) {
                 snprintf(err, errlen,
                          "tp: worker batch logits missing for item %d", i);
@@ -62370,8 +62371,8 @@ static int ds4_session_eval_dspark_speculative_argmax(
     /* Vocab-split head: the last replay eval produced only our logits chunk;
      * merge the workers' before installing them as the session logits. */
     if (replayed_drafts > 0 && tp_verify_sent && e->tp.vocab_split) {
-        const uint32_t vchunk = (uint32_t)DS4_N_VOCAB / (uint32_t)e->tp.world;
-        if (!ds4_tp_recv_logits(e->tp.ctx, row_logits, vchunk)) {
+        if (!ds4_tp_recv_logits(e->tp.ctx, row_logits,
+                                 (uint32_t)DS4_N_VOCAB)) {
             snprintf(err, errlen, "tp: replay logits chunk missing");
             s->checkpoint_valid = false;
             spec_frontier_free(&frontier);
@@ -62518,10 +62519,8 @@ int ds4_session_tp_spec_cycle(ds4_session *s, const int *drafts, int draft_n,
     if (replay_n > 0) {
         s->checkpoint_valid = true;
         if (e->tp.vocab_split) {
-            const uint32_t vchunk = (uint32_t)DS4_N_VOCAB / (uint32_t)e->tp.world;
             if (!ds4_tp_send_logits(e->tp.ctx,
-                                    logits + (uint64_t)e->tp.rank * vchunk,
-                                    vchunk)) {
+                                    logits, (uint32_t)DS4_N_VOCAB)) {
                 free(scratch);
                 snprintf(err, errlen, "tp: replay logits chunk send failed");
                 return 1;
