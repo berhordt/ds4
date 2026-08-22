@@ -1625,10 +1625,27 @@ static int tp_rdma_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint
  * the ring combine), with wr_id = seq*16 + hop so the per-link recv_done
  * watermark tracks per-hop completion.  The ring shares one monotonic seq
  * counter across every gate type, so the watermark stays ordered. */
+/* RDMA ring all-reduce has no per-message TCP barrier (unlike the classic
+ * gate), so the peer's hop-0 send can overtake our recv posting when ring
+ * waves drift, scrambling the UC matching (recv k pairs with send k+j).
+ * Fix: a one-byte ready handshake per gate on the data sockets -- each rank
+ * tells its prev it has posted recvs, and waits for its next to post recvs
+ * before sending.  The handshake forms a ring in the reverse direction and
+ * bounds the skew to zero. */
+static int tp_rdma_ring_ready(ds4_tp *tp) {
+    const int next = (tp->rank + 1) % tp->world;
+    const int prev = (tp->rank + tp->world - 1) % tp->world;
+    char go = 0;
+    if (!tp_write_full(tp->data_fd[prev], &go, 1)) return 0;
+    if (!tp_read_full(tp->data_fd[next], &go, 1)) return 0;
+    return 1;
+}
+
 static int tp_rdma_gate_exchange_ring(ds4_tp *tp, uint32_t layer, uint32_t gate,
                                       uint64_t seq) {
     const uint32_t slot = layer * DS4_TP_GATES_PER_LAYER + gate;
     if (slot != tp_gate_slot(tp, seq)) return 0;
+    if (!tp_rdma_ring_ready(tp)) return 0;
     const int next = (tp->rank + 1) % tp->world;
     const int prev = (tp->rank + tp->world - 1) % tp->world;
     if (tp->data_fd[next] < 0 || tp->data_fd[prev] < 0) return 0;
@@ -1712,10 +1729,17 @@ static int tp_rdma_gate_exchange_ring(ds4_tp *tp, uint32_t layer, uint32_t gate,
         double deadline = tp_now_sec() + (double)tp->timeout_sec;
         uint32_t peer_poll = 0;
         while (ok && rp->recv_done < (uint64_t)seq * 16u + h) {
+            /* Drain both links: prev's CQ reaps the hop recv, next's CQ
+             * reaps this hop's sends (each link has its own CQ; without the
+             * next drain the send queue fills and post_send returns EAGAIN). */
             ok = tp_rdma_drain_cq(tp, prev);
-            if (ok && (peer_poll++ & 0x3fffu) == 0 && tp_peer_closed(tp, prev)) {
-                fprintf(stderr, "ds4-tp: peer %d disconnected during ring gate\n", prev);
-                ok = 0;
+            if (ok) ok = tp_rdma_drain_cq(tp, next);
+            if (ok && (peer_poll++ & 0x3fffu) == 0) {
+                if (tp_peer_closed(tp, prev) || tp_peer_closed(tp, next)) {
+                    fprintf(stderr, "ds4-tp: peer %d/%d disconnected during ring gate\n",
+                            prev, next);
+                    ok = 0;
+                }
             }
             if (tp_now_sec() > deadline) {
                 fprintf(stderr,

@@ -22154,9 +22154,25 @@ static bool metal_graph_encode_decode_layer_phase(
     const int cuda_tp_partner_tier = g->cuda_tp_decode
         ? metal_graph_cuda_tp_partner_tier(cuda_tp_home_tier) : -1;
     const bool tp_split_attn = g->tp_world > 1;
-    const uint32_t tp_heads = tp_split_attn ?
-        (uint32_t)DS4_N_HEAD / g->tp_world : (uint32_t)DS4_N_HEAD;
-    const uint32_t tp_head0 = tp_split_attn ? g->tp_rank * tp_heads : 0;
+    /* The Q-head slice must line up with the remainder-aware output-group
+     * split (group_heads heads per group): a plain DS4_N_HEAD / world
+     * division drops the remainder heads and misaligns the head range with
+     * the group boundaries (Pro: 128 heads / 6 = 21, losing 2 heads).
+     * Derive the head range from the group slice so every head belongs to
+     * exactly one rank. */
+    uint32_t tp_heads = 0, tp_head0 = 0;
+    if (tp_split_attn) {
+        uint32_t grp0 = 0, grp_cnt = 0;
+        ds4_tp_vocab_slice((uint32_t)DS4_N_OUT_GROUP,
+                           (uint32_t)g->tp_world, g->tp_rank,
+                           &grp0, &grp_cnt);
+        const uint32_t group_heads = (uint32_t)DS4_N_HEAD / (uint32_t)DS4_N_OUT_GROUP;
+        tp_head0 = grp0 * group_heads;
+        tp_heads = grp_cnt * group_heads;
+    } else {
+        tp_heads = (uint32_t)DS4_N_HEAD;
+        tp_head0 = 0;
+    }
 
     bool ok = true;
     const bool decode_stage_profile = metal_graph_decode_stage_profile_enabled(il);
@@ -23351,8 +23367,14 @@ static bool metal_graph_encode_decode_layer_phase(
     } else if (ok && g->tp_world > 1) {
         /* Group-sliced attention output: this rank computes its share of the
          * output groups and the matching k-window of the expand projection,
-         * leaving a partial block output in the gate slot. */
-        const uint32_t tp_groups = n_groups / g->tp_world;
+         * leaving a partial block output in the gate slot.  The slice is
+         * remainder-aware (n_groups % world != 0: the first rem ranks get
+         * one extra group) so the summed partials cover every group exactly
+         * -- with a plain division the Pro's 16 output groups over 6 ranks
+         * would drop 4 groups and collapse the hidden state. */
+        uint32_t tp_grp0 = 0, tp_grp_cnt = 0;
+        ds4_tp_vocab_slice(n_groups, (uint32_t)g->tp_world, g->tp_rank,
+                           &tp_grp0, &tp_grp_cnt);
         ok = metal_graph_attention_output_dense_quant_tp(
                 g->tp_out[il * DS4_TP_GATES_PER_LAYER + DS4_TP_GATE_ATTN],
                 metal_graph_attn_low(g),
@@ -23362,7 +23384,7 @@ static bool metal_graph_encode_decode_layer_phase(
                 layer->attn_output_b,
                 group_dim, rank,
                 n_groups,
-                g->tp_rank * tp_groups, tp_groups,
+                tp_grp0, tp_grp_cnt,
                 DS4_N_EMBD,
                 metal_graph_heads(g));
     } else if (ok && layer->attn_output_a->type != DS4_TENSOR_Q8_0) {
