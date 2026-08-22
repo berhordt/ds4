@@ -171,6 +171,10 @@ struct ds4_tp {
      * because the leader has no direct link to most workers.  ctrl_q[src]
      * holds frames delivered to this node from rank src. */
     int ctrl_fd[DS4_TP_MAX_WORLD];
+    /* Serializes writes to each ctrl socket: the main thread's ctrl_send
+     * and the ring relay-forward path both write frames to the same fd, and
+     * interleaved header/payload writes desync the reader (garbage header). */
+    pthread_mutex_t ctrl_mu[DS4_TP_MAX_WORLD];
     pthread_t ctrl_thread[DS4_TP_MAX_WORLD];
     int ctrl_thread_count;
     struct tp_ctrl_queue *ctrl_q[DS4_TP_MAX_WORLD];
@@ -680,9 +684,11 @@ static int tp_ctrl_send(ds4_tp *tp, int dst, uint32_t type,
         ds4_tp_ctrl_header h = { DS4_TP_CTRL_MAGIC, DS4_TP_CTRL_VERSION,
                                  (uint32_t)dst, (uint32_t)tp->rank,
                                  type, bytes };
-        if (!tp_write_full(tp->ctrl_fd[hop], &h, sizeof(h))) return 0;
-        if (bytes && !tp_write_full(tp->ctrl_fd[hop], payload, bytes)) return 0;
-        return 1;
+        pthread_mutex_lock(&tp->ctrl_mu[hop]);
+        int wok = tp_write_full(tp->ctrl_fd[hop], &h, sizeof(h)) &&
+                  (!bytes || tp_write_full(tp->ctrl_fd[hop], payload, bytes));
+        pthread_mutex_unlock(&tp->ctrl_mu[hop]);
+        return wok;
     }
     if (tp->control_fd[dst] < 0) return 1;
     return tp_send_frame(tp->control_fd[dst], type, payload, bytes);
@@ -757,12 +763,13 @@ static void *tp_ring_ctrl_reader(void *arg) {
                 free(payload);
                 break;
             }
-            if (!tp_write_full(tp->ctrl_fd[fwd], &h, sizeof(h)) ||
-                (h.bytes && !tp_write_full(tp->ctrl_fd[fwd], payload, h.bytes))) {
-                free(payload);
-                break;
-            }
+            pthread_mutex_lock(&tp->ctrl_mu[fwd]);
+            int wok = tp_write_full(tp->ctrl_fd[fwd], &h, sizeof(h)) &&
+                      (!h.bytes ||
+                       tp_write_full(tp->ctrl_fd[fwd], payload, h.bytes));
+            pthread_mutex_unlock(&tp->ctrl_mu[fwd]);
             free(payload);
+            if (!wok) break;
         }
     }
     for (int i = 0; i < DS4_TP_MAX_WORLD; i++) {
@@ -2307,6 +2314,7 @@ int ds4_tp_create(
     for (int i = 0; i < DS4_TP_MAX_WORLD; i++) {
         tp->ctrl_fd[i] = -1;
         tp->ctrl_q[i] = NULL;
+        pthread_mutex_init(&tp->ctrl_mu[i], NULL);
     }
     tp->ctrl_thread_count = 0;
     if (tp->ring) {
@@ -2580,6 +2588,9 @@ void ds4_tp_free(ds4_tp *tp) {
     }
     for (int i = 0; i < tp->ctrl_thread_count; i++) {
         if (tp->ctrl_thread[i]) pthread_join(tp->ctrl_thread[i], NULL);
+    }
+    for (int i = 0; i < DS4_TP_MAX_WORLD; i++) {
+        pthread_mutex_destroy(&tp->ctrl_mu[i]);
     }
     for (int i = 0; i < DS4_TP_MAX_WORLD; i++) {
         if (tp->ctrl_q[i]) {
