@@ -135,7 +135,16 @@ typedef struct {
  * the slab in-slot (s-1) % slots and its completion IS the arrival signal. */
 #define DS4_TP_RDMA_MAX_MSG 16384
 #define DS4_TP_RDMA_RECV_WINDOW 16
-#define DS4_TP_RDMA_BULK_SLOTS 32
+#define DS4_TP_RDMA_BULK_SLOTS 128
+/* Max rounds in flight per link.  The AppleThunderboltRDMA UC queues report
+ * a large cap but reject posts past ~128 send / ~192 recv WQEs, so the
+ * pipelined wavefront cannot hold multiple BULK_SLOTS rounds per link.
+ * MAX_INFLIGHT 1 keeps the exchange sequential, which is optimal: the TP
+ * service thread serializes the per-round ready/done handshakes, so the
+ * prefill cost is the handshake count, not the wire round-trips.  Bigger
+ * rounds (2 MiB) cut the count from the old 1120 pairs/gate (1 MiB rounds)
+ * to 560 -- a real prefill lever (P5-style). */
+#define DS4_TP_RDMA_BULK_MAX_INFLIGHT 1
 #define DS4_TP_RDMA_BULK_WR_TAG (UINT64_C(1) << 63)
 #define DS4_TP_BIG_CHUNK (2ull * 1024ull * 1024ull)
 
@@ -1361,12 +1370,13 @@ static int tp_rdma_open_link(ds4_tp *tp, int peer, char *err, size_t errlen) {
     qia.send_cq = r->cq;
     qia.recv_cq = r->cq;
     qia.qp_type = IBV_QPT_UC;
-    /* The pipelined ring bulk wavefront can hold up to (world-1) rounds in
-     * flight per link, each with BULK_SLOTS send/recv WRs, so the queues
-     * must fit (world-1) x BULK_SLOTS plus headroom for the decode ring. */
-    qia.cap.max_send_wr = (uint32_t)((tp->world > 1 ? tp->world - 1 : 1) *
+    /* The pipelined ring bulk wavefront holds up to MAX_INFLIGHT rounds in
+     * flight per link, each with BULK_SLOTS send/recv WRs; size the queues
+     * to that (the driver rejects larger recv queues anyway) plus headroom
+     * for the decode ring. */
+    qia.cap.max_send_wr = (uint32_t)(DS4_TP_RDMA_BULK_MAX_INFLIGHT *
                                      DS4_TP_RDMA_BULK_SLOTS + 32);
-    qia.cap.max_recv_wr = (uint32_t)((tp->world > 1 ? tp->world - 1 : 1) *
+    qia.cap.max_recv_wr = (uint32_t)(DS4_TP_RDMA_BULK_MAX_INFLIGHT *
                                      DS4_TP_RDMA_BULK_SLOTS + 32);
     qia.cap.max_send_sge = 1;
     qia.cap.max_recv_sge = 1;
@@ -3016,14 +3026,14 @@ static void tp_big_combine(ds4_tp *tp, const void *out, void *in,
  * region index is ((r-1-i) mod world).  The element-wise write makes the
  * fold in-place safe when dst overlaps a region (the big-gate case writes
  * the combined sum back into region 0). */
-/* Pipelined ring bulk: each hop h trails hop h-1 by one round, so the
- * per-hop send/recv/fold latencies overlap across hops (the old schedule
- * finished hop h's full payload before starting hop h+1).  Hop h's round r
- * can post only after hop h-1's round r done barrier closes -- reading next's
- * dgo for round r -- which keeps the global round boundary that bounds the
- * UC recv/send matching (a rank's recv for hop h can never pair with prev's
- * hop h+1 messages).  Rounds within one hop stay serial: stage_send[h] and
- * stage_recv[h] are single-buffered per hop. */
+/* Ring bulk wavefront state: each hop h's round r can post only after hop
+ * h-1's round r done barrier closes -- reading next's dgo for round r --
+ * which keeps the global round boundary that bounds the UC recv/send
+ * matching (a rank's recv for hop h can never pair with prev's hop h+1
+ * messages).  Rounds within one hop stay serial: stage_send[h] and
+ * stage_recv[h] are single-buffered per hop.  With MAX_INFLIGHT 1 the
+ * wavefront degenerates to sequential hops (the prefill-optimal schedule
+ * on this hardware); the state machine also supports a deeper overlap. */
 typedef struct {
     uint32_t  posted;      /* rounds posted (recv + ready + send) */
     uint32_t  done;        /* rounds consumed: copy + dgo write done */
@@ -3093,13 +3103,17 @@ static int tp_rdma_ring_bulk_wave_poll(ds4_tp *tp, int prev, int next,
  * bounds the UC recv/send matching skew, and a per-round done barrier
  * (dgo write to prev, dgo read from next after the recv copy) closes the
  * global round boundary before the next hop's matching round starts.  The
- * schedule is a pipelined wavefront: hop h advances round r only after hop
- * h-1's round r done barrier, so hop h's round r+1 overlaps hop h+1's round r
- * (the big-gate regions are unregistered Metal buffers, so each hop has its
- * own staging slot and one round in flight).  Both links' CQs are drained by
- * the wave poll.  The final canonical rank-order fold writes the combined
- * sum into fold_dst (region 0 for the big gate, the batch combined slot for
- * the batch gate). */
+ * schedule is a wavefront over per-hop state: hop h advances round r only
+ * after hop h-1's round r done barrier, so with a deep-enough recv queue
+ * hop h's round r+1 overlaps hop h+1's round r.  On AppleThunderboltRDMA the
+ * UC queues reject posts past ~128 send / ~192 recv WQEs, so MAX_INFLIGHT 1
+ * keeps one round in flight -- the exchange is sequential, which is optimal
+ * for the single TP service thread (it serializes the handshakes; the
+ * handshake count, not wire round-trips, is the prefill cost).  Each hop has
+ * its own staging slot (stage_send[h]/stage_recv[h]) so a deeper wavefront
+ * would not collide.  Both links' CQs are drained by the wave poll.  The
+ * final canonical rank-order fold writes the combined sum into fold_dst
+ * (region 0 for the big gate, the batch combined slot for the batch gate). */
 static int tp_rdma_ring_bulk_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
                                       const void *out, void *in, uint64_t bytes,
                                       uint64_t hop_stride, uint16_t gate,
@@ -3146,6 +3160,7 @@ static int tp_rdma_ring_bulk_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
 
     tp_ring_bulk_hop st[DS4_TP_MAX_WORLD - 1u];
     memset(st, 0, sizeof(st));
+    uint32_t inflight_count = 0;
 
     double deadline = tp_now_sec() + (double)tp->timeout_sec;
     uint32_t peer_poll = 0;
@@ -3181,6 +3196,7 @@ static int tp_rdma_ring_bulk_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
             s->done++;
             s->done_read++;
             s->inflight = 0;
+            inflight_count--;
         }
 
         /* Post new rounds as their gates open: same-hop serial (stage h free)
@@ -3191,6 +3207,7 @@ static int tp_rdma_ring_bulk_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
             const uint32_t r = s->posted;
             if (s->done < r) continue;
             if (h > 0 && st[h - 1].done_read < r + 1) continue;
+            if (inflight_count >= DS4_TP_RDMA_BULK_MAX_INFLIGHT) continue;
 
             const uint64_t roff = (uint64_t)r * ROUND;
             const uint64_t remaining = bytes - roff;
@@ -3287,6 +3304,7 @@ static int tp_rdma_ring_bulk_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
             s->send_done = 0;
             s->inflight = 1;
             s->posted = r + 1;
+            inflight_count++;
         }
 
         if ((peer_poll++ & 0x3fffu) == 0 &&
