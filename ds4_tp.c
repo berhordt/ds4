@@ -3368,7 +3368,10 @@ int ds4_tp_big_gate_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
     ds4_tp_gate_header h = { DS4_TP_BATCH_MAGIC, (uint16_t)layer, 0xB16u, seq };
     if (tp->ring) {
 #ifdef DS4_TP_HAVE_VERBS
-        if (tp->rdma_active) {
+        /* DS4_TP_BIG_TCP=1 forces the TCP ring bulk for the big gate (the
+         * RDMA bulk's per-round ready/done handshakes cost prefill latency;
+         * the TCP write/read has no explicit handshake). */
+        if (tp->rdma_active && !getenv("DS4_TP_BIG_TCP")) {
             return tp_rdma_ring_bulk_exchange(tp, layer, seq, out, in, bytes,
                                               bytes, 0xB16u, (float *)in);
         }
