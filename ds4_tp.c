@@ -135,7 +135,7 @@ typedef struct {
  * the slab in-slot (s-1) % slots and its completion IS the arrival signal. */
 #define DS4_TP_RDMA_MAX_MSG 16384
 #define DS4_TP_RDMA_RECV_WINDOW 16
-#define DS4_TP_RDMA_BULK_SLOTS 64
+#define DS4_TP_RDMA_BULK_SLOTS 32
 #define DS4_TP_RDMA_BULK_WR_TAG (UINT64_C(1) << 63)
 #define DS4_TP_BIG_CHUNK (2ull * 1024ull * 1024ull)
 
@@ -1352,7 +1352,7 @@ static int tp_rdma_open_link(ds4_tp *tp, int peer, char *err, size_t errlen) {
         tp_set_err(err, errlen, "tp rdma: alloc_pd failed");
         return 0;
     }
-    r->cq = api->create_cq(r->ctx, 512, NULL, NULL, 0);
+    r->cq = api->create_cq(r->ctx, 4096, NULL, NULL, 0);
     if (!r->cq) {
         tp_set_err(err, errlen, "tp rdma: create_cq failed");
         return 0;
@@ -1361,8 +1361,13 @@ static int tp_rdma_open_link(ds4_tp *tp, int peer, char *err, size_t errlen) {
     qia.send_cq = r->cq;
     qia.recv_cq = r->cq;
     qia.qp_type = IBV_QPT_UC;
-    qia.cap.max_send_wr = 256;
-    qia.cap.max_recv_wr = 64;
+    /* The pipelined ring bulk wavefront can hold up to (world-1) rounds in
+     * flight per link, each with BULK_SLOTS send/recv WRs, so the queues
+     * must fit (world-1) x BULK_SLOTS plus headroom for the decode ring. */
+    qia.cap.max_send_wr = (uint32_t)((tp->world > 1 ? tp->world - 1 : 1) *
+                                     DS4_TP_RDMA_BULK_SLOTS + 32);
+    qia.cap.max_recv_wr = (uint32_t)((tp->world > 1 ? tp->world - 1 : 1) *
+                                     DS4_TP_RDMA_BULK_SLOTS + 32);
     qia.cap.max_send_sge = 1;
     qia.cap.max_recv_sge = 1;
     qia.cap.max_inline_data = 0;
@@ -1371,6 +1376,8 @@ static int tp_rdma_open_link(ds4_tp *tp, int peer, char *err, size_t errlen) {
         tp_set_err(err, errlen, "tp rdma: create_qp(UC): %s", strerror(errno));
         return 0;
     }
+    fprintf(stderr, "ds4-tp: QP peer %d send_wr=%u recv_wr=%u\n",
+            peer, qia.cap.max_send_wr, qia.cap.max_recv_wr);
     r->max_inline = qia.cap.max_inline_data;
 
     pthread_mutex_init(&r->post_lock, NULL);
@@ -2790,8 +2797,6 @@ static int tp_rdma_ring_bulk_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
                                       const void *out, void *in, uint64_t bytes,
                                       uint64_t hop_stride, uint16_t gate,
                                       float *fold_dst);
-static int tp_rdma_ring_bulk_poll(ds4_tp *tp, int prev, int next,
-                                  uint32_t *recv_done, int *send_done);
 
 static int tp_tcp_batch_send(ds4_tp *tp, int peer, uint32_t layer,
                              uint32_t rows, uint64_t seq) {
@@ -3011,12 +3016,32 @@ static void tp_big_combine(ds4_tp *tp, const void *out, void *in,
  * region index is ((r-1-i) mod world).  The element-wise write makes the
  * fold in-place safe when dst overlaps a region (the big-gate case writes
  * the combined sum back into region 0). */
-/* Poll both ring links for one bulk round: prev's CQ counts the round's
- * recv completions (BULK_WR_TAG), next's CQ marks the round's send done and
- * reaps any leftover decode sends.  Non-bulk completions update the
- * per-link gate-seq watermark / send-outstanding count. */
-static int tp_rdma_ring_bulk_poll(ds4_tp *tp, int prev, int next,
-                                  uint32_t *recv_done, int *send_done) {
+/* Pipelined ring bulk: each hop h trails hop h-1 by one round, so the
+ * per-hop send/recv/fold latencies overlap across hops (the old schedule
+ * finished hop h's full payload before starting hop h+1).  Hop h's round r
+ * can post only after hop h-1's round r done barrier closes -- reading next's
+ * dgo for round r -- which keeps the global round boundary that bounds the
+ * UC recv/send matching (a rank's recv for hop h can never pair with prev's
+ * hop h+1 messages).  Rounds within one hop stay serial: stage_send[h] and
+ * stage_recv[h] are single-buffered per hop. */
+typedef struct {
+    uint32_t  posted;      /* rounds posted (recv + ready + send) */
+    uint32_t  done;        /* rounds consumed: copy + dgo write done */
+    uint32_t  done_read;   /* rounds whose dgo was read from next */
+    uint32_t  round;       /* in-flight round index when inflight */
+    uint32_t  chunks;
+    uint32_t  recv_done;
+    int       send_done;
+    int       inflight;
+    uint64_t  round_bytes;
+} tp_ring_bulk_hop;
+
+/* Poll both ring links for the pipelined wavefront: prev's CQ carries the
+ * bulk recv completions of every in-flight round (wr_id encodes the hop),
+ * next's CQ carries the bulk send completions.  Non-bulk completions update
+ * the per-link gate-seq watermark / send-outstanding count. */
+static int tp_rdma_ring_bulk_wave_poll(ds4_tp *tp, int prev, int next,
+                                       tp_ring_bulk_hop *st, uint32_t hops) {
     ds4_tp_rdma_link *rp = &tp->rdma[prev];
     struct ibv_wc wc[DS4_TP_RDMA_BULK_SLOTS + 1u];
     int n = ibv_poll_cq(rp->cq, (int)(DS4_TP_RDMA_BULK_SLOTS + 1u), wc);
@@ -3029,8 +3054,12 @@ static int tp_rdma_ring_bulk_poll(ds4_tp *tp, int prev, int next,
             return 0;
         }
         if (wc[i].opcode & IBV_WC_RECV) {
-            if (wc[i].wr_id & DS4_TP_RDMA_BULK_WR_TAG) (*recv_done)++;
-            else if (wc[i].wr_id > rp->recv_done) rp->recv_done = wc[i].wr_id;
+            if (wc[i].wr_id & DS4_TP_RDMA_BULK_WR_TAG) {
+                const uint32_t h = (uint32_t)((wc[i].wr_id >> 32) & 0xFFFFu);
+                if (h > 0 && h <= hops) st[h - 1].recv_done++;
+            } else if (wc[i].wr_id > rp->recv_done) {
+                rp->recv_done = wc[i].wr_id;
+            }
         } else if (rp->send_outstanding > 0) {
             rp->send_outstanding--;
         }
@@ -3048,7 +3077,8 @@ static int tp_rdma_ring_bulk_poll(ds4_tp *tp, int prev, int next,
         if (wc[i].opcode & IBV_WC_RECV) {
             if (wc[i].wr_id > rn->recv_done) rn->recv_done = wc[i].wr_id;
         } else if (wc[i].wr_id & DS4_TP_RDMA_BULK_WR_TAG) {
-            *send_done = 1;
+            const uint32_t h = (uint32_t)((wc[i].wr_id >> 32) & 0xFFFFu);
+            if (h > 0 && h <= hops) st[h - 1].send_done = 1;
         } else if (rn->send_outstanding > 0) {
             rn->send_outstanding--;
         }
@@ -3059,11 +3089,15 @@ static int tp_rdma_ring_bulk_poll(ds4_tp *tp, int prev, int next,
 /* RDMA ring bulk exchange: circulate one payload through next/prev (world-1
  * hops), chunked into DS4_TP_RDMA_BULK_SLOTS x 16 KiB messages per round.
  * Per-hop recvs land in `in` region h (hop_stride apart); hop h's relay is
- * out (h==0) or region h-1.  A per-hop ready handshake on the data sockets
- * bounds the UC recv/send matching skew: the decode ring can post all recvs
- * upfront, but the bulk cannot (the big-gate regions are unregistered Metal
- * buffers), so it re-synchronizes each hop.  Both links' CQs are drained in
- * the round wait.  The final canonical rank-order fold writes the combined
+ * out (h==0) or region h-1.  A per-round ready handshake on the data sockets
+ * bounds the UC recv/send matching skew, and a per-round done barrier
+ * (dgo write to prev, dgo read from next after the recv copy) closes the
+ * global round boundary before the next hop's matching round starts.  The
+ * schedule is a pipelined wavefront: hop h advances round r only after hop
+ * h-1's round r done barrier, so hop h's round r+1 overlaps hop h+1's round r
+ * (the big-gate regions are unregistered Metal buffers, so each hop has its
+ * own staging slot and one round in flight).  Both links' CQs are drained by
+ * the wave poll.  The final canonical rank-order fold writes the combined
  * sum into fold_dst (region 0 for the big gate, the batch combined slot for
  * the batch gate). */
 static int tp_rdma_ring_bulk_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
@@ -3103,23 +3137,63 @@ static int tp_rdma_ring_bulk_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
         (uintptr_t)in >= slab_lo && (uintptr_t)in <= slab_hi &&
         bytes <= slab_hi - (uintptr_t)in;
 
-    const uint64_t pidx_n = tp_in_peer_index(tp, next);
-    const uint64_t pidx_p = tp_in_peer_index(tp, prev);
-    uint8_t *stage_send = tp->slab + tp->bulk_stage_off +
-                          pidx_n * tp->bulk_stage_bytes;
-    uint8_t *stage_recv = tp->slab + tp->bulk_stage_off +
-                          (uint64_t)(tp->world - 1) * tp->bulk_stage_bytes +
-                          pidx_p * tp->bulk_stage_bytes;
-
     const uint32_t hops = (uint32_t)tp->world - 1u;
-    for (uint32_t h = 0; h < hops; h++) {
-        const void *relay = h == 0 ? out :
-            (const void *)((uint8_t *)in + (uint64_t)(h - 1) * hop_stride);
-        uint8_t *hopbuf = (uint8_t *)in + (uint64_t)h * hop_stride;
+    const uint64_t ROUND = (uint64_t)DS4_TP_RDMA_BULK_SLOTS * DS4_TP_RDMA_MAX_MSG;
+    const uint64_t total_rounds = (bytes + ROUND - 1u) / ROUND;
+    uint8_t *stage_send = tp->slab + tp->bulk_stage_off;
+    uint8_t *stage_recv = tp->slab + tp->bulk_stage_off +
+                          (uint64_t)(tp->world - 1) * tp->bulk_stage_bytes;
 
-        uint64_t off = 0;
-        while (off < bytes) {
-            const uint64_t remaining = bytes - off;
+    tp_ring_bulk_hop st[DS4_TP_MAX_WORLD - 1u];
+    memset(st, 0, sizeof(st));
+
+    double deadline = tp_now_sec() + (double)tp->timeout_sec;
+    uint32_t peer_poll = 0;
+    while (st[hops - 1].done_read < total_rounds) {
+        /* Service completions on both links; distribute to the in-flight
+         * rounds by their hop tag. */
+        if (!tp_rdma_ring_bulk_wave_poll(tp, prev, next, st, hops)) return 0;
+
+        /* Complete rounds whose recv + send finished: copy the staging into
+         * the hop region, then run the round-done barrier so the next hop's
+         * matching round may start. */
+        for (uint32_t h = 0; h < hops; h++) {
+            tp_ring_bulk_hop *s = &st[h];
+            if (!s->inflight || s->recv_done < s->chunks || !s->send_done)
+                continue;
+            const uint64_t roff = (uint64_t)s->round * ROUND;
+            if (!direct) {
+                uint64_t c = 0;
+                for (uint32_t i = 0; i < s->chunks; i++) {
+                    const uint64_t left = s->round_bytes - c;
+                    const uint32_t len = (uint32_t)(left > DS4_TP_RDMA_MAX_MSG ?
+                                                    DS4_TP_RDMA_MAX_MSG : left);
+                    memcpy((uint8_t *)in + (uint64_t)h * hop_stride + roff + c,
+                           stage_recv + (uint64_t)h * tp->bulk_stage_bytes +
+                               (uint64_t)i * DS4_TP_RDMA_MAX_MSG,
+                           len);
+                    c += len;
+                }
+            }
+            char dgo = 0;
+            if (!tp_write_full(tp->data_fd[prev], &dgo, 1)) return 0;
+            if (!tp_read_full(tp->data_fd[next], &dgo, 1)) return 0;
+            s->done++;
+            s->done_read++;
+            s->inflight = 0;
+        }
+
+        /* Post new rounds as their gates open: same-hop serial (stage h free)
+         * and the global round boundary from hop h-1's done barrier. */
+        for (uint32_t h = 0; h < hops; h++) {
+            tp_ring_bulk_hop *s = &st[h];
+            if (s->inflight || s->posted >= total_rounds) continue;
+            const uint32_t r = s->posted;
+            if (s->done < r) continue;
+            if (h > 0 && st[h - 1].done_read < r + 1) continue;
+
+            const uint64_t roff = (uint64_t)r * ROUND;
+            const uint64_t remaining = bytes - roff;
             uint32_t chunks = (uint32_t)((remaining + DS4_TP_RDMA_MAX_MSG - 1u) /
                                          DS4_TP_RDMA_MAX_MSG);
             if (chunks > DS4_TP_RDMA_BULK_SLOTS) chunks = DS4_TP_RDMA_BULK_SLOTS;
@@ -3130,14 +3204,21 @@ static int tp_rdma_ring_bulk_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
                 const uint64_t left = remaining - round_bytes;
                 lens[i] = (uint32_t)(left > DS4_TP_RDMA_MAX_MSG ?
                                      DS4_TP_RDMA_MAX_MSG : left);
-                chunk_off[i] = round_bytes;
+                chunk_off[i] = direct ? round_bytes :
+                    (uint64_t)i * DS4_TP_RDMA_MAX_MSG;
                 round_bytes += lens[i];
             }
+            const void *relay = h == 0 ? out :
+                (const void *)((uint8_t *)in + (uint64_t)(h - 1) * hop_stride);
+            uint8_t *hopbuf = (uint8_t *)in + (uint64_t)h * hop_stride;
             if (!direct) {
-                for (uint32_t i = 0; i < chunks; i++)
-                    memcpy(stage_send + chunk_off[i],
-                           (const uint8_t *)relay + off + chunk_off[i],
-                           lens[i]);
+                uint64_t c = 0;
+                for (uint32_t i = 0; i < chunks; i++) {
+                    memcpy(stage_send + (uint64_t)h * tp->bulk_stage_bytes +
+                               (uint64_t)i * DS4_TP_RDMA_MAX_MSG,
+                           (const uint8_t *)relay + roff + c, lens[i]);
+                    c += lens[i];
+                }
             }
 
             struct ibv_sge recv_sge[DS4_TP_RDMA_BULK_SLOTS];
@@ -3146,30 +3227,28 @@ static int tp_rdma_ring_bulk_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
             for (uint32_t i = 0; i < chunks; i++) {
                 recv_sge[i] = (struct ibv_sge) {
                     .addr = direct ?
-                        (uintptr_t)(hopbuf + off + chunk_off[i]) :
-                        (uintptr_t)(stage_recv + chunk_off[i]),
+                        (uintptr_t)(hopbuf + roff + chunk_off[i]) :
+                        (uintptr_t)(stage_recv + (uint64_t)h * tp->bulk_stage_bytes +
+                                    chunk_off[i]),
                     .length = lens[i],
                     .lkey = rp->mr->lkey,
                 };
-                recv_wr[i].wr_id = DS4_TP_RDMA_BULK_WR_TAG | ((uint64_t)i + 1u);
+                recv_wr[i].wr_id = DS4_TP_RDMA_BULK_WR_TAG |
+                    ((uint64_t)(h + 1) << 32) | ((uint64_t)i + 1u);
                 recv_wr[i].sg_list = &recv_sge[i];
                 recv_wr[i].num_sge = 1;
                 recv_wr[i].next = i + 1u < chunks ? &recv_wr[i + 1u] : NULL;
             }
             struct ibv_recv_wr *bad_recv = NULL;
             if (ibv_post_recv(rp->qp, recv_wr, &bad_recv) != 0) {
-                fprintf(stderr, "ds4-tp: ring bulk post_recv: %s\n",
-                        strerror(errno));
+                fprintf(stderr, "ds4-tp: ring bulk post_recv h=%u r=%u: %s\n",
+                        h, r, strerror(errno));
                 return 0;
             }
 
-            /* Per-round ready handshake (reverse ring): the bulk posts recvs
-             * round-by-round (the big-gate regions are unregistered Metal
-             * buffers, so it cannot post a whole hop upfront like the decode
-             * ring), and the rounds can drift across ranks.  Telling prev we
-             * have posted this round's recvs and waiting for next's go, after
-             * posting recvs but before sending, guarantees next has posted its
-             * matching recv before our send lands. */
+            /* Per-round ready handshake (reverse ring): tell prev we have
+             * posted this round's recvs and wait for next's go, so next has
+             * posted its matching recv before our send lands. */
             char go = 0;
             if (!tp_write_full(tp->data_fd[prev], &go, 1)) return 0;
             if (!tp_read_full(tp->data_fd[next], &go, 1)) return 0;
@@ -3180,12 +3259,14 @@ static int tp_rdma_ring_bulk_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
             for (uint32_t i = 0; i < chunks; i++) {
                 send_sge[i] = (struct ibv_sge) {
                     .addr = direct ?
-                        (uintptr_t)((const uint8_t *)relay + off + chunk_off[i]) :
-                        (uintptr_t)(stage_send + chunk_off[i]),
+                        (uintptr_t)((const uint8_t *)relay + roff + chunk_off[i]) :
+                        (uintptr_t)(stage_send + (uint64_t)h * tp->bulk_stage_bytes +
+                                    chunk_off[i]),
                     .length = lens[i],
                     .lkey = rn->mr->lkey,
                 };
-                send_wr[i].wr_id = DS4_TP_RDMA_BULK_WR_TAG | ((uint64_t)i + 1u);
+                send_wr[i].wr_id = DS4_TP_RDMA_BULK_WR_TAG |
+                    ((uint64_t)(h + 1) << 32) | ((uint64_t)i + 1u);
                 send_wr[i].sg_list = &send_sge[i];
                 send_wr[i].num_sge = 1;
                 send_wr[i].opcode = IBV_WR_SEND;
@@ -3199,40 +3280,28 @@ static int tp_rdma_ring_bulk_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
                 return 0;
             }
 
-            uint32_t recv_done = 0;
-            int send_done = 0;
-            double deadline = tp_now_sec() + (double)tp->timeout_sec;
-            uint32_t peer_poll = 0;
-            while (recv_done < chunks || !send_done) {
-                if (!tp_rdma_ring_bulk_poll(tp, prev, next,
-                                            &recv_done, &send_done))
-                    return 0;
-                if ((peer_poll++ & 0x3fffu) == 0 &&
-                    (tp_peer_closed(tp, prev) || tp_peer_closed(tp, next))) {
-                    fprintf(stderr,
-                            "ds4-tp: peer %d/%d disconnected during ring bulk\n",
-                            prev, next);
-                    return 0;
-                }
-                if (tp_now_sec() > deadline) {
-                    fprintf(stderr,
-                            "ds4-tp: ring bulk timeout hop %u round (%u/%u recvs)\n",
-                            h, recv_done, chunks);
-                    return 0;
-                }
-            }
-            if (!direct) {
-                for (uint32_t i = 0; i < chunks; i++)
-                    memcpy(hopbuf + off + chunk_off[i],
-                           stage_recv + chunk_off[i], lens[i]);
-            }
-            /* Round-done barrier: tell prev we consumed its round and wait for
-             * next's done, so every rank finishes the round before any relay
-             * reads region data for the next hop. */
-            char dgo = 0;
-            if (!tp_write_full(tp->data_fd[prev], &dgo, 1)) return 0;
-            if (!tp_read_full(tp->data_fd[next], &dgo, 1)) return 0;
-            off += round_bytes;
+            s->round = r;
+            s->chunks = chunks;
+            s->round_bytes = round_bytes;
+            s->recv_done = 0;
+            s->send_done = 0;
+            s->inflight = 1;
+            s->posted = r + 1;
+        }
+
+        if ((peer_poll++ & 0x3fffu) == 0 &&
+            (tp_peer_closed(tp, prev) || tp_peer_closed(tp, next))) {
+            fprintf(stderr,
+                    "ds4-tp: peer %d/%d disconnected during ring bulk\n",
+                    prev, next);
+            return 0;
+        }
+        if (tp_now_sec() > deadline) {
+            fprintf(stderr,
+                    "ds4-tp: ring bulk timeout (%llu/%llu rounds)\n",
+                    (unsigned long long)st[hops - 1].done_read,
+                    (unsigned long long)total_rounds);
+            return 0;
         }
     }
     /* Canonical rank-order fold into fold_dst (in-place safe when fold_dst
