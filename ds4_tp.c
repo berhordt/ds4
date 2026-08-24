@@ -30,6 +30,11 @@
 
 #include "ds4_tp.h"
 
+/* Canonical rank-order fold for the ring all-reduce (defined later). */
+static void tp_ring_fold(ds4_tp *tp, const float *out,
+                         const float *regions, uint64_t region_stride,
+                         uint64_t words, float *dst);
+
 #if defined(__APPLE__) && defined(__has_include)
 #if __has_include(<infiniband/verbs.h>)
 #include <infiniband/verbs.h>
@@ -240,6 +245,8 @@ static void tp_set_err(char *err, size_t errlen, const char *fmt, ...) {
  * Mesh topology descriptor.
  * ----------------------------------------------------------------- */
 
+static int tp_topology_classify(const ds4_tp_topology *topo);
+
 int ds4_tp_topology_load(const char *path, ds4_tp_topology *topo,
                          char *err, size_t errlen) {
     memset(topo, 0, sizeof(*topo));
@@ -382,6 +389,16 @@ int ds4_tp_topology_load(const char *path, ds4_tp_topology *topo,
             }
         }
     }
+    /* Accept exactly one of: classic 2-node pair, full mesh (every node
+     * links to every peer), or ring (world>2, exactly two next/prev links
+     * per node).  Partial meshes (lines, rings with missing chords, mixed
+     * link counts) are rejected here instead of failing at the first gate. */
+    if (tp_topology_classify(topo) == 0) {
+        tp_set_err(err, errlen,
+                   "tp topology: %s: world %d is not a 2-node pair, full mesh, or ring",
+                   path, world);
+        goto fail;
+    }
     fclose(fp);
     return 1;
 malformed:
@@ -423,17 +440,44 @@ static const char *tp_link_host(const ds4_tp *tp, int peer) {
     return li >= 0 ? tp->topo.node[tp->rank].link[li].host : NULL;
 }
 
-/* True when the mesh uses the ring all-reduce (world>2, canonical next/prev
- * links present on every node). */
+/* True when the mesh is a ring: world>2 and every node has exactly two
+ * links, which are its next and prev ring neighbours.  Fully-connected
+ * meshes (n_links == world-1) are NOT rings: they keep the broadcast/gather
+ * + CPU canonical-combine path. */
 static bool tp_topology_ring(const ds4_tp_topology *topo) {
     if (!topo || topo->world <= 2) return false;
     for (int r = 0; r < topo->world; r++) {
         const int next = (r + 1) % topo->world;
         const int prev = (r + topo->world - 1) % topo->world;
+        if (topo->node[r].n_links != 2) return false;
         if (tp_node_link_index(topo, r, next) < 0) return false;
         if (tp_node_link_index(topo, r, prev) < 0) return false;
     }
     return true;
+}
+
+/* Topology class: 0 = invalid/partial mesh, 1 = classic 2-node pair,
+ * 2 = full mesh (every node links to every peer), 3 = ring. */
+static int tp_topology_classify(const ds4_tp_topology *topo) {
+    if (!topo || topo->world < 2 || topo->world > DS4_TP_MAX_WORLD) return 0;
+    const int w = topo->world;
+    if (w == 2) {
+        if (topo->node[0].n_links == 1 && topo->node[1].n_links == 1 &&
+            tp_node_link_index(topo, 0, 1) >= 0 &&
+            tp_node_link_index(topo, 1, 0) >= 0) return 1;
+        return 0;
+    }
+    if (tp_topology_ring(topo)) return 3;
+    bool full = true;
+    for (int r = 0; r < w; r++) {
+        if (topo->node[r].n_links != w - 1) { full = false; break; }
+        for (int p = 0; p < w; p++) {
+            if (p == r) continue;
+            if (tp_node_link_index(topo, r, p) < 0) { full = false; break; }
+        }
+        if (!full) break;
+    }
+    return full ? 2 : 0;
 }
 
 static int tp_write_full(int fd, const void *buf, size_t len) {
@@ -1134,9 +1178,11 @@ static void tp_combine(ds4_tp *tp, uint32_t layer, uint32_t gate) {
             tp_slab_in_peer_offset(tp, layer, gate, 0));
     memcpy(dst, first, tp->vec_bytes);
     for (int i = 1; i < tp->world; i++) {
-        if (i == tp->rank) continue;
-        const float *src = (const float *)(tp->slab +
-            tp_slab_in_peer_offset(tp, layer, gate, i));
+        /* partial[i] is the local out when i==rank (own slice must be
+         * included), the peer's labeled in vector otherwise. */
+        const float *src = i == tp->rank ? out :
+            (const float *)(tp->slab +
+                tp_slab_in_peer_offset(tp, layer, gate, i));
         for (uint64_t k = 0; k < words; k++) dst[k] += src[k];
     }
 }
@@ -1153,9 +1199,9 @@ static void tp_batch_combine(ds4_tp *tp, uint32_t layer, uint32_t rows) {
             tp_slab_batch_in_peer_offset(tp, layer, 0));
     memcpy(dst, first, (uint64_t)rows * tp->vec_bytes);
     for (int i = 1; i < tp->world; i++) {
-        if (i == tp->rank) continue;
-        const float *src = (const float *)(tp->slab +
-            tp_slab_batch_in_peer_offset(tp, layer, i));
+        const float *src = i == tp->rank ? out :
+            (const float *)(tp->slab +
+                tp_slab_batch_in_peer_offset(tp, layer, i));
         for (uint64_t r = 0; r < rows; r++) {
             const float *sr = src + r * words;
             float *dr = dst + r * words;
@@ -1664,7 +1710,6 @@ static int tp_rdma_gate_exchange_ring(ds4_tp *tp, uint32_t layer, uint32_t gate,
                                        (uint64_t)slot * tp->vec_bytes);
     const uint64_t words = tp->vec_bytes / sizeof(float);
     const uint32_t hops = (uint32_t)tp->world - 1u;
-    memcpy(accum, out, tp->vec_bytes);
 
     pthread_mutex_lock(&rp->post_lock);
     for (uint32_t h = 0; h < hops; h++) {
@@ -1757,11 +1802,13 @@ static int tp_rdma_gate_exchange_ring(ds4_tp *tp, uint32_t layer, uint32_t gate,
             }
         }
         if (!ok) return 0;
-
-        const float *src = (const float *)(tp->slab + tp->in_off +
-            (uint64_t)slot * tp->in_peer_bytes + (uint64_t)h * tp->vec_bytes);
-        for (uint64_t k = 0; k < words; k++) accum[k] += src[k];
     }
+    /* Canonical rank-order fold: every rank sums partial[0..world-1] in the
+     * same FP order, keeping the hidden state bit-exact across the ring. */
+    tp_ring_fold(tp, out,
+                 (const float *)(tp->slab + tp->in_off +
+                     (uint64_t)slot * tp->in_peer_bytes),
+                 words, words, accum);
     return 1;
 }
 
@@ -2691,7 +2738,6 @@ int ds4_tp_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint64_t seq
                                            (uint64_t)slot * tp->vec_bytes);
         const uint64_t words = tp->vec_bytes / sizeof(float);
         const uint32_t hops = (uint32_t)tp->world - 1u;
-        memcpy(accum, out, tp->vec_bytes);
         for (uint32_t h = 0; h < hops; h++) {
             const void *relay = h == 0 ? (const void *)out :
                 (const void *)(tp->slab + tp->in_off +
@@ -2714,8 +2760,12 @@ int ds4_tp_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint64_t seq
             float *src = (float *)(tp->slab + tp->in_off +
                 (uint64_t)slot * tp->in_peer_bytes + (uint64_t)h * tp->vec_bytes);
             if (!tp_read_full(tp->data_fd[prev], src, tp->vec_bytes)) return 0;
-            for (uint64_t k = 0; k < words; k++) accum[k] += src[k];
         }
+        /* Canonical rank-order fold: identical FP sum on every rank. */
+        tp_ring_fold(tp, out,
+                     (const float *)(tp->slab + tp->in_off +
+                         (uint64_t)slot * tp->in_peer_bytes),
+                     words, words, accum);
         return 1;
     }
 #ifdef DS4_TP_HAVE_VERBS
@@ -2735,6 +2785,13 @@ int ds4_tp_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint64_t seq
     if (tp->world > 2) tp_combine(tp, layer, gate);
     return 1;
 }
+
+static int tp_rdma_ring_bulk_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
+                                      const void *out, void *in, uint64_t bytes,
+                                      uint64_t hop_stride, uint16_t gate,
+                                      float *fold_dst);
+static int tp_rdma_ring_bulk_poll(ds4_tp *tp, int prev, int next,
+                                  uint32_t *recv_done, int *send_done);
 
 static int tp_tcp_batch_send(ds4_tp *tp, int peer, uint32_t layer,
                              uint32_t rows, uint64_t seq) {
@@ -2793,6 +2850,19 @@ int ds4_tp_batch_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows,
     ds4_tp_gate_header h = { DS4_TP_BATCH_MAGIC, (uint16_t)layer,
                              (uint16_t)rows, seq };
     if (tp->ring) {
+#ifdef DS4_TP_HAVE_VERBS
+        if (tp->rdma_active) {
+            return tp_rdma_ring_bulk_exchange(
+                tp, layer, seq,
+                (const void *)(tp->slab + ds4_tp_slab_batch_out_offset(tp, layer)),
+                tp->slab + tp->batch_in_off +
+                    (uint64_t)layer * DS4_TP_BATCH_MAX_ROWS *
+                        (tp->world - 1) * tp->vec_bytes,
+                bytes, (uint64_t)DS4_TP_BATCH_MAX_ROWS * tp->vec_bytes,
+                (uint16_t)rows,
+                (float *)(tp->slab + ds4_tp_slab_batch_combined_offset(tp, layer)));
+        }
+#endif
         /* Ring bulk over TCP: circulate the running sum through next/prev. */
         const int next = (tp->rank + 1) % tp->world;
         const int prev = (tp->rank + tp->world - 1) % tp->world;
@@ -2815,7 +2885,6 @@ int ds4_tp_batch_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows,
             ds4_tp_slab_batch_out_offset(tp, layer));
         const uint64_t words = bytes / sizeof(float);
         const uint32_t hops = (uint32_t)tp->world - 1u;
-        memcpy(accum, out, bytes);
         for (uint32_t h = 0; h < hops; h++) {
             const void *relay = h == 0 ? (const void *)out :
                 (const void *)(tp->slab + tp->batch_in_off +
@@ -2836,8 +2905,15 @@ int ds4_tp_batch_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows,
                     return 0;
                 off += n;
             }
-            for (uint64_t k = 0; k < words; k++) accum[k] += hopbuf[k];
         }
+        /* Canonical rank-order fold into the batch combined slot. */
+        tp_ring_fold(tp, out,
+                     (const float *)(tp->slab + tp->batch_in_off +
+                         (uint64_t)layer * DS4_TP_BATCH_MAX_ROWS *
+                             (tp->world - 1) * tp->vec_bytes),
+                     (uint64_t)DS4_TP_BATCH_MAX_ROWS * tp->vec_bytes /
+                         sizeof(float),
+                     words, accum);
         return 1;
     }
 #ifdef DS4_TP_HAVE_VERBS
@@ -2909,15 +2985,279 @@ static void tp_big_combine(ds4_tp *tp, const void *out, void *in,
     const uint64_t words = bytes / sizeof(float);
     const float *o = (const float *)out;
     float *dst = (float *)in;
-    const float *first = tp->rank == 0 ? o :
-        (const float *)((uint8_t *)in +
-                        (uint64_t)tp_in_peer_index(tp, 0) * bytes);
-    memcpy(dst, first, bytes);
-    for (int i = 1; i < tp->world; i++) {
-        if (i == tp->rank) continue;
-        const float *src = (const float *)((uint8_t *)in +
-            (uint64_t)tp_in_peer_index(tp, i) * bytes);
-        for (uint64_t k = 0; k < words; k++) dst[k] += src[k];
+    /* Element-wise canonical rank-order fold: dst is `in` region 0, which
+     * may itself hold a peer partial (peer 1 on rank 0, peer 0 on ranks > 0
+     * under tp_in_peer_index), so a memcpy-first fold would destroy a
+     * partial before it is read.  Accumulate per element, then write. */
+    for (uint64_t k = 0; k < words; k++) {
+        const float *s0 = tp->rank == 0 ? o :
+            (const float *)((uint8_t *)in +
+                            (uint64_t)tp_in_peer_index(tp, 0) * bytes);
+        float acc = s0[k];
+        for (int i = 1; i < tp->world; i++) {
+            const float *src = i == tp->rank ? o :
+                (const float *)((uint8_t *)in +
+                    (uint64_t)tp_in_peer_index(tp, i) * bytes);
+            acc += src[k];
+        }
+        dst[k] = acc;
+    }
+}
+
+/* Canonical rank-order fold for the ring all-reduce: rank r sums
+ * partial[0] + partial[1] + ... + partial[world-1], where partial[i] is the
+ * local out when i==r and the ring hop region holding rank i's partial
+ * otherwise.  Rank i (i != r) arrives at hop (r-1-i) mod world, so its
+ * region index is ((r-1-i) mod world).  The element-wise write makes the
+ * fold in-place safe when dst overlaps a region (the big-gate case writes
+ * the combined sum back into region 0). */
+/* Poll both ring links for one bulk round: prev's CQ counts the round's
+ * recv completions (BULK_WR_TAG), next's CQ marks the round's send done and
+ * reaps any leftover decode sends.  Non-bulk completions update the
+ * per-link gate-seq watermark / send-outstanding count. */
+static int tp_rdma_ring_bulk_poll(ds4_tp *tp, int prev, int next,
+                                  uint32_t *recv_done, int *send_done) {
+    ds4_tp_rdma_link *rp = &tp->rdma[prev];
+    struct ibv_wc wc[DS4_TP_RDMA_BULK_SLOTS + 1u];
+    int n = ibv_poll_cq(rp->cq, (int)(DS4_TP_RDMA_BULK_SLOTS + 1u), wc);
+    if (n < 0) return 0;
+    for (int i = 0; i < n; i++) {
+        if (wc[i].status != IBV_WC_SUCCESS) {
+            fprintf(stderr,
+                    "ds4-tp: ring bulk rdma completion error (prev %d): %s\n",
+                    prev, tp_wc_status_str(wc[i].status));
+            return 0;
+        }
+        if (wc[i].opcode & IBV_WC_RECV) {
+            if (wc[i].wr_id & DS4_TP_RDMA_BULK_WR_TAG) (*recv_done)++;
+            else if (wc[i].wr_id > rp->recv_done) rp->recv_done = wc[i].wr_id;
+        } else if (rp->send_outstanding > 0) {
+            rp->send_outstanding--;
+        }
+    }
+    ds4_tp_rdma_link *rn = &tp->rdma[next];
+    n = ibv_poll_cq(rn->cq, (int)(DS4_TP_RDMA_BULK_SLOTS + 1u), wc);
+    if (n < 0) return 0;
+    for (int i = 0; i < n; i++) {
+        if (wc[i].status != IBV_WC_SUCCESS) {
+            fprintf(stderr,
+                    "ds4-tp: ring bulk rdma completion error (next %d): %s\n",
+                    next, tp_wc_status_str(wc[i].status));
+            return 0;
+        }
+        if (wc[i].opcode & IBV_WC_RECV) {
+            if (wc[i].wr_id > rn->recv_done) rn->recv_done = wc[i].wr_id;
+        } else if (wc[i].wr_id & DS4_TP_RDMA_BULK_WR_TAG) {
+            *send_done = 1;
+        } else if (rn->send_outstanding > 0) {
+            rn->send_outstanding--;
+        }
+    }
+    return 1;
+}
+
+/* RDMA ring bulk exchange: circulate one payload through next/prev (world-1
+ * hops), chunked into DS4_TP_RDMA_BULK_SLOTS x 16 KiB messages per round.
+ * Per-hop recvs land in `in` region h (hop_stride apart); hop h's relay is
+ * out (h==0) or region h-1.  A per-hop ready handshake on the data sockets
+ * bounds the UC recv/send matching skew: the decode ring can post all recvs
+ * upfront, but the bulk cannot (the big-gate regions are unregistered Metal
+ * buffers), so it re-synchronizes each hop.  Both links' CQs are drained in
+ * the round wait.  The final canonical rank-order fold writes the combined
+ * sum into fold_dst (region 0 for the big gate, the batch combined slot for
+ * the batch gate). */
+static int tp_rdma_ring_bulk_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
+                                      const void *out, void *in, uint64_t bytes,
+                                      uint64_t hop_stride, uint16_t gate,
+                                      float *fold_dst) {
+    const int next = (tp->rank + 1) % tp->world;
+    const int prev = (tp->rank + tp->world - 1) % tp->world;
+    if (tp->data_fd[next] < 0 || tp->data_fd[prev] < 0) return 0;
+    ds4_tp_rdma_link *rn = &tp->rdma[next];
+    ds4_tp_rdma_link *rp = &tp->rdma[prev];
+    if (!rn->qp || !rn->mr || !rp->qp || !rp->mr) return 0;
+    if (bytes == 0) return 0;
+
+    /* Header barrier: write our header to next, read prev's, verify. */
+    ds4_tp_gate_header h = { DS4_TP_BATCH_MAGIC, (uint16_t)layer, gate, seq };
+    if (!tp_write_full(tp->data_fd[next], &h, sizeof(h))) return 0;
+    ds4_tp_gate_header ph;
+    if (!tp_read_full(tp->data_fd[prev], &ph, sizeof(ph))) return 0;
+    if (ph.magic != DS4_TP_BATCH_MAGIC || ph.layer != layer ||
+        ph.gate != gate || ph.seq != seq) {
+        fprintf(stderr,
+                "ds4-tp: ring bulk desync: got l=%u tag=%x seq=%llu, want l=%u seq=%llu\n",
+                ph.layer, ph.gate, (unsigned long long)ph.seq,
+                layer, (unsigned long long)seq);
+        return 0;
+    }
+
+    /* Drain decode lookahead receives on both links before reusing the QPs. */
+    if (!tp_rdma_drain_decode_window(tp, next)) return 0;
+    if (!tp_rdma_drain_decode_window(tp, prev)) return 0;
+
+    const uintptr_t slab_lo = (uintptr_t)tp->slab;
+    const uintptr_t slab_hi = slab_lo + tp->slab_bytes;
+    const int direct = out && in &&
+        (uintptr_t)out >= slab_lo && (uintptr_t)out <= slab_hi &&
+        (uintptr_t)in >= slab_lo && (uintptr_t)in <= slab_hi &&
+        bytes <= slab_hi - (uintptr_t)in;
+
+    const uint64_t pidx_n = tp_in_peer_index(tp, next);
+    const uint64_t pidx_p = tp_in_peer_index(tp, prev);
+    uint8_t *stage_send = tp->slab + tp->bulk_stage_off +
+                          pidx_n * tp->bulk_stage_bytes;
+    uint8_t *stage_recv = tp->slab + tp->bulk_stage_off +
+                          (uint64_t)(tp->world - 1) * tp->bulk_stage_bytes +
+                          pidx_p * tp->bulk_stage_bytes;
+
+    const uint32_t hops = (uint32_t)tp->world - 1u;
+    for (uint32_t h = 0; h < hops; h++) {
+        const void *relay = h == 0 ? out :
+            (const void *)((uint8_t *)in + (uint64_t)(h - 1) * hop_stride);
+        uint8_t *hopbuf = (uint8_t *)in + (uint64_t)h * hop_stride;
+
+        uint64_t off = 0;
+        while (off < bytes) {
+            const uint64_t remaining = bytes - off;
+            uint32_t chunks = (uint32_t)((remaining + DS4_TP_RDMA_MAX_MSG - 1u) /
+                                         DS4_TP_RDMA_MAX_MSG);
+            if (chunks > DS4_TP_RDMA_BULK_SLOTS) chunks = DS4_TP_RDMA_BULK_SLOTS;
+            uint64_t round_bytes = 0;
+            uint32_t lens[DS4_TP_RDMA_BULK_SLOTS];
+            uint64_t chunk_off[DS4_TP_RDMA_BULK_SLOTS];
+            for (uint32_t i = 0; i < chunks; i++) {
+                const uint64_t left = remaining - round_bytes;
+                lens[i] = (uint32_t)(left > DS4_TP_RDMA_MAX_MSG ?
+                                     DS4_TP_RDMA_MAX_MSG : left);
+                chunk_off[i] = round_bytes;
+                round_bytes += lens[i];
+            }
+            if (!direct) {
+                for (uint32_t i = 0; i < chunks; i++)
+                    memcpy(stage_send + chunk_off[i],
+                           (const uint8_t *)relay + off + chunk_off[i],
+                           lens[i]);
+            }
+
+            struct ibv_sge recv_sge[DS4_TP_RDMA_BULK_SLOTS];
+            struct ibv_recv_wr recv_wr[DS4_TP_RDMA_BULK_SLOTS];
+            memset(recv_wr, 0, sizeof(recv_wr));
+            for (uint32_t i = 0; i < chunks; i++) {
+                recv_sge[i] = (struct ibv_sge) {
+                    .addr = direct ?
+                        (uintptr_t)(hopbuf + off + chunk_off[i]) :
+                        (uintptr_t)(stage_recv + chunk_off[i]),
+                    .length = lens[i],
+                    .lkey = rp->mr->lkey,
+                };
+                recv_wr[i].wr_id = DS4_TP_RDMA_BULK_WR_TAG | ((uint64_t)i + 1u);
+                recv_wr[i].sg_list = &recv_sge[i];
+                recv_wr[i].num_sge = 1;
+                recv_wr[i].next = i + 1u < chunks ? &recv_wr[i + 1u] : NULL;
+            }
+            struct ibv_recv_wr *bad_recv = NULL;
+            if (ibv_post_recv(rp->qp, recv_wr, &bad_recv) != 0) {
+                fprintf(stderr, "ds4-tp: ring bulk post_recv: %s\n",
+                        strerror(errno));
+                return 0;
+            }
+
+            /* Per-round ready handshake (reverse ring): the bulk posts recvs
+             * round-by-round (the big-gate regions are unregistered Metal
+             * buffers, so it cannot post a whole hop upfront like the decode
+             * ring), and the rounds can drift across ranks.  Telling prev we
+             * have posted this round's recvs and waiting for next's go, after
+             * posting recvs but before sending, guarantees next has posted its
+             * matching recv before our send lands. */
+            char go = 0;
+            if (!tp_write_full(tp->data_fd[prev], &go, 1)) return 0;
+            if (!tp_read_full(tp->data_fd[next], &go, 1)) return 0;
+
+            struct ibv_sge send_sge[DS4_TP_RDMA_BULK_SLOTS];
+            struct ibv_send_wr send_wr[DS4_TP_RDMA_BULK_SLOTS];
+            memset(send_wr, 0, sizeof(send_wr));
+            for (uint32_t i = 0; i < chunks; i++) {
+                send_sge[i] = (struct ibv_sge) {
+                    .addr = direct ?
+                        (uintptr_t)((const uint8_t *)relay + off + chunk_off[i]) :
+                        (uintptr_t)(stage_send + chunk_off[i]),
+                    .length = lens[i],
+                    .lkey = rn->mr->lkey,
+                };
+                send_wr[i].wr_id = DS4_TP_RDMA_BULK_WR_TAG | ((uint64_t)i + 1u);
+                send_wr[i].sg_list = &send_sge[i];
+                send_wr[i].num_sge = 1;
+                send_wr[i].opcode = IBV_WR_SEND;
+                send_wr[i].send_flags = i + 1u == chunks ? IBV_SEND_SIGNALED : 0;
+                send_wr[i].next = i + 1u < chunks ? &send_wr[i + 1u] : NULL;
+            }
+            struct ibv_send_wr *bad_send = NULL;
+            if (ibv_post_send(rn->qp, send_wr, &bad_send) != 0) {
+                fprintf(stderr, "ds4-tp: ring bulk post_send: %s\n",
+                        strerror(errno));
+                return 0;
+            }
+
+            uint32_t recv_done = 0;
+            int send_done = 0;
+            double deadline = tp_now_sec() + (double)tp->timeout_sec;
+            uint32_t peer_poll = 0;
+            while (recv_done < chunks || !send_done) {
+                if (!tp_rdma_ring_bulk_poll(tp, prev, next,
+                                            &recv_done, &send_done))
+                    return 0;
+                if ((peer_poll++ & 0x3fffu) == 0 &&
+                    (tp_peer_closed(tp, prev) || tp_peer_closed(tp, next))) {
+                    fprintf(stderr,
+                            "ds4-tp: peer %d/%d disconnected during ring bulk\n",
+                            prev, next);
+                    return 0;
+                }
+                if (tp_now_sec() > deadline) {
+                    fprintf(stderr,
+                            "ds4-tp: ring bulk timeout hop %u round (%u/%u recvs)\n",
+                            h, recv_done, chunks);
+                    return 0;
+                }
+            }
+            if (!direct) {
+                for (uint32_t i = 0; i < chunks; i++)
+                    memcpy(hopbuf + off + chunk_off[i],
+                           stage_recv + chunk_off[i], lens[i]);
+            }
+            /* Round-done barrier: tell prev we consumed its round and wait for
+             * next's done, so every rank finishes the round before any relay
+             * reads region data for the next hop. */
+            char dgo = 0;
+            if (!tp_write_full(tp->data_fd[prev], &dgo, 1)) return 0;
+            if (!tp_read_full(tp->data_fd[next], &dgo, 1)) return 0;
+            off += round_bytes;
+        }
+    }
+    /* Canonical rank-order fold into fold_dst (in-place safe when fold_dst
+     * overlaps region 0). */
+    tp_ring_fold(tp, (const float *)out, (const float *)in,
+                 hop_stride / sizeof(float), bytes / sizeof(float),
+                 fold_dst);
+    return 1;
+}
+
+static void tp_ring_fold(ds4_tp *tp, const float *out,
+                         const float *regions, uint64_t region_stride,
+                         uint64_t words, float *dst) {
+    const int w = (int)tp->world;
+    const int r = (int)tp->rank;
+    for (uint64_t k = 0; k < words; k++) {
+        const float *s0 = r == 0 ? out :
+            regions + (uint64_t)((r - 1 + w) % w) * region_stride;
+        float acc = s0[k];
+        for (int i = 1; i < w; i++) {
+            const float *src = i == r ? out :
+                regions + (uint64_t)((r - 1 - i + w) % w) * region_stride;
+            acc += src[k];
+        }
+        dst[k] = acc;
     }
 }
 
@@ -2940,6 +3280,12 @@ int ds4_tp_big_gate_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
     if (!out || !in || bytes == 0) return 0;
     ds4_tp_gate_header h = { DS4_TP_BATCH_MAGIC, (uint16_t)layer, 0xB16u, seq };
     if (tp->ring) {
+#ifdef DS4_TP_HAVE_VERBS
+        if (tp->rdma_active) {
+            return tp_rdma_ring_bulk_exchange(tp, layer, seq, out, in, bytes,
+                                              bytes, 0xB16u, (float *)in);
+        }
+#endif
         /* Ring bulk over TCP: circulate the running sum through next/prev.
          * The caller's `in` carries (world-1)*bytes; region 0 is the
          * accumulator and region 1 the per-hop receive buffer. */
@@ -2960,15 +3306,16 @@ int ds4_tp_big_gate_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
         }
         const uint64_t words = bytes / sizeof(float);
         const uint32_t hops = (uint32_t)tp->world - 1u;
-        memcpy(in, out, bytes);
-        /* Region 0 of `in` is the accumulator; regions 1 and 2 alternate as
-         * the per-hop receive/relay buffers. */
-        uint8_t *buf0 = (uint8_t *)in + bytes;
-        uint8_t *buf1 = (uint8_t *)in + 2u * bytes;
+        /* Each hop's incoming partial lands in its own region h of `in`
+         * ((world-1)*bytes), and hop h's relay is out (h==0) or region h-1.
+         * This also keeps the writes inside (world-1)*bytes for world==3
+         * (the old alternating two-buffer scheme ran past the end).  The
+         * final canonical rank-order fold writes the combined sum back into
+         * region 0 in-place. */
         for (uint32_t h = 0; h < hops; h++) {
             const void *relay = h == 0 ? (const void *)out :
-                (h & 1u) ? (const void *)buf0 : (const void *)buf1;
-            uint8_t *hopbuf = (h & 1u) ? buf1 : buf0;
+                (const void *)((uint8_t *)in + (uint64_t)(h - 1) * bytes);
+            uint8_t *hopbuf = (uint8_t *)in + (uint64_t)h * bytes;
             uint64_t off = 0;
             while (off < bytes) {
                 const uint64_t n = bytes - off > DS4_TP_BIG_CHUNK ?
@@ -2979,10 +3326,9 @@ int ds4_tp_big_gate_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
                     return 0;
                 off += n;
             }
-            const float *hf = (const float *)hopbuf;
-            float *acc = (float *)in;
-            for (uint64_t k = 0; k < words; k++) acc[k] += hf[k];
         }
+        tp_ring_fold(tp, (const float *)out, (const float *)in,
+                     words, words, (float *)in);
         if (getenv("DS4_GLM_TP_DEBUG")) {
             const float *o = (const float *)out;
             const float *i0 = (const float *)in;

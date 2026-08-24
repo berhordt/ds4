@@ -185,6 +185,9 @@ kernel void kernel_dsv4_hc_zero_outsides_slice(
     if (args.n_hc != 4) {
         return;
     }
+    if ((int64_t) gid >= args.n_embd * args.n_hc) {
+        return;
+    }
     const int64_t d = (int64_t)(gid % (uint)args.n_embd);
     const int64_t h = (int64_t)(gid / (uint)args.n_embd);
     if (d >= args.embd0 && d < args.embd0 + args.embd_n) {

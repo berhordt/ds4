@@ -211,7 +211,10 @@ ds4_distributed.o: ds4_distributed.c ds4_distributed.h ds4.h ds4_ssd.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_distributed.c
 
 ds4_tp.o: ds4_tp.c ds4_tp.h ds4.h ds4_ssd.h
-	$(CC) $(CFLAGS) -c -o $@ ds4_tp.c
+	# -ffast-math implies -fassociative-math, which reorders the canonical
+	# rank-order FP folds (ring all-reduce + full-mesh combine) and breaks
+	# bit-exactness across ranks.  Disable reassociation for this object only.
+	$(CC) $(CFLAGS) -fno-associative-math -c -o $@ ds4_tp.c
 
 ds4_help.o: ds4_help.c ds4_help.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_help.c
