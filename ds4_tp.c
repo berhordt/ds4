@@ -74,7 +74,7 @@ typedef struct {
     uint32_t gates_per_token;
     uint32_t world;             /* mesh world size (2 for the classic pair) */
     uint32_t rank;              /* this node's rank in the mesh */
-    uint32_t pad;
+    uint32_t big_tcp;           /* 1: this rank wants the TCP big-gate override */
 } ds4_tp_hello_fixed;
 
 typedef struct {
@@ -197,6 +197,8 @@ struct ds4_tp {
     int data_fd[DS4_TP_MAX_WORLD];
     bool rdma_active;
     uint32_t peer_rdma_ok[DS4_TP_MAX_WORLD]; /* workers' rdma_ok from hello */
+    uint32_t peer_big_tcp[DS4_TP_MAX_WORLD]; /* workers' big-tcp bit from hello */
+    uint32_t big_tcp_override;  /* mesh-wide TCP big-gate decision (ring only) */
     uint32_t peer_ctx;
     uint32_t n_layer;
     uint32_t n_embd;
@@ -2152,6 +2154,19 @@ static void tp_rdma_close(ds4_tp *tp) {
  * Bring-up.
  * --------------------------------------------------------------------- */
 
+/* DS4_TP_BIG_TCP: only an explicit true value (1/true/yes/on) forces the TCP
+ * ring bulk for the big gate; 0/false/no/off and empty disable it.  The
+ * choice is per-rank and is ANDed across ranks in the hello, so all ranks
+ * agree on the big-gate transport (mixed settings fall back to RDMA). */
+static int ds4_tp_big_tcp_env(void) {
+    const char *v = getenv("DS4_TP_BIG_TCP");
+    if (!v || !*v) return 0;
+    if (!strcmp(v, "0") || !strcmp(v, "false") || !strcmp(v, "no") ||
+        !strcmp(v, "off") || !strcmp(v, "FALSE") || !strcmp(v, "NO") ||
+        !strcmp(v, "OFF")) return 0;
+    return 1;
+}
+
 static int tp_hello_exchange(ds4_tp *tp, int peer, const ds4_tp_identity *id,
                              int rdma_ok, char *err, size_t errlen) {
     ds4_tp_hello_fixed mine = {
@@ -2171,6 +2186,7 @@ static int tp_hello_exchange(ds4_tp *tp, int peer, const ds4_tp_identity *id,
         .gates_per_token = id->gates_per_token,
         .world = (uint32_t)tp->world,
         .rank = (uint32_t)tp->rank,
+        .big_tcp = (uint32_t)ds4_tp_big_tcp_env(),
     };
     ds4_tp_hello_fixed theirs;
     int got_theirs = 0;
@@ -2273,6 +2289,7 @@ static int tp_hello_exchange(ds4_tp *tp, int peer, const ds4_tp_identity *id,
         /* Leader collects each worker's rdma_ok; the mesh-wide decision is
          * broadcast after the hello barrier. */
         tp->peer_rdma_ok[peer] = theirs.rdma_ok;
+        tp->peer_big_tcp[peer] = theirs.big_tcp;
     } else {
         /* Worker: the leader broadcasts the transport decision. */
         uint32_t mode = 0;
@@ -2297,7 +2314,8 @@ static int tp_hello_exchange(ds4_tp *tp, int peer, const ds4_tp_identity *id,
                 return 0;
             }
         }
-        tp->rdma_active = mode != 0;
+        tp->rdma_active = (mode & 1u) != 0;
+        tp->big_tcp_override = (mode & 2u) != 0;
         if (tp->opt.transport == DS4_TP_TRANSPORT_RDMA && !tp->rdma_active) {
             tp_set_err(err, errlen,
                        "tp: --transport rdma but a peer has no active device");
@@ -2517,7 +2535,16 @@ int ds4_tp_create(
                        "tp: --transport rdma but a peer has no active device");
             goto fail;
         }
-        uint32_t mode = tp->rdma_active ? 1u : 0u;
+        /* TCP big-gate override only if every connected rank opts in. */
+        int all_big_tcp = ds4_tp_big_tcp_env() != 0;
+        for (int m = 1; m < tp->world; m++) {
+            if (tp->control_fd[m] >= 0 && !tp->peer_big_tcp[m]) {
+                all_big_tcp = 0;
+            }
+        }
+        tp->big_tcp_override = all_big_tcp != 0;
+        uint32_t mode = (tp->rdma_active ? 1u : 0u) |
+                        (tp->big_tcp_override ? 2u : 0u);
         for (int m = 1; m < tp->world; m++) {
             if (tp->ring) {
                 if (!tp_ctrl_send(tp, m, DS4_TP_FRAME_RDMA_MODE,
@@ -3088,7 +3115,15 @@ static int tp_rdma_ring_bulk_wave_poll(ds4_tp *tp, int prev, int next,
             if (wc[i].wr_id > rn->recv_done) rn->recv_done = wc[i].wr_id;
         } else if (wc[i].wr_id & DS4_TP_RDMA_BULK_WR_TAG) {
             const uint32_t h = (uint32_t)((wc[i].wr_id >> 32) & 0xFFFFu);
-            if (h > 0 && h <= hops) st[h - 1].send_done = 1;
+            if (h > 0 && h <= hops) {
+                st[h - 1].send_done = 1;
+            } else if (rn->send_outstanding > 0) {
+                /* Drain-send completion (tag with h==0): count against the
+                 * outstanding drain sends, not a bulk round.  The drain
+                 * normally consumes its own completions before the bulk
+                 * exchange, so this is defensive only. */
+                rn->send_outstanding--;
+            }
         } else if (rn->send_outstanding > 0) {
             rn->send_outstanding--;
         }
@@ -3146,10 +3181,15 @@ static int tp_rdma_ring_bulk_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
 
     const uintptr_t slab_lo = (uintptr_t)tp->slab;
     const uintptr_t slab_hi = slab_lo + tp->slab_bytes;
+    /* Direct path: both out and in must fit in the registered slab.  The in
+     * side spans the whole hop region set ((hops-1)*hop_stride + bytes), so
+     * check the full extent, not just the first round. */
+    const uint64_t in_extent = (uint64_t)(tp->world - 2u) * hop_stride + bytes;
     const int direct = out && in &&
         (uintptr_t)out >= slab_lo && (uintptr_t)out <= slab_hi &&
+        bytes <= slab_hi - (uintptr_t)out &&
         (uintptr_t)in >= slab_lo && (uintptr_t)in <= slab_hi &&
-        bytes <= slab_hi - (uintptr_t)in;
+        in_extent <= slab_hi - (uintptr_t)in;
 
     const uint32_t hops = (uint32_t)tp->world - 1u;
     const uint64_t ROUND = (uint64_t)DS4_TP_RDMA_BULK_SLOTS * DS4_TP_RDMA_MAX_MSG;
@@ -3165,6 +3205,7 @@ static int tp_rdma_ring_bulk_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
     double deadline = tp_now_sec() + (double)tp->timeout_sec;
     uint32_t peer_poll = 0;
     while (st[hops - 1].done_read < total_rounds) {
+        const uint64_t done_before = st[hops - 1].done_read;
         /* Service completions on both links; distribute to the in-flight
          * rounds by their hop tag. */
         if (!tp_rdma_ring_bulk_wave_poll(tp, prev, next, st, hops)) return 0;
@@ -3314,6 +3355,13 @@ static int tp_rdma_ring_bulk_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
                     prev, next);
             return 0;
         }
+        /* Progress-based deadline: reset whenever the exchange advances, so a
+         * lowered DS4_TP_TIMEOUT_SEC cannot time out a large multi-round gate
+         * that is still making progress (a stall with no progress still
+         * times out). */
+        if (st[hops - 1].done_read > done_before) {
+            deadline = tp_now_sec() + (double)tp->timeout_sec;
+        }
         if (tp_now_sec() > deadline) {
             fprintf(stderr,
                     "ds4-tp: ring bulk timeout (%llu/%llu rounds)\n",
@@ -3368,10 +3416,11 @@ int ds4_tp_big_gate_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
     ds4_tp_gate_header h = { DS4_TP_BATCH_MAGIC, (uint16_t)layer, 0xB16u, seq };
     if (tp->ring) {
 #ifdef DS4_TP_HAVE_VERBS
-        /* DS4_TP_BIG_TCP=1 forces the TCP ring bulk for the big gate (the
-         * RDMA bulk's per-round ready/done handshakes cost prefill latency;
-         * the TCP write/read has no explicit handshake). */
-        if (tp->rdma_active && !getenv("DS4_TP_BIG_TCP")) {
+        /* DS4_TP_BIG_TCP (negotiated across ranks in the hello) forces the
+         * TCP ring bulk for the big gate (the RDMA bulk's per-round
+         * ready/done handshakes cost prefill latency; the TCP write/read has
+         * no explicit handshake). */
+        if (tp->rdma_active && !tp->big_tcp_override) {
             return tp_rdma_ring_bulk_exchange(tp, layer, seq, out, in, bytes,
                                               bytes, 0xB16u, (float *)in);
         }
