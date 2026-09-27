@@ -1,6 +1,7 @@
 #include "ds4.h"
 #include "ds4_tool_text.h"
 #include "ds4_distributed.h"
+#include "ds4_tp.h"
 #include "ds4_gpu_args.h"
 #include "ds4_help.h"
 #include "ds4_kvstore.h"
@@ -15617,8 +15618,7 @@ static server_config parse_options(int argc, char **argv) {
             server_log(DS4_LOG_DEFAULT,
                        "ds4-server: %s",
                        tp_parse_err[0] ? tp_parse_err :
-                       "invalid tensor-parallel option");
-            exit(2);
+                       "invalid tensor-parallel option");            exit(2);
         }
         if (tp_parse == DS4_TP_CLI_MATCHED) continue;
 
@@ -15793,7 +15793,17 @@ static server_config parse_options(int argc, char **argv) {
         server_log(DS4_LOG_DEFAULT, "ds4-server: %s", tp_err);
         exit(2);
     }
-    char dist_err[256];
+    if (c.engine.tp.role != DS4_TP_NONE && c.kv_disk_dir) {
+        /* The worker must stay in lockstep with the leader.  A disk cache
+         * restore rewrites the leader's local KV without a matching worker
+         * update, so the next sync would force a full worker re-prefill and
+         * negate the cache.  Reject the combination instead of silently
+         * degrading it. */
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: tensor parallelism does not support --kv-disk-dir "
+                   "(the worker cannot mirror disk cache restores)");
+        exit(2);
+    }    char dist_err[256];
     if (ds4_dist_prepare_engine_options(&c.engine.distributed,
                                         &c.engine,
                                         dist_err,
@@ -15811,8 +15821,7 @@ static server_config parse_options(int argc, char **argv) {
         server_log(DS4_LOG_DEFAULT,
                    "ds4-server: --role worker is a serving mode; start tensor-parallel workers with ./ds4");
         exit(2);
-    }
-    return c;
+    }    return c;
 }
 
 #ifndef DS4_SERVER_TEST
@@ -15884,15 +15893,11 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    if (cfg.engine.distributed.role == DS4_DISTRIBUTED_WORKER) {
-        ds4_dist_generation_options gen = {
-            .ctx_size = cfg.ctx_size,
-        };
-        int rc = ds4_dist_run(engine, &cfg.engine.distributed, &gen);
+    if (cfg.engine.tp.role == DS4_TP_WORKER) {
+        int rc = ds4_tp_worker_run(engine, &cfg.engine.tp);
         ds4_engine_close(engine);
         return rc;
     }
-
     ds4_tp *tp_leader = NULL;
     if (cfg.engine.tp.role == DS4_TP_LEADER) {
         char tp_err[256] = "";
@@ -15912,13 +15917,24 @@ int main(int argc, char **argv) {
                                     tp_id.gate_slot_mask);
         if (!ds4_tp_create(&tp_leader, &cfg.engine.tp, &tp_id,
                            tp_err, sizeof(tp_err)) ||
-            !ds4_engine_tp_bind(engine, tp_leader,
-                                tp_err, sizeof(tp_err))) {
+            !ds4_engine_tp_bind(engine, tp_leader, tp_err, sizeof(tp_err))) {
             server_log(DS4_LOG_DEFAULT, "ds4-server: %s", tp_err);
             ds4_tp_free(tp_leader);
             ds4_engine_close(engine);
             return 1;
         }
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: tensor-parallel leader connected; the worker mirrors %s sessions",
+                   cfg.batched_sessions > 0 ? "batched" : "single");
+    }
+
+    if (cfg.engine.distributed.role == DS4_DISTRIBUTED_WORKER) {
+        ds4_dist_generation_options gen = {
+            .ctx_size = cfg.ctx_size,
+        };
+        int rc = ds4_dist_run(engine, &cfg.engine.distributed, &gen);
+        ds4_engine_close(engine);
+        return rc;
     }
 
     const int slot_count = cfg.batched_sessions > 0 ? cfg.batched_sessions : 1;
@@ -16122,6 +16138,8 @@ int main(int argc, char **argv) {
         kv_cache_store_current(&s, slot, "shutdown");
     }
     server_close_resources(&s);
+    if (tp_leader) ds4_tp_send_stop(tp_leader);
+    ds4_tp_free(tp_leader);
     return 0;
 }
 #else
@@ -16712,7 +16730,116 @@ static void test_multimodal_prefill_resume_frontier(void) {
     TEST_ASSERT(server_multimodal_resume_frontier(160, 159, 170, true) == 0);
     TEST_ASSERT(server_multimodal_resume_frontier(160, 160, 159, true) == 0);
     TEST_ASSERT(server_multimodal_resume_frontier(160, 160, 170, false) == 0);
+static void test_tensor_parallel_option_parsing(void) {
+    /* The server adopts the distributed --role/--listen/--coordinator
+     * addresses for a 50/50 tensor-parallel pair, exactly like the ds4 CLI. */
+    char *leader_argv[] = {
+        "ds4-server", "--metal",
+        "--tensor-parallel", "--role", "coordinator",
+        "--listen", "0.0.0.0", "9911",
+        "--transport", "rdma",
+    };
+    server_config leader = parse_options(10, leader_argv);
+    TEST_ASSERT(leader.engine.tp.role == DS4_TP_LEADER);
+    TEST_ASSERT(leader.engine.tp.transport == DS4_TP_TRANSPORT_RDMA);
+    TEST_ASSERT(leader.engine.tp.listen_host);
+    TEST_ASSERT(strcmp(leader.engine.tp.listen_host, "0.0.0.0") == 0);
+    TEST_ASSERT(leader.engine.tp.listen_port == 9911);
+    TEST_ASSERT(leader.engine.distributed.role == DS4_DISTRIBUTED_NONE);
+
+    char *worker_argv[] = {
+        "ds4-server", "--metal",
+        "--tensor-parallel", "--role", "worker",
+        "--coordinator", "10.99.0.2", "9911",
+    };
+    server_config worker = parse_options(8, worker_argv);
+    TEST_ASSERT(worker.engine.tp.role == DS4_TP_WORKER);
+    TEST_ASSERT(worker.engine.tp.transport == DS4_TP_TRANSPORT_AUTO);
+    TEST_ASSERT(worker.engine.tp.leader_host);
+    TEST_ASSERT(strcmp(worker.engine.tp.leader_host, "10.99.0.2") == 0);
+    TEST_ASSERT(worker.engine.tp.leader_port == 9911);
+    TEST_ASSERT(worker.engine.distributed.role == DS4_DISTRIBUTED_NONE);
+
+    char *tcp_argv[] = {
+        "ds4-server", "--metal",
+        "--tensor-parallel", "--role", "worker",
+        "--coordinator", "10.99.0.2", "9911",
+        "--transport", "tcp",
+    };
+    server_config tcp = parse_options(10, tcp_argv);
+    TEST_ASSERT(tcp.engine.tp.role == DS4_TP_WORKER);
+    TEST_ASSERT(tcp.engine.tp.transport == DS4_TP_TRANSPORT_TCP);
+    TEST_ASSERT(tcp.engine.tp.leader_port == 9911);
 }
+
+static void test_tp_mesh_topology(void) {
+    /* Link math for a fully connected world-4 mesh: link i of node r
+     * connects to peer (r+i+1) % world. */
+    TEST_ASSERT(tp_link_peer(0, 0, 4) == 1);
+    TEST_ASSERT(tp_link_peer(0, 2, 4) == 3);
+    TEST_ASSERT(tp_link_peer(3, 2, 4) == 2);
+    TEST_ASSERT(tp_link_to(0, 2, 4) == 1);   /* node 0 link 1 -> node 2 */
+    TEST_ASSERT(tp_link_to(2, 0, 4) == 1);   /* node 2 link 1 -> node 0 */
+    TEST_ASSERT(tp_link_to(1, 3, 4) == 1);   /* node 1 link 1 -> node 3 */
+    TEST_ASSERT(tp_link_to(3, 1, 4) == 1);   /* node 3 link 1 -> node 1 */
+    TEST_ASSERT(tp_link_from(1, 0, 4) == 2); /* node 1 link 2 -> node 0 */
+    TEST_ASSERT(tp_link_from(2, 0, 4) == 1);
+    TEST_ASSERT(tp_link_from(3, 0, 4) == 0);
+    TEST_ASSERT(tp_link_from(2, 1, 4) == 2);
+
+    /* A world-4 slab is larger than the world-2 one (per-peer in regions
+     * plus the combined slot). */
+    const uint64_t s2 = ds4_tp_slab_bytes(43, 6144, 2);
+    const uint64_t s4 = ds4_tp_slab_bytes(43, 6144, 4);
+    TEST_ASSERT(s4 > s2);
+
+    const char *path = "/tmp/ds4_tp_mesh_test.txt";
+    FILE *fp = fopen(path, "w");
+    TEST_ASSERT(fp != NULL);
+    fprintf(fp, "# test mesh\nworld 4\n");
+    fprintf(fp, "node 0 10.99.0.2 9911 10.99.1.2 9911 10.99.2.2 9911\n");
+    fprintf(fp, "node 1 10.99.0.1 9911 10.99.3.1 9911 10.99.4.1 9911\n");
+    fprintf(fp, "node 2 10.99.0.1 9912 10.99.3.2 9911 10.99.5.1 9911\n");
+    fprintf(fp, "node 3 10.99.0.1 9913 10.99.4.1 9912 10.99.5.2 9911\n");
+    fclose(fp);
+
+    ds4_tp_topology topo;
+    char terr[256] = "";
+    TEST_ASSERT(ds4_tp_topology_load(path, &topo, terr, sizeof(terr)));
+    TEST_ASSERT(topo.world == 4);
+    TEST_ASSERT(topo.node[0].host[0] &&
+                !strcmp(topo.node[0].host[0], "10.99.0.2"));
+    TEST_ASSERT(topo.node[0].port[2] == 9911);
+    TEST_ASSERT(topo.node[3].host[0] &&
+                !strcmp(topo.node[3].host[0], "10.99.0.1"));
+    TEST_ASSERT(topo.node[3].port[2] == 9911);
+    ds4_tp_topology_free(&topo);
+
+    /* Mesh CLI parsing: --tp-topology replaces --listen/--coordinator and
+     * --tp-rank selects this node's worker rank. */
+    char *mesh_argv[] = {
+        "ds4-server", "--metal",
+        "--tensor-parallel", "--role", "worker",
+        "--tp-topology", (char *)path,
+        "--tp-rank", "2",
+    };
+    server_config mesh = parse_options(9, mesh_argv);
+    TEST_ASSERT(mesh.engine.tp.role == DS4_TP_WORKER);
+    TEST_ASSERT(mesh.engine.tp.topology_path);
+    TEST_ASSERT(strcmp(mesh.engine.tp.topology_path, path) == 0);
+    TEST_ASSERT(mesh.engine.tp.rank == 2);
+    TEST_ASSERT(mesh.engine.tp.world == 0); /* resolved at create time */
+    TEST_ASSERT(mesh.engine.distributed.role == DS4_DISTRIBUTED_NONE);
+
+    /* A topology missing a node must fail to parse. */
+    fp = fopen(path, "w");
+    TEST_ASSERT(fp != NULL);
+    fprintf(fp, "world 4\nnode 0 10.0.0.1 9000 10.0.0.2 9000 10.0.0.3 9000\n");
+    fclose(fp);
+    memset(&topo, 0, sizeof(topo));
+    TEST_ASSERT(!ds4_tp_topology_load(path, &topo, terr, sizeof(terr)));
+
+    remove(path);}
 
 static void test_batched_live_continuation_slot_binding(void) {
     server s = {0};
@@ -22929,7 +23056,8 @@ static void ds4_server_unit_tests_run(void) {
     test_batched_prefill_round_robin();
     test_mixed_prefill_quantum_option();
     test_multimodal_prefill_resume_frontier();
-    test_batched_live_continuation_slot_binding();
+    test_tensor_parallel_option_parsing();
+    test_tp_mesh_topology();    test_batched_live_continuation_slot_binding();
     test_live_continuation_contract();
     test_slot_probe_and_routing_scores();
     test_slot_probe_live_state_tiers();

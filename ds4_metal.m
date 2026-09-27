@@ -21,8 +21,9 @@
 #include <mach/mach.h>
 #include <mach-o/dyld.h>
 #include <objc/runtime.h>
-
+#include <dlfcn.h>
 #include "ds4.h"
+#include "ds4_tp.h"
 #include "ds4_gpu.h"
 #include "ds4_image.h"
 
@@ -412,6 +413,9 @@ static id<MTLComputePipelineState> g_dsv4_head_rms_norm_rope_tail_pipeline;
 static bool g_use_dsv4_head_rms_norm_rope_tail_pipeline;
 static id<MTLComputePipelineState> g_hc_split_sinkhorn_pipeline;
 static id<MTLComputePipelineState> g_hc_split_weighted_sum_pipeline;
+static id<MTLComputePipelineState> g_hc_rms_partial_sums_pipeline;
+static id<MTLComputePipelineState> g_hc_rms_norm_matmul_partial_pipeline;
+static id<MTLComputePipelineState> g_hc_zero_outsides_slice_pipeline;
 static id<MTLComputePipelineState> g_hc_split_weighted_sum_norm_pipeline;
 static id<MTLComputePipelineState> g_dsv4_hc_producer_pre_norm_pipeline;
 static id<MTLComputePipelineState> g_dsv4_hc_expand_producer_pre_norm_pipeline;
@@ -5665,6 +5669,8 @@ typedef struct {
     int64_t n_embd;
     int64_t n_hc;
     int64_t n_tokens;
+    int64_t embd0;    /* TP mesh: this rank's first embedding index */
+    int64_t embd_n;   /* TP mesh: this rank's embedding count */
     uint64_t nb_x0;
     uint64_t nb_x1;
     uint64_t nb_x2;
@@ -5685,6 +5691,8 @@ typedef struct {
     int32_t sinkhorn_iters;
     int64_t n_rows;
     int64_t mix_hc;
+    int64_t embd0;    /* TP mesh: this rank's first embedding index */
+    int64_t embd_n;   /* TP mesh: this rank's embedding count */
     uint64_t nb_mix1;
     uint64_t nb_split1;
     uint64_t nb_x0;
@@ -5717,6 +5725,8 @@ typedef struct {
     int64_t n_embd;
     int64_t n_hc;
     int64_t n_tokens;
+    int64_t embd0;    /* TP mesh: this rank's first embedding index */
+    int64_t embd_n;   /* TP mesh: this rank's embedding count */
     uint64_t nb_block0;
     uint64_t nb_block1;
     uint64_t nb_add0;
@@ -6470,6 +6480,8 @@ typedef struct {
     uint32_t use_token_buffer;
     uint32_t token;
     uint32_t hash_rows;
+    int32_t  first_expert;   /* TP shard: owned expert range */
+    int32_t  n_bind_expert;
 } ds4_gpu_dsv4_router_select_one_args;
 
 typedef struct {
@@ -8659,6 +8671,54 @@ int ds4_gpu_init(void) {
             return 0;
         }
 
+        fn = [library newFunctionWithName:@"kernel_dsv4_hc_rms_partial_sums"];
+        if (!fn) {
+            fprintf(stderr, "ds4: Metal kernel_dsv4_hc_rms_partial_sums function not found\n");
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+        g_hc_rms_partial_sums_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        if (!g_hc_rms_partial_sums_pipeline) {
+            fprintf(stderr, "ds4: Metal kernel_dsv4_hc_rms_partial_sums pipeline failed: %s\n",
+                    [[error localizedDescription] UTF8String]);
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+
+        fn = [library newFunctionWithName:@"kernel_dsv4_hc_rms_norm_matmul_partial"];
+        if (!fn) {
+            fprintf(stderr, "ds4: Metal kernel_dsv4_hc_rms_norm_matmul_partial function not found\n");
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+        g_hc_rms_norm_matmul_partial_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        if (!g_hc_rms_norm_matmul_partial_pipeline) {
+            fprintf(stderr, "ds4: Metal kernel_dsv4_hc_rms_norm_matmul_partial pipeline failed: %s\n",
+                    [[error localizedDescription] UTF8String]);
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+
+        fn = [library newFunctionWithName:@"kernel_dsv4_hc_zero_outsides_slice"];
+        if (!fn) {
+            fprintf(stderr, "ds4: Metal kernel_dsv4_hc_zero_outsides_slice function not found\n");
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+        g_hc_zero_outsides_slice_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        if (!g_hc_zero_outsides_slice_pipeline) {
+            fprintf(stderr, "ds4: Metal kernel_dsv4_hc_zero_outsides_slice pipeline failed: %s\n",
+                    [[error localizedDescription] UTF8String]);
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+
         fn = [library newFunctionWithName:@"kernel_dsv4_hc_weighted_sum"];
         if (!fn) {
             fprintf(stderr, "ds4: Metal kernel_dsv4_hc_weighted_sum function not found\n");
@@ -10230,28 +10290,46 @@ static uint64_t g_tp_batch_seq;
  * not bound; world 2 assigns each rank one contiguous expert range. */
 static int32_t g_tp_split_rank;
 static int32_t g_tp_split_world = 1;
+static int32_t g_tp_split_world_saved;  /* suspend/resume keeps the real world */
 static int32_t g_tp_session_batch_mode;
+
+/* TP mesh HC split helpers.  The n_embd slice is active only for world>2
+ * (world<=2 keeps the full-range defaults so the kernels stay bit-identical
+ * to the historical single-node shape).  Returns the rank's contiguous
+ * embedding slice for the HC state, which is strided across the n_hc
+ * channels in the [t][h][d] layout. */
+static void ds4_gpu_hc_slice(uint32_t n_embd, int64_t *embd0, int64_t *embd_n) {
+    const int32_t world = g_tp_split_world > 2 ? g_tp_split_world : 1;
+    if (world > 1) {
+        *embd_n = (int64_t)(n_embd / (uint32_t)world);
+        *embd0 = (int64_t)g_tp_split_rank * *embd_n;
+    } else {
+        *embd0 = 0;
+        *embd_n = (int64_t)n_embd;
+    }
+}
 
 static int ds4_gpu_tp_world_is_two(void) {
     return g_tp_split_world == 2;
 }
 
-/* Return the contiguous routed-expert range backed by this process. Rank 1
- * owns the high range and receives any odd-count remainder. */
+/* Return the contiguous routed-expert range backed by this process, matching
+ * the kernel formula (metal/moe.metal ds4_tp_owns_expert): first =
+ * rank*(total/world), last = (rank+1)==world ? total : first + total/world.
+ * World 1 means TP is not bound. */
 static void ds4_gpu_tp_expert_range(uint32_t n_total_expert,
                                     uint32_t *first_expert,
                                     uint32_t *n_expert) {
     *first_expert = 0;
     *n_expert = n_total_expert;
-    if (g_tp_split_world != 2) return;
+    if (g_tp_split_world <= 1) return;
 
-    const uint32_t low_experts = n_total_expert / 2u;
-    if (g_tp_split_rank == 1) {
-        *first_expert = low_experts;
-        *n_expert = n_total_expert - low_experts;
-    } else {
-        *n_expert = low_experts;
-    }
+    const uint32_t base = n_total_expert / (uint32_t)g_tp_split_world;
+    const uint32_t first = (uint32_t)g_tp_split_rank * base;
+    const uint32_t last = g_tp_split_rank + 1 == g_tp_split_world ?
+        n_total_expert : first + base;
+    *first_expert = first;
+    *n_expert = last - first;
 }
 
 /* Attention head split for GLM batch prefill: each rank computes a
@@ -10271,11 +10349,12 @@ static void ds4_gpu_tp_attn_head_range(uint32_t n_head,
                                        uint32_t *head_count) {
     *head_base = 0;
     *head_count = n_head;
-    if (!g_tp_attn_head_split || g_tp_split_world != 2) return;
-    const uint32_t half = n_head / 2u;
-    if (half == 0u || (half % group) != 0u || (n_head % 2u) != 0u) return;
-    *head_count = half;
-    *head_base = g_tp_split_rank == 1 ? half : 0u;
+    if (!g_tp_attn_head_split || g_tp_split_world <= 1) return;
+    const uint32_t base = n_head / (uint32_t)g_tp_split_world;
+    if (base == 0u || (base % group) != 0u || (n_head % (uint32_t)g_tp_split_world) != 0u)
+        return;
+    *head_count = base;
+    *head_base = (uint32_t)g_tp_split_rank * base;
 }
 /* Flag gates (DS4_TP_FLAG_GATES): the GPU publishes gate arrival by storing
  * the sequence number into a slab word instead of signaling the shared
@@ -10774,14 +10853,15 @@ static void *ds4_gpu_tp_service_thread(void *arg) {
     return NULL;
 }
 
-int ds4_gpu_tp_init(uint32_t rank,
+int ds4_gpu_tp_init(uint32_t rank, uint32_t world,
                     ds4_gpu_tensor *slab, uint64_t gpu_flags_off,
                     uint64_t out_off, uint64_t vec_bytes,
                     ds4_gpu_tp_exchange_fn fn, void *ud) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
-    if (g_tp_thread_running || rank > 1) return 0;
+    if (g_tp_thread_running || world < 2 || world > DS4_TP_MAX_WORLD ||
+        rank >= world) return 0;
     g_tp_split_rank = (int32_t)rank;
-    g_tp_split_world = 2;
+    g_tp_split_world = (int32_t)world;
     g_tp_slab_buffer = slab ? ds4_gpu_tensor_buffer(slab) : nil;
     g_tp_slab_buffer_off = slab ? ds4_gpu_tensor_offset(slab) : 0;
     g_tp_gpu_flags_off = gpu_flags_off;
@@ -10911,7 +10991,13 @@ void ds4_gpu_tp_shutdown(void) {
 
 void ds4_gpu_tp_suspend_expert_sharding(int suspend) {
     if (!g_tp_thread_running) return;
-    g_tp_split_world = suspend ? 1 : 2;
+    if (suspend) {
+        g_tp_split_world_saved = g_tp_split_world;
+        g_tp_split_world = 1;
+    } else {
+        g_tp_split_world = g_tp_split_world_saved ? g_tp_split_world_saved : 2;
+        g_tp_split_world_saved = 0;
+    }
 }
 
 /* Fold request for producers that write the TP partial with a generic matvec
@@ -11229,7 +11315,7 @@ int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
 /* Prefill batch gate: the service thread exchanges big_bytes directly
  * between two CPU-visible bounce buffers. The shared-event signal orders
  * all preceding GPU stores before the service thread reads the payload. */
-static uint64_t ds4_gpu_tp_big_gate_kick(uint32_t layer, uint32_t rows,
+uint64_t ds4_gpu_tp_big_gate_kick(uint32_t layer, uint32_t rows,
                                          const ds4_gpu_tensor *out_t,
                                          ds4_gpu_tensor *in_t,
                                          uint64_t bytes) {
@@ -11266,7 +11352,7 @@ static uint64_t ds4_gpu_tp_big_gate_kick(uint32_t layer, uint32_t rows,
     return seq;
 }
 
-static int ds4_gpu_tp_big_gate_wait(uint64_t seq) {
+int ds4_gpu_tp_big_gate_wait(uint64_t seq) {
     if (!g_batch_cb || seq == 0) return 0;
     ds4_gpu_close_batch_encoder();
     [g_batch_cb encodeWaitForEvent:g_tp_batch_cpu_event value:seq];
@@ -11616,6 +11702,9 @@ void ds4_gpu_cleanup(void) {
         g_use_dsv4_head_rms_norm_rope_tail_pipeline = false;
         g_hc_split_sinkhorn_pipeline = nil;
         g_hc_split_weighted_sum_pipeline = nil;
+        g_hc_rms_partial_sums_pipeline = nil;
+        g_hc_rms_norm_matmul_partial_pipeline = nil;
+        g_hc_zero_outsides_slice_pipeline = nil;
         g_hc_split_weighted_sum_norm_pipeline = nil;
         g_dsv4_hc_producer_pre_norm_pipeline = nil;
         g_hc_weighted_sum_pipeline = nil;
@@ -12854,10 +12943,29 @@ static id<MTLBuffer> ds4_gpu_wrap_model_range(
         }
     }
 
+    uint64_t near_start = 0, near_end = 0;
+    for (uint32_t i = 0; i < g_model_view_count; i++) {
+        if (g_model_views[i].model_map != model_map ||
+            g_model_views[i].model_size != model_size) continue;
+        const uint64_t vs = g_model_views[i].model_offset;
+        const uint64_t ve = vs + g_model_views[i].bytes;
+        if (ve <= offset) {
+            if (vs >= near_start) { near_start = vs; near_end = ve; }
+        } else if (vs >= end) {
+            if (near_end == 0 || vs < near_start) { near_start = vs; near_end = ve; }
+        }
+    }
+    Dl_info di;
+    const char *caller = dladdr(__builtin_return_address(0), &di) && di.dli_sname
+        ? di.dli_sname : "?";
     fprintf(stderr,
-            "ds4: Metal model range %.2f..%.2f GiB is not covered by mapped model views\n",
+            "ds4: Metal model range %.2f..%.2f GiB (off=%llu len=%llu, model %llu bytes, views %u) "
+            "is not covered by mapped model views; nearest view %.2f..%.2f GiB caller=%s\n",
             ds4_gpu_gib(offset),
-            ds4_gpu_gib(end));
+            ds4_gpu_gib(end),
+            (unsigned long long)offset, (unsigned long long)len,
+            (unsigned long long)model_size, g_model_view_count,
+            ds4_gpu_gib(near_start), ds4_gpu_gib(near_end), caller);
     return nil;
 }
 
@@ -20383,7 +20491,6 @@ static int ds4_gpu_shared_gate_up_swiglu_q8_0_impl(
                                                          weight_bytes,
                                                          &up_inner);
         if (!gate_wbuf || !up_wbuf) return 0;
-
         ds4_gpu_q8_0_matvec_args args = ds4_gpu_make_q8_0_mv_args(in_dim, out_dim);
         ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_q8_0_mv_dispatch();
         args.nr0 = mv_dispatch.nr0;
@@ -26208,12 +26315,23 @@ int ds4_gpu_dsv41_attention_output_tp_batch(
         const void *model_map, uint64_t model_size,
         uint64_t out_a_offset, uint64_t out_b_offset,
         const ds4_gpu_tensor *heads, uint32_t n_tokens, uint32_t tp_rank) {
-    const uint64_t shard_bytes = UINT64_C(4) * 1024 * (4096 / 32 * 34);
-    if (tp_rank > 1 || out_a_offset > model_size ||
-        shard_bytes * 2u > model_size - out_a_offset) return 0;
+    /* N-rank output-projection split.  attn_output_a holds DS4_N_OUT_GROUP *
+     * 1024 Q8 rows and rank r owns groups [r*OUT_GROUP/world, +OUT_GROUP/world)
+     * of them -- exactly the range ds41_attention_low() stages into `low` -- so
+     * the world-2 formula generalises to the mesh by shrinking the per-rank
+     * shard instead of hard-coding two ranks. */
+    const uint32_t world = g_tp_split_world > 1 ? (uint32_t)g_tp_split_world : 2u;
+    const uint32_t out_group = 8u;                      /* DS4_N_OUT_GROUP */
+    if (out_group % world != 0u || tp_rank >= world) return 0;
+    const uint32_t groups = out_group / world;
+    const uint64_t row_a_bytes = (4096ull / 32ull) * 34ull; /* Q8_0 row, 4096 */
+    const uint64_t shard_bytes = (uint64_t)groups * 1024u * row_a_bytes;
+    if (out_a_offset > model_size ||
+        shard_bytes * (uint64_t)world > model_size - out_a_offset) return 0;
     return ds4_gpu_attention_output_q8_batch_impl(out, low, low, low,
-        model_map, model_size, out_a_offset + tp_rank * shard_bytes, out_b_offset,
-        4096, 1024, 4, 5120, heads, n_tokens, true, 8192, tp_rank * 4096u);
+        model_map, model_size, out_a_offset + (uint64_t)tp_rank * shard_bytes,
+        out_b_offset, 4096, 1024, groups, 5120, heads, n_tokens, true, 8192,
+        (uint64_t)tp_rank * groups * 1024u);
 }
 
 int ds4_gpu_attention_output_q4_K_batch_tensor(
@@ -34024,12 +34142,19 @@ static int ds4_gpu_encode_router_select(
         }
 
         const bool use_token_buffer = single_token == NULL;
+        uint32_t tp_first_expert = 0, tp_n_bind_expert = 0;
+        if (g_tp_split_world > 1 && !hash_mode) {
+            ds4_gpu_tp_expert_range(n_expert, &tp_first_expert,
+                                    &tp_n_bind_expert);
+        }
         ds4_gpu_dsv4_router_select_one_args args = {
             .has_bias = has_bias ? 1u : 0u,
             .hash_mode = hash_mode ? 1u : 0u,
             .use_token_buffer = use_token_buffer ? 1u : 0u,
             .token = single_token ? (uint32_t)*single_token : 0u,
             .hash_rows = hash_rows,
+            .first_expert = (int32_t)tp_first_expert,
+            .n_bind_expert = (int32_t)tp_n_bind_expert,
         };
 
         const float zero_f32 = 0.0f;
@@ -40741,6 +40866,13 @@ int ds4_gpu_routed_moe_one_tensor(
                 g_tp_split_rank == 0 && g_tp_split_world == 1 &&
                 add_in == NULL && (force_resident || !g_ssd_streaming_mode) &&
                 !write_clamped_moe && fuse_pair_swiglu && direct_down_sum;
+            uint32_t mx_owned_first = 0, mx_owned_n = 0;
+            ds4_gpu_tp_expert_range(n_total_expert, &mx_owned_first, &mx_owned_n);
+            /* N-rank generalisation: the old check hard-coded rank0=top half /
+             * rank1=bottom half at world 2.  The fused pair-SwiGLU + sum6
+             * kernels bind this rank's contiguous owned slice, and the
+             * transport folds the per-rank partials, so any world whose
+             * bind range lies inside that slice is valid. */
             const bool parallel_mxfp4_tp_route =
                 g_parallel_ffn_mode == 2 &&
                 gate_type == DS4_METAL_TENSOR_MXFP4 &&
@@ -40750,10 +40882,10 @@ int ds4_gpu_routed_moe_one_tensor(
                 out_dim == 4096 && gate_row_bytes == 2176 &&
                 gate_expert_bytes == 4456448 && down_row_bytes == 1088 &&
                 down_expert_bytes == 4456448 &&
-                ((g_tp_split_rank == 0 && first_expert == 0u) ||
-                 (g_tp_split_rank == 1 &&
-                  first_expert + n_bind_expert == n_total_expert)) &&
-                g_tp_split_world == 2 && add_in == NULL &&
+                g_tp_split_world >= 1 && n_bind_expert > 0 &&
+                first_expert >= mx_owned_first &&
+                first_expert + n_bind_expert <= mx_owned_first + mx_owned_n &&
+                add_in == NULL &&
                 (force_resident || !g_ssd_streaming_mode) &&
                 !write_clamped_moe && fuse_pair_swiglu && direct_down_sum;
             if (!parallel_iq2_route && !parallel_mxfp4_tp_route) {
@@ -41608,14 +41740,33 @@ int ds4_gpu_routed_moe_one_tensor(
                 }
 
                 for (uint32_t i = 0; i < n_expert; i++) {
-                    const uint64_t expert_id = (uint64_t)(uint32_t)selected_ids[i];
+                    const int32_t selected_expert = selected_ids[i];
+                    /* Skip experts this rank does not own: the kernels
+                     * filter them, and their model views are not mapped. */
+                    const int32_t owned_lo = (int32_t)first_expert;
+                    const int32_t owned_hi = (int32_t)(first_expert + n_bind_expert);
+                    if (selected_expert < owned_lo ||
+                        selected_expert >= owned_hi) {
+                        gate_slot_bufs[i] = nil;
+                        up_slot_bufs[i] = nil;
+                        down_slot_bufs[i] = nil;
+                        gate_slot_offsets[i] = 0;
+                        up_slot_offsets[i] = 0;
+                        down_slot_offsets[i] = 0;
+                        continue;
+                    }
+                    const uint64_t expert_id = (uint64_t)(uint32_t)selected_expert;
                     if (expert_id > UINT64_MAX / gate_expert_bytes ||
                         expert_id > UINT64_MAX / down_expert_bytes) {
                         fprintf(stderr, "ds4: Metal routed MoE selected expert offset overflow\n");
                         return 0;
                     }
-                    const uint64_t gate_rel = expert_id * gate_expert_bytes;
-                    const uint64_t down_rel = expert_id * down_expert_bytes;
+                    /* selected ids are global; gate_offset already includes
+                     * first_expert, so the relative slot is id - first. */
+                    const uint64_t gate_rel =
+                        (expert_id - (uint64_t)first_expert) * gate_expert_bytes;
+                    const uint64_t down_rel =
+                        (expert_id - (uint64_t)first_expert) * down_expert_bytes;
                     if (gate_rel > UINT64_MAX - gate_offset ||
                         gate_rel > UINT64_MAX - up_offset ||
                         down_rel > UINT64_MAX - down_offset) {
@@ -41913,7 +42064,17 @@ int ds4_gpu_routed_moe_one_tensor(
             gate_buf = ds4_gpu_wrap_model_range(model_map, model_size, gate_offset, gate_tensor_bytes, &gate_inner);
             up_buf = ds4_gpu_wrap_model_range(model_map, model_size, up_offset, gate_tensor_bytes, &up_inner);
             down_buf = ds4_gpu_wrap_model_range(model_map, model_size, down_offset, down_tensor_bytes, &down_inner);
-            if (!gate_buf || !up_buf || !down_buf) { if (getenv("DS4_GLM_TP_DEBUG")) fprintf(stderr, "ds4: routed_moe_one silent return at line %d\n", 33326); return 0; }
+            if (!gate_buf || !up_buf || !down_buf) {
+                fprintf(stderr,
+                        "ds4: routed_moe_one wrap fail rank=%d n_total=%u first=%u n_bind=%u "
+                        "gate_off=%llu up_off=%llu down_off=%llu gbytes=%llu dbytes=%llu\n",
+                        g_tp_split_rank, n_total_expert, first_expert, n_bind_expert,
+                        (unsigned long long)gate_offset, (unsigned long long)up_offset,
+                        (unsigned long long)down_offset,
+                        (unsigned long long)gate_tensor_bytes,
+                        (unsigned long long)down_tensor_bytes);
+                return 0;
+            }
         }
         if (q4_grouped_boundary || q4_exact_boundary || q4_table_boundary) {
             if (ds4_gpu_end_commands() == 0 || ds4_gpu_begin_commands() == 0) {
@@ -43446,7 +43607,7 @@ int ds4_gpu_routed_moe_batch_tensor(
             use_mm_id &&
             !(gate_type == DS4_METAL_TENSOR_IQ2_XXS &&
               (ds4_gpu_routed_mm_mpp_mask() & 3) == 3) &&
-            g_tp_split_world != 2 &&    /* pair-swiglu mm kernel lacks expert ownership */
+            g_tp_split_world <= 1 &&    /* pair-swiglu mm kernel lacks expert ownership */
             request_mid_f16 &&
             n_expert == 6 &&
             ((gate_type == DS4_METAL_TENSOR_IQ2_XXS &&
@@ -44588,6 +44749,8 @@ static int ds4_gpu_hc_weighted_sum_strided(
         uint64_t                weight_row_stride,
         uint32_t                n_embd,
         uint32_t                n_hc,
+        int64_t                 embd0,
+        int64_t                 embd_n,
         const char             *label) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!out || !residual_hc || !weights || n_embd == 0 || n_hc == 0 ||
@@ -44636,6 +44799,8 @@ static int ds4_gpu_hc_weighted_sum_strided(
             .n_embd = n_embd,
             .n_hc = n_hc,
             .n_tokens = (int64_t)n_tokens64,
+            .embd0 = embd0,
+            .embd_n = embd_n,
             .nb_x0 = sizeof(float),
             .nb_x1 = (uint64_t)n_embd * sizeof(float),
             .nb_x2 = (uint64_t)n_hc * n_embd * sizeof(float),
@@ -44680,7 +44845,33 @@ int ds4_gpu_hc_weighted_sum_tensor(
                                              (uint64_t)n_hc * sizeof(float),
                                              n_embd,
                                              n_hc,
+                                             0,
+                                             (int64_t)n_embd,
                                              "HC weighted sum");
+}
+
+/* TP mesh slice variant: computes this rank's n_embd slice of the collapsed
+ * row and zeroes the rest, so a sum-based all-reduce reconstructs the full
+ * row.  Used by the prefill output head in the split path; everything else
+ * keeps the full-range ds4_gpu_hc_weighted_sum_tensor. */
+int ds4_gpu_hc_weighted_sum_slice_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *weights,
+        uint32_t                n_embd,
+        uint32_t                n_hc,
+        int64_t                 embd0,
+        int64_t                 embd_n) {
+    return ds4_gpu_hc_weighted_sum_strided(out,
+                                             residual_hc,
+                                             weights,
+                                             0,
+                                             (uint64_t)n_hc * sizeof(float),
+                                             n_embd,
+                                             n_hc,
+                                             embd0,
+                                             embd_n,
+                                             "HC weighted sum slice");
 }
 
 int ds4_gpu_hc_weighted_sum_split_tensor(
@@ -44697,6 +44888,8 @@ int ds4_gpu_hc_weighted_sum_split_tensor(
                                              mix_hc * sizeof(float),
                                              n_embd,
                                              n_hc,
+                                             0,
+                                             (int64_t)n_embd,
                                              "HC weighted sum split");
 }
 
@@ -44714,7 +44907,9 @@ int ds4_gpu_hc_split_weighted_sum_tensor(
         uint32_t                n_embd,
         uint32_t                n_hc,
         uint32_t                sinkhorn_iters,
-        float                   eps) {
+        float                   eps,
+        int64_t                 embd0,
+        int64_t                 embd_n) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!out || !split || !mix || !residual_hc || !model_map ||
         n_embd == 0 || n_hc == 0) {
@@ -44788,7 +44983,8 @@ int ds4_gpu_hc_split_weighted_sum_tensor(
             .nb1 = out_row_bytes,
             .eps = eps,
         };
-
+        args.embd0 = embd0;
+        args.embd_n = embd_n;
         NSUInteger nth = g_hc_split_weighted_sum_pipeline.maxTotalThreadsPerThreadgroup;
         if (nth > 256u) nth = 256u;
         if (nth > (NSUInteger)n_embd) nth = (NSUInteger)n_embd;
@@ -44813,6 +45009,246 @@ int ds4_gpu_hc_split_weighted_sum_tensor(
         ds4_gpu_end_compute_encoder(cb, enc);
 
         if (!ds4_gpu_finish_command_buffer(cb, owned, "HC split/sum fused")) return 0;
+    }
+
+    return 1;
+}
+
+/* TP mesh partial RMS sums: one thread per slice element accumulates its
+ * squared HC value into the per-token slot with a float atomic (no threadgroup
+ * reduction, so the full-library miscompilation seen with the tree/simd-sum
+ * reductions cannot apply).  The caller all-reduces the partials to obtain
+ * the full-row sums for the HC pre projection. */
+int ds4_gpu_hc_rms_partial_sums_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        uint32_t                n_embd,
+        uint32_t                n_hc,
+        uint32_t                n_tokens) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!out || !x || n_embd == 0 || n_hc != 4 || n_tokens == 0) return 0;
+
+    @autoreleasepool {
+        id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
+        id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out);
+        const uint64_t x_bytes = (uint64_t)n_hc * n_embd * n_tokens * sizeof(float);
+        const uint64_t out_bytes = (uint64_t)n_tokens * sizeof(float);
+        if (!xbuf || !outbuf ||
+            ds4_gpu_tensor_bytes(x) < x_bytes ||
+            ds4_gpu_tensor_bytes(out) < out_bytes) {
+            fprintf(stderr, "ds4: Metal HC partial RMS received undersized activation buffers\n");
+            return 0;
+        }
+
+        int64_t embd0 = 0, embd_n = 0;
+        ds4_gpu_hc_slice(n_embd, &embd0, &embd_n);
+
+        typedef struct {
+            int64_t n_embd;
+            int64_t n_hc;
+            int64_t n_tokens;
+            int64_t embd0;
+            int64_t embd_n;
+            uint64_t nb_x0;
+            uint64_t nb_x1;
+            uint64_t nb_x2;
+            uint64_t nb_out0;
+        } hc_rms_partial_args_t;
+        hc_rms_partial_args_t args = {
+            .n_embd = (int64_t)n_embd,
+            .n_hc = (int64_t)n_hc,
+            .n_tokens = (int64_t)n_tokens,
+            .embd0 = embd0,
+            .embd_n = embd_n,
+            .nb_x0 = sizeof(float),
+            .nb_x1 = (uint64_t)n_embd * sizeof(float),
+            .nb_x2 = (uint64_t)n_hc * n_embd * sizeof(float),
+            .nb_out0 = sizeof(float),
+        };
+
+        const uint64_t n_chunks = (uint64_t)embd_n / 64u;
+        const uint64_t n_elem = n_chunks * n_hc * n_tokens;
+        const NSUInteger nth = MIN((NSUInteger)256, MAX((NSUInteger)1, (NSUInteger)n_elem));
+        const NSUInteger n_tg = ((NSUInteger)n_elem + nth - 1u) / nth;
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:g_hc_rms_partial_sums_pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:1];
+        [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:2];
+        [enc dispatchThreadgroups:MTLSizeMake(n_tg, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "HC partial RMS sums")) return 0;
+    }
+
+    return 1;
+}
+
+/* TP mesh HC pre projection partial: normalize this rank's n_embd slice with
+ * the all-reduced full-row RMS and compute its partial out_dim projection.
+ * The caller all-reduces the partials to form the full mix. */
+int ds4_gpu_hc_rms_norm_matmul_partial_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *rms_sums,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint32_t                n_embd,
+        uint32_t                n_hc,
+        uint32_t                n_tokens,
+        uint32_t                out_dim,
+        float                   eps) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!out || !x || !rms_sums || !model_map ||
+        n_embd == 0 || n_hc != 4 || n_tokens == 0 || out_dim == 0) {
+        return 0;
+    }
+
+    @autoreleasepool {
+        id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
+        id<MTLBuffer> rmsbuf = ds4_gpu_tensor_buffer(rms_sums);
+        id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out);
+        const uint64_t x_bytes = (uint64_t)n_hc * n_embd * n_tokens * sizeof(float);
+        const uint64_t rms_bytes = (uint64_t)n_tokens * sizeof(float);
+        const uint64_t out_bytes = (uint64_t)n_tokens * out_dim * sizeof(float);
+        if (!xbuf || !rmsbuf || !outbuf ||
+            ds4_gpu_tensor_bytes(x) < x_bytes ||
+            ds4_gpu_tensor_bytes(rms_sums) < rms_bytes ||
+            ds4_gpu_tensor_bytes(out) < out_bytes) {
+            fprintf(stderr, "ds4: Metal HC partial matmul received undersized activation buffers\n");
+            return 0;
+        }
+
+        const uint64_t row_bytes = (uint64_t)n_hc * n_embd * sizeof(uint16_t);
+        const uint64_t weight_bytes = row_bytes * out_dim;
+        if (weight_offset > model_size || weight_bytes > model_size - weight_offset) {
+            fprintf(stderr, "ds4: Metal HC partial matmul weight range is outside the mapped model\n");
+            return 0;
+        }
+        uint64_t weight_inner = 0;
+        id<MTLBuffer> weightbuf = ds4_gpu_wrap_model_range(
+            model_map, model_size, weight_offset, weight_bytes, &weight_inner);
+        if (!weightbuf) return 0;
+
+        int64_t embd0 = 0, embd_n = 0;
+        ds4_gpu_hc_slice(n_embd, &embd0, &embd_n);
+
+        typedef struct {
+            int64_t n_embd;
+            int64_t n_hc;
+            int64_t n_tokens;
+            int64_t embd0;
+            int64_t embd_n;
+            int64_t out_dim;
+            uint64_t nb_x0;
+            uint64_t nb_x1;
+            uint64_t nb_x2;
+            uint64_t nb_w0;
+            uint64_t nb_out0;
+            uint64_t nb_out1;
+            float eps;
+        } hc_rms_norm_matmul_partial_args_t;
+        hc_rms_norm_matmul_partial_args_t args = {
+            .n_embd = (int64_t)n_embd,
+            .n_hc = (int64_t)n_hc,
+            .n_tokens = (int64_t)n_tokens,
+            .embd0 = embd0,
+            .embd_n = embd_n,
+            .out_dim = (int64_t)out_dim,
+            .nb_x0 = sizeof(float),
+            .nb_x1 = (uint64_t)n_embd * sizeof(float),
+            .nb_x2 = (uint64_t)n_hc * n_embd * sizeof(float),
+            .nb_w0 = (uint64_t)n_hc * n_embd * sizeof(uint16_t),
+            .nb_out0 = sizeof(float),
+            .nb_out1 = (uint64_t)out_dim * sizeof(float),
+            .eps = eps,
+        };
+
+        const NSUInteger nth = MIN((NSUInteger)256, MAX((NSUInteger)1, (NSUInteger)out_dim));
+        const uint64_t n_elem = (uint64_t)n_tokens * out_dim;
+        const NSUInteger n_tg = ((NSUInteger)n_elem + nth - 1u) / nth;
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:g_hc_rms_norm_matmul_partial_pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:1];
+        [enc setBuffer:rmsbuf offset:ds4_gpu_tensor_offset(rms_sums) atIndex:2];
+        [enc setBuffer:weightbuf offset:(NSUInteger)weight_inner atIndex:3];
+        [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:4];
+        [enc dispatchThreadgroups:MTLSizeMake(n_tg, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "HC partial RMS matmul")) return 0;
+    }
+
+    return 1;
+}
+
+/* TP mesh HC split helper: zero the HC channels' embedding columns outside
+ * this rank's n_embd slice on a single token row, so a sum-based all-reduce
+ * reconstructs the full row for the output head. */
+int ds4_gpu_hc_zero_outsides_slice_tensor(
+        ds4_gpu_tensor       *x,
+        uint32_t                n_embd,
+        uint32_t                n_hc,
+        int64_t                 embd0,
+        int64_t                 embd_n) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!x || n_embd == 0 || n_hc != 4 || embd_n <= 0) return 0;
+
+    @autoreleasepool {
+        id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
+        const uint64_t x_bytes = (uint64_t)n_hc * n_embd * sizeof(float);
+        if (!xbuf || ds4_gpu_tensor_bytes(x) < x_bytes) {
+            fprintf(stderr, "ds4: Metal HC zero-outside-slice received undersized buffer\n");
+            return 0;
+        }
+
+        typedef struct {
+            int64_t n_embd;
+            int64_t n_hc;
+            int64_t embd0;
+            int64_t embd_n;
+            uint64_t nb_x0;
+            uint64_t nb_x1;
+            uint64_t nb_x2;
+        } hc_zero_slice_args_t;
+        hc_zero_slice_args_t args = {
+            .n_embd = (int64_t)n_embd,
+            .n_hc = (int64_t)n_hc,
+            .embd0 = embd0,
+            .embd_n = embd_n,
+            .nb_x0 = sizeof(float),
+            .nb_x1 = (uint64_t)n_embd * sizeof(float),
+            .nb_x2 = (uint64_t)n_hc * n_embd * sizeof(float),
+        };
+
+        const uint64_t n_elem = (uint64_t)n_hc * n_embd;
+        const NSUInteger nth = MIN((NSUInteger)256, MAX((NSUInteger)1, (NSUInteger)n_elem));
+        const NSUInteger n_tg = ((NSUInteger)n_elem + nth - 1u) / nth;
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:g_hc_zero_outsides_slice_pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:1];
+        [enc dispatchThreadgroups:MTLSizeMake(n_tg, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "HC zero outside slice")) return 0;
     }
 
     return 1;
@@ -45702,6 +46138,8 @@ int ds4_gpu_hc_expand_tensor(
             .n_embd = n_embd,
             .n_hc = n_hc,
             .n_tokens = (int64_t)n_tokens64,
+            .embd0 = 0,
+            .embd_n = (int64_t)n_embd,
             .nb_block0 = sizeof(float),
             .nb_block1 = (uint64_t)n_embd * sizeof(float),
             .nb_add0 = sizeof(float),
@@ -45819,6 +46257,8 @@ int ds4_gpu_hc_expand_add_tensor(
             .n_embd = n_embd,
             .n_hc = n_hc,
             .n_tokens = (int64_t)n_tokens64,
+            .embd0 = 0,
+            .embd_n = (int64_t)n_embd,
             .nb_block0 = sizeof(float),
             .nb_block1 = (uint64_t)n_embd * sizeof(float),
             .nb_add0 = sizeof(float),
@@ -45875,16 +46315,11 @@ int ds4_gpu_hc_expand_split_tensor(
         const ds4_gpu_tensor *residual_hc,
         const ds4_gpu_tensor *split,
         uint32_t                n_embd,
-        uint32_t                n_hc) {
-    if (!g_initialized && !ds4_gpu_init()) {
-        fprintf(stderr, "ds4: Metal HC expand split could not initialize the backend\n");
-        return 0;
-    }
-    if (!out_hc || !block_out || !residual_hc || !split || n_embd == 0 || n_hc == 0) {
-        fprintf(stderr, "ds4: Metal HC expand split received invalid arguments\n");
-        return 0;
-    }
-
+uint32_t                n_hc,
+        int64_t                 embd0,
+        int64_t                 embd_n) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!out_hc || !block_out || !residual_hc || !split || n_embd == 0 || n_hc == 0) return 0;
     @autoreleasepool {
         id<MTLBuffer> blockbuf = ds4_gpu_tensor_buffer(block_out);
         id<MTLBuffer> resbuf = ds4_gpu_tensor_buffer(residual_hc);
@@ -45931,6 +46366,8 @@ int ds4_gpu_hc_expand_split_tensor(
             .n_embd = n_embd,
             .n_hc = n_hc,
             .n_tokens = (int64_t)n_tokens64,
+.embd0 = embd0,
+.embd_n = embd_n,
             .nb_block0 = sizeof(float),
             .nb_block1 = (uint64_t)n_embd * sizeof(float),
             .nb_add0 = sizeof(float),
@@ -46006,7 +46443,9 @@ int ds4_gpu_hc_expand_add_split_tensor(
         const ds4_gpu_tensor *residual_hc,
         const ds4_gpu_tensor *split,
         uint32_t                n_embd,
-        uint32_t                n_hc) {
+        uint32_t                n_hc,
+        int64_t                 embd0,
+        int64_t                 embd_n) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!out_hc || !block_out || !block_add || !residual_hc || !split || n_embd == 0 || n_hc == 0) return 0;
 
@@ -46058,6 +46497,8 @@ int ds4_gpu_hc_expand_add_split_tensor(
             .n_embd = n_embd,
             .n_hc = n_hc,
             .n_tokens = (int64_t)n_tokens64,
+.embd0 = embd0,
+.embd_n = embd_n,
             .nb_block0 = sizeof(float),
             .nb_block1 = (uint64_t)n_embd * sizeof(float),
             .nb_add0 = sizeof(float),

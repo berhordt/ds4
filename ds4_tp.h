@@ -32,6 +32,8 @@ enum {
     DS4_TP_GATES_PER_LAYER = 2,
     /* Max rows in a verify-block batch gate (speculative blocks are <=5). */
     DS4_TP_BATCH_MAX_ROWS = 8,
+    /* Hard cap on the mesh world size (per-link arrays are fixed-size). */
+    DS4_TP_MAX_WORLD = 8,
 };
 
 /* Engine identity exchanged in the hello so a mismatched pair aborts before
@@ -102,28 +104,100 @@ int ds4_tp_create(
 void ds4_tp_free(ds4_tp *tp);
 
 int ds4_tp_rank(const ds4_tp *tp);
+int ds4_tp_world(const ds4_tp *tp);
 bool ds4_tp_is_rdma(const ds4_tp *tp);
 uint32_t ds4_tp_peer_ctx(const ds4_tp *tp);
 bool ds4_tp_failed(const ds4_tp *tp);
 void ds4_tp_mark_failed(ds4_tp *tp);
 
+/* Vocab-split slice for one rank.  Handles vocab % world != 0 by giving
+ * the first `rem` ranks one extra token each (offsets are cumulative). */
+static inline void ds4_tp_vocab_slice(uint32_t vocab, uint32_t world,
+                                      uint32_t rank, uint32_t *off,
+                                      uint32_t *count) {
+    const uint32_t base = vocab / world;
+    const uint32_t rem = vocab % world;
+    *count = base + (rank < rem ? 1u : 0u);
+    *off = rank * base + (rank < rem ? rank : rem);
+}
+
+/* Mesh topology descriptor.
+ *
+ * A small file describes the fully connected mesh: `world N`, then one
+ * `node R H0 P0 H1 P1 H2 P2` line per node listing the node's LOCAL
+ * addresses on its W-1 links.  Link i of node R connects to peer
+ * (R+i+1) % world; the port on a node's link is the port that node LISTENS
+ * on for that link (control for rank 0, data for the lower-rank side of
+ * each pair).  Each node reads the same file and selects its own rank.
+ *
+ * Link math helpers (all modulo world):
+ *   tp_link_peer(r, i)  = (r+i+1) % world          peer on link i
+ *   tp_link_to(r, m)    = (m-r-1)  % world          link index of r to m
+ *   tp_link_from(m, r)  = (r-m-1)  % world          link index of m to r
+ */
+#define DS4_TP_LINKS(world) ((world) - 1)
+
+/* One directed data link on a node: which peer it connects to, plus this
+ * node's local listen address for that link.  A fully-connected mesh has
+ * world-1 links per node; a ring/partial mesh has fewer (the ring needs
+ * exactly the next and prev peers). */
+typedef struct {
+    int peer;                       /* peer rank this link connects to */
+    char *host;                     /* local listen host for this link */
+    int port;                       /* local listen port for this link */
+} ds4_tp_topology_link;
+
+typedef struct {
+    int world;
+    struct {
+        /* Control-plane listener (used by rank 0; workers dial it).  On a
+         * ring the data links only reach two neighbours, so control rides
+         * the shared LAN.  Rank 0 listens on control_base_port + m for
+         * worker m (m=1..world-1); worker m dials base_port + m. */
+        char *control_host;
+        int control_port;
+        int n_links;
+        ds4_tp_topology_link link[DS4_TP_MAX_WORLD];
+    } node[DS4_TP_MAX_WORLD];
+} ds4_tp_topology;
+
+int ds4_tp_topology_load(const char *path, ds4_tp_topology *topo,
+                         char *err, size_t errlen);
+void ds4_tp_topology_free(ds4_tp_topology *topo);
+static inline int tp_link_peer(int r, int i, int world) {
+    return (r + i + 1) % world;
+}
+static inline int tp_link_to(int r, int m, int world) {
+    return ((m - r - 1) % world + world) % world;
+}
+static inline int tp_link_from(int m, int r, int world) {
+    return ((r - m - 1) % world + world) % world;
+}
+
 /* Gate slab.  The engine allocates one shared GPU-visible block and hands
  * its base VA here; ds4_tp registers it with the NIC (RDMA) and exchanges
- * remote keys.  Layout, all offsets from base, S = n_layer * 2 slots:
+ * remote keys.  Layout, all offsets from base, S = n_layer * 2 slots,
+ * P = world-1 (per-peer in vectors):
  *
- *   out vectors   S * vec_bytes   written by local GPU kernels
- *   in  vectors   S * vec_bytes   RDMA/TCP-written with the peer partials
- *   in  seq flags S * 8           written strictly after each in vector
- *   token slot    16              {seq u64, token i32, pad} leader->worker
- *   (gpu flags, then batch out/in: n_layer * BATCH_MAX_ROWS * vec_bytes
- *    each, row partials for the speculative verify-block gates)
+ *   out vectors       S * vec_bytes            written by local GPU kernels
+ *   in  vectors       S * P * vec_bytes        RDMA/TCP-written peer partials,
+ *                                              labeled by peer rank
+ *   combined vectors  S * vec_bytes            canonical rank-order sum written
+ *                                              by the CPU exchange for world>2
+ *   in  seq flags     S * P * 8
+ *   token slot        16                       {seq u64, token i32, pad}
+ *   (gpu flags, then batch out / batch in(P) / batch combined: each
+ *    n_layer * BATCH_MAX_ROWS * vec_bytes, row partials for the speculative
+ *    verify-block gates)
  *
  * vec_bytes = n_embd * 4 (f32 partials, never quantized on the wire). */
-uint64_t ds4_tp_slab_bytes(uint32_t n_layer, uint32_t n_embd);
+uint64_t ds4_tp_slab_bytes(uint32_t n_layer, uint32_t n_embd, uint32_t world);
 uint64_t ds4_tp_slab_out_offset(const ds4_tp *tp, uint32_t layer, uint32_t gate);
 uint64_t ds4_tp_slab_in_offset(const ds4_tp *tp, uint32_t layer, uint32_t gate);
+uint64_t ds4_tp_slab_combined_offset(const ds4_tp *tp, uint32_t layer, uint32_t gate);
 uint64_t ds4_tp_slab_batch_out_offset(const ds4_tp *tp, uint32_t layer);
 uint64_t ds4_tp_slab_batch_in_offset(const ds4_tp *tp, uint32_t layer);
+uint64_t ds4_tp_slab_batch_combined_offset(const ds4_tp *tp, uint32_t layer);
 uint64_t ds4_tp_slab_gpu_flags_offset(const ds4_tp *tp);
 int ds4_tp_attach_slab(ds4_tp *tp, void *base, char *err, size_t errlen);
 /* Stop the data plane before freeing its registered buffers. No more gates
@@ -210,9 +284,14 @@ typedef enum {
     DS4_TP_FRAME_EVAL_BATCH = 15,
     DS4_TP_FRAME_MIXED_BATCH = 16,
     DS4_TP_FRAME_COMMAND_ACK = 17,
-    DS4_TP_FRAME_SYNC_MULTIMODAL = 18,
-    DS4_TP_FRAME_RDMA_WARM = 19,
-    DS4_TP_FRAME_RDMA_POSTED = 20,
+    /* Mesh (N-node) control-plane frames.  The leader broadcasts the mesh-wide
+     * RDMA decision to workers after the hello barrier (u32: 1 = RDMA, 0 = TCP
+     * fallback); ring mode relays a hello through its neighbours.  These replace
+     * the old two-rank RDMA_WARM/RDMA_POSTED handshake. */
+    DS4_TP_FRAME_RDMA_MODE = 18,
+    DS4_TP_FRAME_HELLO = 19,
+    /* V4.1 / GLM features carried over from the two-rank transport. */
+    DS4_TP_FRAME_SYNC_MULTIMODAL = 20,
     DS4_TP_FRAME_GLM_MTP = 21,
     DS4_TP_FRAME_SYNC_CHECKPOINT = 22,
 } ds4_tp_frame_type;
@@ -242,8 +321,13 @@ void ds4_tp_command_free(ds4_tp_command *command);
  * and compare.  Returns 0 on transport failure, -1 on hash mismatch. */
 int ds4_tp_hash_check(ds4_tp *tp, uint64_t seq, uint64_t hash, char *err, size_t errlen);
 
-/* Vocab-split output head: the worker ships its logits half to the leader
- * after every eval (and after a sync) on the control socket. */
+/* Vocab-split output head: every worker ships its vocab chunk (vocab/world)
+ * to the leader after each eval and sync; the leader folds the chunks into
+ * its full logits buffer at dst + worker_rank * count.  count is the
+ * per-worker chunk size. */
+int ds4_tp_send_logits(ds4_tp *tp, const float *chunk, uint32_t vocab);
+int ds4_tp_recv_logits(ds4_tp *tp, float *dst, uint32_t vocab);
+/* DSpark verify replay (two-rank): one full/partial logits half per frame. */
 int ds4_tp_send_logits_half(ds4_tp *tp, const float *half, uint32_t count);
 int ds4_tp_recv_logits_half(ds4_tp *tp, float *half, uint32_t count);
 

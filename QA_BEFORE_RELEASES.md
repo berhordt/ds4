@@ -448,7 +448,20 @@ substitute for this matrix.
   The released GLM 5.2 IQ2_XXS file keeps `indexer.proj.weight` in FP32. Its
   loader and Metal graph must accept that established layout; GLM 5.3 may use
   its quantized or BF16 indexer projection instead.
-- With explicit permission for the current QA pass, run one resident GLM Q2
+  diagnostic. Use a GGUF whose routed-expert type has ownership-aware GLM TP
+  kernels. Also test a Q4-routed GLM file as a negative gate: until Q4 ownership
+  kernels are implemented, both ranks must reject it clearly before evaluation
+  rather than loading a partial split or hanging.
+- Run the same TP pair with `ds4-server` on the head node (`--role coordinator`,
+  `--listen`) and the ds4 CLI as the worker. Exercise OpenAI chat, Responses, and
+  Anthropic requests over HTTP, including SSE, and confirm a clean server
+  shutdown sends STOP so the worker exits. `--kv-disk-dir` must be rejected in
+  this mode.
+- Run a four-node fully connected mesh (ds4-server rank 0, three ds4 workers)
+  with `--tp-topology mesh.txt --tp-rank N` over both TCP and RDMA. Verify the
+  per-link bring-up, the all-reduce decode gates, vocab-chunk logits merge, and
+  DSpark verify fan-out produce byte-identical output across ranks. A GLM GGUF
+  must be rejected for world > 2.- With explicit permission for the current QA pass, run one resident GLM Q2
   prompt, a long-context prompt, integrated GLM MTP, and concurrent server
   requests on the eight-GPU CUDA host. Use ordinary eight-GPU layer placement
   for GLM; do not pass the Flash-specific

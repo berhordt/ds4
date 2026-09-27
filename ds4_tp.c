@@ -1,11 +1,15 @@
-/* Tensor-parallel transport and lockstep protocol. See ds4_tp.h.
+/* Tensor-parallel transport and lockstep protocol.  See ds4_tp.h and
+ * misc/METAL_TENSOR_PARALLELISM.md for the design.
  *
- * Wire notes: supported ranks are little-endian; the hello magic
+ * Wire notes: both ranks are identical Apple Silicon machines by
+ * definition, so the wire format is host little-endian; the hello magic
  * doubles as a byte-order check.  The control socket is a plain blocking
- * TCP stream carrying framed commands. Gate traffic uses two-sided RDMA
- * send/recv (Thunderbolt UC on Metal, RoCE RC on Linux) or a separate
- * full-duplex TCP socket. */
+ * TCP stream carrying framed commands.  Gate traffic goes over RDMA
+ * (Thunderbolt UC queue pair, two-sided send/recv — see the driver quirks
+ * note at ds4_tp_rdma) or over a dedicated full-duplex TCP socket at 16KB
+ * per direction as the fallback. */
 
+#include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -15,21 +19,26 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <pthread.h>
-#include <poll.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
-#include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
+#include <ifaddrs.h>
+#include <net/if.h>
+#include <arpa/inet.h>
 
 #include "ds4_tp.h"
-#include "ds4_gpu.h"
 
-#if (defined(__APPLE__) || defined(__linux__)) && defined(__has_include)
+/* Canonical rank-order fold for the ring all-reduce (defined later). */
+static void tp_ring_fold(ds4_tp *tp, const float *out,
+                         const float *regions, uint64_t region_stride,
+                         uint64_t words, float *dst);
+
+#if defined(__APPLE__) && defined(__has_include)
 #if __has_include(<infiniband/verbs.h>)
 #include <infiniband/verbs.h>
 #include <dlfcn.h>
@@ -39,14 +48,11 @@
 
 #define DS4_TP_MAGIC UINT32_C(0x44533454) /* "DS4T" */
 #define DS4_TP_BATCH_MAGIC UINT32_C(0x44533442) /* "DS4B" */
-/* V4.1 CUDA workers now return half-logit frames after successful work. */
-#define DS4_TP_PROTOCOL_VERSION 14u
+#define DS4_TP_PROTOCOL_VERSION 8u  /* mesh: hello world/rank, RDMA_MODE */
 
+/* Default gate timeout is generous: the first gate after a sync waits for
+ * the peer's whole (possibly cold page cache) prefill. */
 #define DS4_TP_DEFAULT_TIMEOUT_SEC 300
-/* Once both ranks enter a Metal gate, a live exchange normally completes in
- * microseconds. Fail well before Metal's command-buffer watchdog if the peer
- * stalls while keeping its sockets open. */
-#define DS4_TP_DEFAULT_GATE_TIMEOUT_MS 750
 
 typedef struct {
     uint32_t magic;
@@ -69,8 +75,9 @@ typedef struct {
     uint32_t gate_slot_start;
     uint32_t gate_slot_step;
     uint32_t gates_per_token;
-    uint32_t pad;
-    uint64_t gate_slot_mask[DS4_TP_GATE_MASK_WORDS];
+    uint32_t world;             /* mesh world size (2 for the classic pair) */
+    uint32_t rank;              /* this node's rank in the mesh */
+    uint32_t big_tcp;           /* 1: this rank wants the TCP big-gate override */
 } ds4_tp_hello_fixed;
 
 typedef struct {
@@ -82,7 +89,6 @@ typedef struct {
     uint16_t lid;
     uint8_t gid[16];
     uint8_t link_layer;
-    uint8_t reliable;
 } ds4_tp_rdma_info;
 
 /* TCP gate frames carry a small header so a desynchronized pair fails loudly
@@ -109,10 +115,6 @@ typedef struct {
     int (*query_device)(struct ibv_context *, struct ibv_device_attr *);
     int (*query_port)(struct ibv_context *, uint8_t, struct ibv_port_attr *);
     int (*query_gid)(struct ibv_context *, uint8_t, int, union ibv_gid *);
-#ifdef __linux__
-    int (*query_gid_ex)(struct ibv_context *, uint32_t, uint32_t,
-                        struct ibv_gid_entry *, uint32_t, size_t);
-#endif
     struct ibv_pd *(*alloc_pd)(struct ibv_context *);
     int (*dealloc_pd)(struct ibv_pd *);
     struct ibv_mr *(*reg_mr)(struct ibv_pd *, void *, size_t, int);
@@ -122,7 +124,6 @@ typedef struct {
     struct ibv_qp *(*create_qp)(struct ibv_pd *, struct ibv_qp_init_attr *);
     int (*destroy_qp)(struct ibv_qp *);
     int (*modify_qp)(struct ibv_qp *, struct ibv_qp_attr *, int);
-    int (*query_qp)(struct ibv_qp *, struct ibv_qp_attr *, int, struct ibv_qp_init_attr *);
 } ds4_tp_verbs_api;
 
 /* AppleThunderboltRDMA quirks (validated with scratchpad probes,
@@ -132,19 +133,25 @@ typedef struct {
  * RTR requires GRH addressing with the IPv4-mapped GID that appears only
  * once the Thunderbolt member interface has an IPv4 address of its own.
  * UC delivery is in-order and the gate sequence is globally deterministic
- * (a model-fixed number of gates per token). After any initial bulk prefill,
- * decode keeps a receive window posted by sequence number: recv for seq s
- * lands in the slab in-slot (s-1) % slots and its completion is the arrival
- * signal. The provider also reports CQEs for unsignaled sends: request and
- * account for every send, rather than treating one CQE as a completed chain. */
+ * (86 gates per token, fixed order). After any initial bulk prefill, decode
+ * keeps a receive window posted by sequence number: recv for seq s lands in
+ * the slab in-slot (s-1) % slots and its completion IS the arrival signal. */
 #define DS4_TP_RDMA_MAX_MSG 16384
 #define DS4_TP_RDMA_RECV_WINDOW 16
-#define DS4_TP_RDMA_BULK_SLOTS 64
+#define DS4_TP_RDMA_BULK_SLOTS 128
+/* Max rounds in flight per link.  The AppleThunderboltRDMA UC queues report
+ * a large cap but reject posts past ~128 send / ~192 recv WQEs, so the
+ * pipelined wavefront cannot hold multiple BULK_SLOTS rounds per link.
+ * MAX_INFLIGHT 1 keeps the exchange sequential, which is optimal: the TP
+ * service thread serializes the per-round ready/done handshakes, so the
+ * prefill cost is the handshake count, not the wire round-trips.  Bigger
+ * rounds (2 MiB) cut the count from the old 1120 pairs/gate (1 MiB rounds)
+ * to 560 -- a real prefill lever (P5-style). */
+#define DS4_TP_RDMA_BULK_MAX_INFLIGHT 1
 #define DS4_TP_RDMA_BULK_WR_TAG (UINT64_C(1) << 63)
-#define DS4_TP_RDMA_BLOCK_WR_TAG (UINT64_C(1) << 61)
+#define DS4_TP_BIG_CHUNK (2ull * 1024ull * 1024ull)
 
 typedef struct {
-    ds4_tp_verbs_api api;
     struct ibv_context *ctx;
     struct ibv_pd *pd;
     struct ibv_cq *cq;
@@ -155,36 +162,46 @@ typedef struct {
     int gid_index;
     uint32_t max_inline;
     ds4_tp_rdma_info peer;
-    uint32_t send_outstanding;  /* individual sends not yet reaped */
+    uint32_t send_outstanding;  /* signaled sends not yet reaped */
     uint64_t recv_done;         /* highest gate seq whose recv completed */
     uint64_t last_gate_seq;     /* last real decode receive consumed */
     bool recv_window_active;    /* decode recvs are queued ahead */
-    int warm_failed;            /* last warm-up round failed (dead direction) */
-    uint32_t setup_attempt;     /* queue pair recreations so far */
     pthread_mutex_t post_lock;
-    bool post_lock_ready;
-    uint32_t recv_depth;        /* queue pair receive depth actually granted */
-    uint32_t send_depth;        /* queue pair send depth actually granted */
-    struct ibv_sge *win_sge;    /* window work request arrays (recv_depth) */
-    struct ibv_recv_wr *win_rwr;
-    struct ibv_send_wr *win_swr;
-    /* Verify-block window (speculative decoding): one batch gate per layer,
-     * receives posted a layer ahead of every send, no per-gate control
-     * traffic (see ds4_tp_batch_block_begin). */
-    bool block_active;
-    uint32_t block_rows;
-    uint32_t block_layers;
-    uint32_t block_posted;      /* layers whose receives are posted */
-    uint64_t block_recv_done;   /* row messages received in this block */
-} ds4_tp_rdma;
+} ds4_tp_rdma_link;
 #endif
+
+struct tp_ctrl_queue;
+#define DS4_TP_CTRL_PORT_DELTA 10000
 
 struct ds4_tp {
     ds4_tp_options opt;
-    int rank;                   /* 0 leader, 1 worker */
-    int control_fd;
-    int data_fd;                /* TCP fallback, headers, and verify gates */
+    int rank;                   /* 0 leader, 1..world-1 workers */
+    int world;                  /* mesh size (2 for the classic pair) */
+    ds4_tp_topology topo;       /* resolved mesh descriptor (world==0: none) */
+    bool ring;                  /* world>2 canonical next/prev ring topology */
+    /* Control sockets, indexed by peer rank.  The leader holds one fd per
+     * worker (control_fd[m], m=1..world-1); a worker holds control_fd[0]
+     * to the leader. */
+    int control_fd[DS4_TP_MAX_WORLD];
+    /* Ring mode: physical control sockets to the two ring neighbours
+     * (ctrl_fd[next], ctrl_fd[prev]); control frames relay through the ring
+     * because the leader has no direct link to most workers.  ctrl_q[src]
+     * holds frames delivered to this node from rank src. */
+    int ctrl_fd[DS4_TP_MAX_WORLD];
+    /* Serializes writes to each ctrl socket: the main thread's ctrl_send
+     * and the ring relay-forward path both write frames to the same fd, and
+     * interleaved header/payload writes desync the reader (garbage header). */
+    pthread_mutex_t ctrl_mu[DS4_TP_MAX_WORLD];
+    pthread_t ctrl_thread[DS4_TP_MAX_WORLD];
+    int ctrl_thread_count;
+    struct tp_ctrl_queue *ctrl_q[DS4_TP_MAX_WORLD];
+    /* Full-mesh data sockets, indexed by peer rank: data_fd[m] is the
+     * gate/verify link to rank m (m != rank). */
+    int data_fd[DS4_TP_MAX_WORLD];
     bool rdma_active;
+    uint32_t peer_rdma_ok[DS4_TP_MAX_WORLD]; /* workers' rdma_ok from hello */
+    uint32_t peer_big_tcp[DS4_TP_MAX_WORLD]; /* workers' big-tcp bit from hello */
+    uint32_t big_tcp_override;  /* mesh-wide TCP big-gate decision (ring only) */
     uint32_t peer_ctx;
     uint32_t n_layer;
     uint32_t n_embd;
@@ -194,25 +211,30 @@ struct ds4_tp {
     uint32_t gate_slot_start;
     uint32_t gate_slot_step;
     uint32_t gates_per_token;
-    uint64_t gate_slot_mask[DS4_TP_GATE_MASK_WORDS];
     uint8_t *slab;
     uint64_t slab_bytes;
-    /* Slab regions, see ds4_tp.h layout comment. */
+    /* Slab regions, see ds4_tp.h layout comment.  in_peer_bytes is the
+     * per-peer in stride ((world-1) in vectors per slot). */
     uint64_t out_off;
     uint64_t in_off;
+    uint64_t in_peer_bytes;
+    uint64_t combined_off;      /* canonical sum for world>2 (CPU exchange) */
     uint64_t in_flags_off;
     uint64_t token_off;
     uint64_t out_flags_off;     /* local staging for RDMA flag writes */
     uint64_t gpu_flags_off;     /* GPU-written gate-ready flags (u32/slot) */
     uint64_t batch_out_off;     /* [layer][row] verify-block local partials */
     uint64_t batch_in_off;      /* [layer][row] verify-block peer partials */
+    uint64_t batch_combined_off;/* canonical batch sum for world>2 */
+    uint64_t bulk_stage_off;    /* per-peer bulk RDMA staging (send+recv) */
+    uint64_t bulk_stage_bytes;  /* one peer's staging size (BULK_SLOTS x MAX_MSG) */
     uint64_t timeout_sec;
-    uint64_t gate_timeout_ms;
     atomic_bool failed;
-    uint64_t sync_checkpoint_seq;
 #ifdef DS4_TP_HAVE_VERBS
-    ds4_tp_rdma rdma;
+    ds4_tp_verbs_api rdma_api;          /* verbs entry points, loaded once */
+    ds4_tp_rdma_link rdma[DS4_TP_MAX_WORLD];   /* one QP per peer link */
 #endif
+    uint64_t sync_checkpoint_seq;
 };
 
 /* ------------------------------------------------------------------------
@@ -225,12 +247,252 @@ static double tp_now_sec(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
 }
 
+
 static void tp_set_err(char *err, size_t errlen, const char *fmt, ...) {
     if (!err || !errlen) return;
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(err, errlen, fmt, ap);
     va_end(ap);
+}
+
+/* ---------------------------------------------------------------------
+ * Mesh topology descriptor.
+ * ----------------------------------------------------------------- */
+
+static int tp_topology_classify(const ds4_tp_topology *topo);
+
+int ds4_tp_topology_load(const char *path, ds4_tp_topology *topo,
+                         char *err, size_t errlen) {
+    memset(topo, 0, sizeof(*topo));
+    FILE *fp = fopen(path, "r");
+    if (!fp) {
+        tp_set_err(err, errlen, "tp topology: %s: %s", path, strerror(errno));
+        return 0;
+    }
+    char line[512];
+    int world = -1;
+    bool seen[DS4_TP_MAX_WORLD] = {false};
+    bool new_format = false;
+    int lineno = 0;
+    while (fgets(line, sizeof(line), fp)) {
+        lineno++;
+        char *s = line;
+        while (*s == ' ' || *s == '\t') s++;
+        if (!*s || *s == '#') continue;
+        char *tok = strtok(s, " \t\r\n");
+        if (!tok) continue;
+        if (!strcmp(tok, "world")) {
+            tok = strtok(NULL, " \t\r\n");
+            if (!tok) goto malformed;
+            world = atoi(tok);
+            if (world < 2 || world > DS4_TP_MAX_WORLD) {
+                tp_set_err(err, errlen,
+                           "tp topology: %s:%d: world must be 2..%d",
+                           path, lineno, DS4_TP_MAX_WORLD);
+                goto fail;
+            }
+            topo->world = world;
+        } else if (!strcmp(tok, "control")) {
+            /* control N host base_port: control-plane listener. */
+            new_format = true;
+            tok = strtok(NULL, " \t\r\n");
+            char *host = strtok(NULL, " \t\r\n");
+            char *port = strtok(NULL, " \t\r\n");
+            if (!tok || !host || !port) goto malformed;
+            int node = atoi(tok);
+            if (world < 0 || node < 0 || node >= world) {
+                tp_set_err(err, errlen, "tp topology: %s:%d: bad control node %s",
+                           path, lineno, tok);
+                goto fail;
+            }
+            char *end = NULL;
+            errno = 0;
+            long p = strtol(port, &end, 10);
+            if (errno != 0 || end == port || *end || p <= 0 || p > 65535) {
+                tp_set_err(err, errlen,
+                           "tp topology: %s:%d: bad control port %s",
+                           path, lineno, port);
+                goto fail;
+            }
+            if (topo->node[node].control_host) goto malformed;
+            topo->node[node].control_host = strdup(host);
+            topo->node[node].control_port = (int)p;
+        } else if (!strcmp(tok, "node")) {
+            tok = strtok(NULL, " \t\r\n");
+            if (!tok) goto malformed;
+            int node = atoi(tok);
+            if (world < 0 || node < 0 || node >= world) {
+                tp_set_err(err, errlen, "tp topology: %s:%d: bad node %s",
+                           path, lineno, tok);
+                goto fail;
+            }
+            if (seen[node]) {
+                tp_set_err(err, errlen,
+                           "tp topology: %s:%d: duplicate node %d",
+                           path, lineno, node);
+                goto fail;
+            }
+            seen[node] = true;
+            /* New format: node N peer host port [peer host port ...].  Old
+             * format: node N host port ... (world-1 links in rank order).
+             * Detect by the first token: a bare integer (no dot) is a peer
+             * id, otherwise an old-style link address. */
+            int n_links = 0;
+            for (;;) {
+                char *a = strtok(NULL, " \t\r\n");
+                if (!a) break;
+                char *b = strtok(NULL, " \t\r\n");
+                if (!b) goto malformed;
+                int peer = -1;
+                if (strchr(a, '.') == NULL) {
+                    /* bare integer => peer id (new format) */
+                    char *e2 = NULL;
+                    long v = strtol(a, &e2, 10);
+                    if (e2 == a || *e2 || v < 0 || v >= world || v == node) {
+                        tp_set_err(err, errlen,
+                                   "tp topology: %s:%d: bad link peer %s",
+                                   path, lineno, a);
+                        goto fail;
+                    }
+                    peer = (int)v;
+                    new_format = true;
+                }
+                char *host = peer >= 0 ? b : a;
+                char *port = peer >= 0 ? strtok(NULL, " \t\r\n") : b;
+                if (!port) goto malformed;
+                char *end = NULL;
+                errno = 0;
+                long p = strtol(port, &end, 10);
+                if (errno != 0 || end == port || *end || p <= 0 || p > 65535) {
+                    tp_set_err(err, errlen,
+                               "tp topology: %s:%d: bad link port %s",
+                               path, lineno, port);
+                    goto fail;
+                }
+                if (n_links >= DS4_TP_MAX_WORLD) goto malformed;
+                ds4_tp_topology_link *lk = &topo->node[node].link[n_links];
+                if (peer < 0) peer = (node + n_links + 1) % world; /* old */
+                lk->peer = peer;
+                lk->host = strdup(host);
+                lk->port = (int)p;
+                n_links++;
+            }
+            topo->node[node].n_links = n_links;
+        } else {
+            goto malformed;
+        }
+    }
+    if (world < 0) goto malformed;
+    for (int i = 0; i < world; i++) {
+        if (!seen[i]) {
+            tp_set_err(err, errlen, "tp topology: %s: missing node %d",
+                       path, i);
+            goto fail;
+        }
+    }
+    /* New format: peer-labeled links; control addresses are optional (the
+     * ring control plane rides per-link sockets).  Old format: each node
+     * must carry the full-mesh link set. */
+    if (new_format) {
+        for (int i = 0; i < world; i++) {
+            if (topo->node[i].n_links < 1) {
+                tp_set_err(err, errlen,
+                           "tp topology: %s: node %d has no data links",
+                           path, i);
+                goto fail;
+            }
+        }
+    }
+    /* Accept exactly one of: classic 2-node pair, full mesh (every node
+     * links to every peer), or ring (world>2, exactly two next/prev links
+     * per node).  Partial meshes (lines, rings with missing chords, mixed
+     * link counts) are rejected here instead of failing at the first gate. */
+    if (tp_topology_classify(topo) == 0) {
+        tp_set_err(err, errlen,
+                   "tp topology: %s: world %d is not a 2-node pair, full mesh, or ring",
+                   path, world);
+        goto fail;
+    }
+    fclose(fp);
+    return 1;
+malformed:
+    tp_set_err(err, errlen, "tp topology: %s:%d: malformed line", path, lineno);
+fail:
+    fclose(fp);
+    ds4_tp_topology_free(topo);
+    return 0;
+}
+
+void ds4_tp_topology_free(ds4_tp_topology *topo) {
+    if (!topo) return;
+    for (int n = 0; n < DS4_TP_MAX_WORLD; n++) {
+        free(topo->node[n].control_host);
+        topo->node[n].control_host = NULL;
+        for (int i = 0; i < topo->node[n].n_links; i++) {
+            free(topo->node[n].link[i].host);
+            topo->node[n].link[i].host = NULL;
+        }
+        topo->node[n].n_links = 0;
+    }
+    memset(topo, 0, sizeof(*topo));
+}
+
+/* Link index of `node`'s link that connects to `peer`, or -1. */
+static int tp_node_link_index(const ds4_tp_topology *topo, int node, int peer) {
+    if (!topo || node < 0 || node >= topo->world) return -1;
+    for (int i = 0; i < topo->node[node].n_links; i++) {
+        if (topo->node[node].link[i].peer == peer) return i;
+    }
+    return -1;
+}
+
+/* This rank's local link host for the peer (RDMA device matching), or
+ * NULL when the peer is not directly connected. */
+static const char *tp_link_host(const ds4_tp *tp, int peer) {
+    if (!tp->topo.world) return NULL;
+    const int li = tp_node_link_index(&tp->topo, tp->rank, peer);
+    return li >= 0 ? tp->topo.node[tp->rank].link[li].host : NULL;
+}
+
+/* True when the mesh is a ring: world>2 and every node has exactly two
+ * links, which are its next and prev ring neighbours.  Fully-connected
+ * meshes (n_links == world-1) are NOT rings: they keep the broadcast/gather
+ * + CPU canonical-combine path. */
+static bool tp_topology_ring(const ds4_tp_topology *topo) {
+    if (!topo || topo->world <= 2) return false;
+    for (int r = 0; r < topo->world; r++) {
+        const int next = (r + 1) % topo->world;
+        const int prev = (r + topo->world - 1) % topo->world;
+        if (topo->node[r].n_links != 2) return false;
+        if (tp_node_link_index(topo, r, next) < 0) return false;
+        if (tp_node_link_index(topo, r, prev) < 0) return false;
+    }
+    return true;
+}
+
+/* Topology class: 0 = invalid/partial mesh, 1 = classic 2-node pair,
+ * 2 = full mesh (every node links to every peer), 3 = ring. */
+static int tp_topology_classify(const ds4_tp_topology *topo) {
+    if (!topo || topo->world < 2 || topo->world > DS4_TP_MAX_WORLD) return 0;
+    const int w = topo->world;
+    if (w == 2) {
+        if (topo->node[0].n_links == 1 && topo->node[1].n_links == 1 &&
+            tp_node_link_index(topo, 0, 1) >= 0 &&
+            tp_node_link_index(topo, 1, 0) >= 0) return 1;
+        return 0;
+    }
+    if (tp_topology_ring(topo)) return 3;
+    bool full = true;
+    for (int r = 0; r < w; r++) {
+        if (topo->node[r].n_links != w - 1) { full = false; break; }
+        for (int p = 0; p < w; p++) {
+            if (p == r) continue;
+            if (tp_node_link_index(topo, r, p) < 0) { full = false; break; }
+        }
+        if (!full) break;
+    }
+    return full ? 2 : 0;
 }
 
 static int tp_write_full(int fd, const void *buf, size_t len) {
@@ -280,99 +542,15 @@ static void tp_socket_tune(int fd) {
     setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &sz, sizeof(sz));
 }
 
-static int tp_socket_set_gate_timeout(int fd, uint64_t timeout_ms) {
-    struct timeval tv = {
-        .tv_sec = (time_t)(timeout_ms / 1000u),
-        .tv_usec = (suseconds_t)((timeout_ms % 1000u) * 1000u),
-    };
-    if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) != 0)
-        return 0;
-    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) != 0)
-        return 0;
-    return 1;
-}
-
-static void tp_iov_advance(struct msghdr *msg, size_t bytes) {
-    while (msg->msg_iovlen && bytes >= msg->msg_iov->iov_len) {
-        bytes -= msg->msg_iov->iov_len;
-        msg->msg_iov++;
-        msg->msg_iovlen--;
-    }
-    if (bytes) {
-        msg->msg_iov->iov_base = (char *)msg->msg_iov->iov_base + bytes;
-        msg->msg_iov->iov_len -= bytes;
-    }
-}
-
-/* Keep both directions moving even if the kernel clamps the socket buffers. */
-static int tp_tcp_exchange_io(ds4_tp *tp, ds4_tp_gate_header *header,
-                              ds4_tp_gate_header *peer_header,
-                              const void *out, void *in, size_t bytes) {
-    struct iovec tx[] = {{header, sizeof(*header)}, {(void *)out, bytes}};
-    struct iovec rx[] = {{peer_header, sizeof(*peer_header)}, {in, bytes}};
-    struct msghdr send_msg = {.msg_iov = tx + !header, .msg_iovlen = header ? 2 : 1};
-    struct msghdr recv_msg = {.msg_iov = rx + !header, .msg_iovlen = header ? 2 : 1};
-    const double timeout = tp->gate_timeout_ms / 1000.0;
-    double deadline = tp_now_sec() + timeout;
-    while (send_msg.msg_iovlen || recv_msg.msg_iovlen) {
-        int progress = 0;
-        if (send_msg.msg_iovlen) {
-            int flags = MSG_DONTWAIT;
-#ifdef MSG_NOSIGNAL
-            flags |= MSG_NOSIGNAL;
-#endif
-            ssize_t n = sendmsg(tp->data_fd, &send_msg, flags);
-            if (n > 0) { tp_iov_advance(&send_msg, (size_t)n); progress = 1; }
-            else if (n == 0) { errno = EPIPE; return 0; }
-            else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) return 0;
-        }
-        if (recv_msg.msg_iovlen) {
-            ssize_t n = recvmsg(tp->data_fd, &recv_msg, MSG_DONTWAIT);
-            if (n > 0) { tp_iov_advance(&recv_msg, (size_t)n); progress = 1; }
-            else if (n == 0) { errno = ECONNRESET; return 0; }
-            else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) return 0;
-        }
-        if (progress) { deadline = tp_now_sec() + timeout; continue; }
-        const double remaining_ms = (deadline - tp_now_sec()) * 1000.0;
-        if (remaining_ms <= 0.0) { errno = ETIMEDOUT; return 0; }
-        struct pollfd pfd = {.fd = tp->data_fd,
-            .events = (send_msg.msg_iovlen ? POLLOUT : 0) |
-                      (recv_msg.msg_iovlen ? POLLIN : 0)};
-        int wait_ms = remaining_ms >= INT_MAX ? INT_MAX : (int)remaining_ms + 1;
-        if (poll(&pfd, 1, wait_ms) < 0 && errno != EINTR) return 0;
-        if (pfd.revents & POLLNVAL) { errno = EBADF; return 0; }
-    }
-    return 1;
-}
-
-static int tp_tcp_exchange(ds4_tp *tp, ds4_tp_gate_header *header,
-                           ds4_tp_gate_header *peer_header,
-                           const void *out, void *in, size_t bytes) {
-#ifdef __APPLE__
-    /* Darwin sendmsg can block despite MSG_DONTWAIT. The data socket has
-     * one exchange owner; restore its mode before blocking header I/O. */
-    const int flags = fcntl(tp->data_fd, F_GETFL);
-    if (flags < 0) return 0;
-    const bool changed = !(flags & O_NONBLOCK);
-    if (changed && fcntl(tp->data_fd, F_SETFL, flags | O_NONBLOCK) < 0) return 0;
-#endif
-    const int ok = tp_tcp_exchange_io(tp, header, peer_header, out, in, bytes);
-#ifdef __APPLE__
-    const int saved_errno = errno;
-    if (changed && fcntl(tp->data_fd, F_SETFL, flags) < 0) return 0;
-    errno = saved_errno;
-#endif
-    return ok;
-}
-
 #ifdef DS4_TP_HAVE_VERBS
 /* UC queue pairs do not report a dead remote reliably.  The control socket
  * does, so sample it while polling an RDMA completion and abort before the
  * Metal command-buffer watchdog fires. */
-static int tp_peer_closed(const ds4_tp *tp) {
+static int tp_peer_closed(const ds4_tp *tp, int peer) {
     char byte;
-    const ssize_t n = recv(tp->control_fd, &byte, 1,
-                           MSG_PEEK | MSG_DONTWAIT);
+    const int fd = tp->data_fd[peer];
+    if (fd < 0) return 0;
+    const ssize_t n = recv(fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT);
     if (n == 0) return 1;
     if (n > 0) return 0;
     return errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR;
@@ -406,7 +584,25 @@ static int tp_listen(const char *host, int port, char *err, size_t errlen) {
     return fd;
 }
 
-static int tp_dial(const char *host, int port, double timeout_sec, char *err, size_t errlen) {
+/* Interface index of the local interface holding `ip`, or 0. */
+static unsigned int tp_ifindex_for_addr(const char *ip) {
+    if (!ip || !*ip) return 0;
+    struct ifaddrs *ifa = NULL;
+    if (getifaddrs(&ifa) != 0) return 0;
+    unsigned int idx = 0;
+    for (struct ifaddrs *p = ifa; p; p = p->ifa_next) {
+        if (!p->ifa_addr || p->ifa_addr->sa_family != AF_INET) continue;
+        const struct sockaddr_in *sin = (const struct sockaddr_in *)p->ifa_addr;
+        char buf[INET_ADDRSTRLEN];
+        if (!inet_ntop(AF_INET, &sin->sin_addr, buf, sizeof(buf))) continue;
+        if (!strcmp(buf, ip)) { idx = if_nametoindex(p->ifa_name); break; }
+    }
+    freeifaddrs(ifa);
+    return idx;
+}
+
+static int tp_dial_src(const char *host, int port, const char *bind_host,
+                       double timeout_sec, char *err, size_t errlen) {
     char portbuf[16];
     snprintf(portbuf, sizeof(portbuf), "%d", port);
     double deadline = tp_now_sec() + timeout_sec;
@@ -417,18 +613,61 @@ static int tp_dial(const char *host, int port, double timeout_sec, char *err, si
         hints.ai_family = AF_UNSPEC;
         hints.ai_socktype = SOCK_STREAM;
         int gai = getaddrinfo(host, portbuf, &hints, &res);
+        const int dbg = getenv("DS4_TP_CTRL_DEBUG") != NULL;
         if (gai == 0) {
             for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
                 int fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-                if (fd < 0) continue;
+                if (dbg) fprintf(stderr, "ds4-tp: dial try host=%s port=%d bind=%s fam=%d fd=%d\n", host, port, bind_host ? bind_host : "-", ai->ai_family, fd);
+                if (fd < 0) { if (dbg) fprintf(stderr, "ds4-tp: dial socket errno=%d %s\n", errno, strerror(errno)); continue; }
+                /* A link-local mesh has one 169.254/16 address per peer, each on
+                 * its own interface.  Without pinning the source the kernel may
+                 * choose the wrong interface and connect() fails EHOSTUNREACH
+                 * before a single SYN is sent.  Bind to this link's local end. */
+                if (bind_host && *bind_host) {
+                    struct addrinfo bh = {0}, *bres = NULL;
+                    bh.ai_family = ai->ai_family;
+                    bh.ai_socktype = SOCK_STREAM;
+                    bh.ai_flags = AI_NUMERICHOST;
+                    if (getaddrinfo(bind_host, NULL, &bh, &bres) == 0) {
+                        if (bres->ai_family == AF_INET)
+                            ((struct sockaddr_in *)bres->ai_addr)->sin_port = 0;
+                        else if (bres->ai_family == AF_INET6)
+                            ((struct sockaddr_in6 *)bres->ai_addr)->sin6_port = 0;
+                        if (bind(fd, bres->ai_addr, bres->ai_addrlen) != 0 && dbg)
+                            fprintf(stderr, "ds4-tp: dial bind %s errno=%d %s\n",
+                                    bind_host, errno, strerror(errno));
+                        freeaddrinfo(bres);
+                    } else if (dbg) {
+                        fprintf(stderr, "ds4-tp: dial bind host %s resolve failed\n", bind_host);
+                    }
+#ifdef IP_BOUND_IF
+                    /* Binding the source alone is not enough: macOS routes a
+                     * link-local destination by the routing table first, and
+                     * with several 169.254/16 interfaces the wrong one wins.
+                     * Pin the lookup to the interface that owns this link. */
+                    {   unsigned int ifx = tp_ifindex_for_addr(bind_host);
+                        if (ifx) {
+                            if (setsockopt(fd, IPPROTO_IP, IP_BOUND_IF, &ifx,
+                                           sizeof(ifx)) != 0 && dbg)
+                                fprintf(stderr, "ds4-tp: IP_BOUND_IF %s errno=%d %s\n",
+                                        bind_host, errno, strerror(errno));
+                        } else if (dbg) {
+                            fprintf(stderr, "ds4-tp: no interface for bind %s\n", bind_host);
+                        }
+                    }
+#endif
+                }
                 if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) {
                     freeaddrinfo(res);
                     return fd;
                 }
                 last_errno = errno;
+                if (dbg) fprintf(stderr, "ds4-tp: dial connect errno=%d %s\n", errno, strerror(errno));
                 close(fd);
             }
             freeaddrinfo(res);
+        } else if (dbg) {
+            fprintf(stderr, "ds4-tp: dial gai=%d %s\n", gai, gai_strerror(gai));
         }
         /* Retrying is normal while the peer loads its model; still say why
          * every ~10s so a wrong address or a policy block is visible. */
@@ -442,6 +681,13 @@ static int tp_dial(const char *host, int port, double timeout_sec, char *err, si
     tp_set_err(err, errlen, "tp connect %s:%d: %s", host, port,
                last_errno ? strerror(last_errno) : "unreachable");
     return -1;
+}
+
+/* Source-unbound dial (LAN/Wi-Fi control plane and any peer on the routed
+ * network); link-local mesh links must use tp_dial_src() with their local
+ * end instead. */
+static int tp_dial(const char *host, int port, double timeout_sec, char *err, size_t errlen) {
+    return tp_dial_src(host, port, NULL, timeout_sec, err, errlen);
 }
 
 static int tp_send_frame(int fd, uint32_t type, const void *payload, uint32_t bytes) {
@@ -460,6 +706,212 @@ static int tp_read_frame_header(int fd, uint32_t *type, uint32_t *bytes) {
     return 1;
 }
 
+/* Control-frame queue (ring relay delivery). */
+typedef struct tp_ctrl_msg {
+    uint32_t type;
+    uint32_t bytes;
+    uint8_t *payload;
+    struct tp_ctrl_msg *next;
+} tp_ctrl_msg;
+
+typedef struct tp_ctrl_queue {
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    tp_ctrl_msg *head;
+    tp_ctrl_msg *tail;
+    int closed;
+} tp_ctrl_queue;
+
+#define DS4_TP_CTRL_MAGIC 0x4354524Cu   /* "CTRL" */
+#define DS4_TP_CTRL_VERSION 1u
+
+typedef struct {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t dst;
+    uint32_t src;
+    uint32_t type;
+    uint32_t bytes;
+} ds4_tp_ctrl_header;
+
+static void tp_ctrl_queue_init(tp_ctrl_queue *q) {
+    pthread_mutex_init(&q->mu, NULL);
+    pthread_cond_init(&q->cv, NULL);
+    q->head = q->tail = NULL;
+    q->closed = 0;
+}
+
+static void tp_ctrl_queue_push(tp_ctrl_queue *q, uint32_t type,
+                               uint8_t *payload, uint32_t bytes) {
+    tp_ctrl_msg *m = calloc(1, sizeof(*m));
+    if (!m) return;
+    m->type = type;
+    m->bytes = bytes;
+    m->payload = payload;
+    pthread_mutex_lock(&q->mu);
+    if (q->tail) q->tail->next = m;
+    else q->head = m;
+    q->tail = m;
+    pthread_cond_signal(&q->cv);
+    pthread_mutex_unlock(&q->mu);
+}
+
+/* Pop one frame; returns 1 with *payload malloc'd (caller frees, may be
+ * NULL when bytes==0), 0 when the queue is closed/empty. */
+static int tp_ctrl_queue_pop(tp_ctrl_queue *q, uint32_t *type,
+                             uint8_t **payload, uint32_t *bytes) {
+    pthread_mutex_lock(&q->mu);
+    while (!q->head && !q->closed) {
+        pthread_cond_wait(&q->cv, &q->mu);
+    }
+    tp_ctrl_msg *m = q->head;
+    if (!m) {
+        pthread_mutex_unlock(&q->mu);
+        return 0;
+    }
+    q->head = m->next;
+    if (!q->head) q->tail = NULL;
+    pthread_mutex_unlock(&q->mu);
+    *type = m->type;
+    *bytes = m->bytes;
+    *payload = m->payload;
+    free(m);
+    return 1;
+}
+
+/* Ring next hop toward dst (shorter arc; ties go to next). */
+static int tp_ring_next_hop(const ds4_tp *tp, int dst) {
+    const int via_next = (dst - tp->rank + tp->world) % tp->world;
+    const int via_prev = (tp->rank - dst + tp->world) % tp->world;
+    return via_next <= via_prev ? (tp->rank + 1) % tp->world
+                                : (tp->rank + tp->world - 1) % tp->world;
+}
+
+/* Send one control frame to dst (relayed in ring mode). */
+static int tp_ctrl_send(ds4_tp *tp, int dst, uint32_t type,
+                        const void *payload, uint32_t bytes) {
+    if (!tp || dst < 0 || dst >= tp->world) return 0;
+    if (tp->ring) {
+        if (dst == tp->rank) {
+            uint8_t *copy = NULL;
+            if (bytes) {
+                copy = malloc(bytes);
+                if (!copy) return 0;
+                memcpy(copy, payload, bytes);
+            }
+            tp_ctrl_queue_push(tp->ctrl_q[tp->rank], type, copy, bytes);
+            return 1;
+        }
+        const int hop = tp_ring_next_hop(tp, dst);
+        if (getenv("DS4_TP_CTRL_DEBUG")) {
+            fprintf(stderr, "[r%d] ctrl_send dst=%d type=%u bytes=%u via=%d\n",
+                    tp->rank, dst, type, bytes, hop);
+        }
+        if (tp->ctrl_fd[hop] < 0) return 0;
+        ds4_tp_ctrl_header h = { DS4_TP_CTRL_MAGIC, DS4_TP_CTRL_VERSION,
+                                 (uint32_t)dst, (uint32_t)tp->rank,
+                                 type, bytes };
+        pthread_mutex_lock(&tp->ctrl_mu[hop]);
+        int wok = tp_write_full(tp->ctrl_fd[hop], &h, sizeof(h)) &&
+                  (!bytes || tp_write_full(tp->ctrl_fd[hop], payload, bytes));
+        pthread_mutex_unlock(&tp->ctrl_mu[hop]);
+        return wok;
+    }
+    if (tp->control_fd[dst] < 0) return 1;
+    return tp_send_frame(tp->control_fd[dst], type, payload, bytes);
+}
+
+/* Receive one control frame from src; *payload is malloc'd (may be NULL). */
+static int tp_ctrl_recv(ds4_tp *tp, int src, uint32_t *type,
+                        uint8_t **payload, uint32_t *bytes) {
+    if (!tp || src < 0 || src >= tp->world) return 0;
+    if (tp->ring) {
+        return tp_ctrl_queue_pop(tp->ctrl_q[src], type, payload, bytes);
+    }
+    if (tp->control_fd[src] < 0) return 0;
+    uint32_t ftype = 0, fbytes = 0;
+    if (!tp_read_frame_header(tp->control_fd[src], &ftype, &fbytes)) return 0;
+    uint8_t *buf = NULL;
+    if (fbytes) {
+        buf = malloc(fbytes);
+        if (!buf || !tp_read_full(tp->control_fd[src], buf, fbytes)) {
+            free(buf);
+            return 0;
+        }
+    }
+    *type = ftype;
+    *bytes = fbytes;
+    *payload = buf;
+    return 1;
+}
+
+/* Ring relay reader: one thread per physical control socket. */
+typedef struct {
+    ds4_tp *tp;
+    int peer;   /* the neighbour this socket connects to */
+} tp_ring_ctrl_ctx;
+
+static void *tp_ring_ctrl_reader(void *arg) {
+    tp_ring_ctrl_ctx *ctx = arg;
+    ds4_tp *tp = ctx->tp;
+    const int peer = ctx->peer;
+    free(ctx);
+    const int fd = tp->ctrl_fd[peer];
+    for (;;) {
+        ds4_tp_ctrl_header h;
+        if (!tp_read_full(fd, &h, sizeof(h))) {
+            if (getenv("DS4_TP_CTRL_DEBUG"))
+                fprintf(stderr, "[r%d] ctrl reader peer=%d socket closed\n",
+                        tp->rank, peer);
+            break;
+        }
+        if (h.magic != DS4_TP_CTRL_MAGIC || h.version != DS4_TP_CTRL_VERSION ||
+            h.src >= (uint32_t)tp->world || h.dst >= (uint32_t)tp->world ||
+            h.bytes > (32u * 1024u * 1024u)) {
+            fprintf(stderr, "ds4-tp: ring ctrl bad header (src=%u dst=%u type=%u bytes=%u)\n",
+                    h.src, h.dst, h.type, h.bytes);
+            break;
+        }
+        uint8_t *payload = NULL;
+        if (h.bytes) {
+            payload = malloc(h.bytes);
+            if (!payload || !tp_read_full(fd, payload, h.bytes)) {
+                free(payload);
+                break;
+            }
+        }
+        if ((int)h.dst == tp->rank) {
+            tp_ctrl_queue_push(tp->ctrl_q[h.src], h.type, payload, h.bytes);
+        } else {
+            const int fwd = tp_ring_next_hop(tp, (int)h.dst);
+            if (fwd == peer || tp->ctrl_fd[fwd] < 0) {
+                fprintf(stderr, "ds4-tp: ring ctrl cannot forward src=%u dst=%u from peer %d\n",
+                        h.src, h.dst, peer);
+                free(payload);
+                break;
+            }
+            pthread_mutex_lock(&tp->ctrl_mu[fwd]);
+            int wok = tp_write_full(tp->ctrl_fd[fwd], &h, sizeof(h)) &&
+                      (!h.bytes ||
+                       tp_write_full(tp->ctrl_fd[fwd], payload, h.bytes));
+            pthread_mutex_unlock(&tp->ctrl_mu[fwd]);
+            free(payload);
+            if (!wok) break;
+        }
+    }
+    for (int i = 0; i < DS4_TP_MAX_WORLD; i++) {
+        if (tp->ctrl_q[i]) {
+            pthread_mutex_lock(&tp->ctrl_q[i]->mu);
+            tp->ctrl_q[i]->closed = 1;
+            pthread_cond_broadcast(&tp->ctrl_q[i]->cv);
+            pthread_mutex_unlock(&tp->ctrl_q[i]->mu);
+        }
+    }
+    return NULL;
+}
+
+
+
 /* ------------------------------------------------------------------------
  * Options and CLI.
  * --------------------------------------------------------------------- */
@@ -477,7 +929,11 @@ void ds4_tp_usage(FILE *fp) {
         "  --rdma-gid-index <n>        Select the local verbs GID index.\n"
         "  --tensor-parallel-token-prefill\n"
         "                              GLM diagnostic: prefill one token at a time.\n"
-        "  --debug-hash <n>            Cross-check hidden state every n tokens.\n");
+        "  --debug-hash <n>            Cross-check hidden state every n tokens.\n"
+        "Mesh (fully connected N-node TP over RDMA):\n"
+        "  --tp-topology <file>        Mesh descriptor: world size + each node's 3 link\n"
+        "                              addresses. Replaces --listen/--coordinator.\n"
+        "  --tp-rank <n>               This node's rank (0 leader, 1..world-1 workers).\n");
 }
 
 int ds4_tp_parse_cli_arg(
@@ -521,6 +977,22 @@ int ds4_tp_parse_cli_arg(
     } else if (!strcmp(arg, "--debug-hash")) {
         if (i + 1 >= argc) goto missing;
         opt->debug_hash = atoi(argv[++i]);
+    } else if (!strcmp(arg, "--tp-topology")) {
+        if (i + 1 >= argc) goto missing;
+        opt->topology_path = argv[++i];
+    } else if (!strcmp(arg, "--tp-rank")) {
+        if (i + 1 >= argc) goto missing;
+        char *end = NULL;
+        errno = 0;
+        long value = strtol(argv[++i], &end, 10);
+        if (errno != 0 || !end || *end != '\0' || value < 0 ||
+            value >= DS4_TP_MAX_WORLD) {
+            tp_set_err(err, errlen,
+                       "invalid --tp-rank %s (0..%d)", argv[i], DS4_TP_MAX_WORLD - 1);
+            return DS4_TP_CLI_ERROR;
+        }
+        opt->rank = (int)value;
+        opt->rank_set = true;
     } else {
         return DS4_TP_CLI_NOT_MATCHED;
     }
@@ -550,7 +1022,7 @@ int ds4_tp_adopt_distributed_options(
     }
     if (dist->layers.set) {
         tp_set_err(err, errlen,
-                   "tensor parallelism always uses one 50/50 worker; omit --layers");
+                   "tensor parallelism does not use distributed layer slices; omit --layers");
         return 0;
     }
     if (dist->prefill_chunk || dist->prefill_window || dist->activation_bits ||
@@ -561,33 +1033,44 @@ int ds4_tp_adopt_distributed_options(
     }
 
     if (dist->role == DS4_DISTRIBUTED_COORDINATOR) {
-        if (!dist->listen_host || dist->listen_port <= 0) {
-            tp_set_err(err, errlen,
-                       "--role coordinator --tensor-parallel requires --listen HOST PORT");
-            return 0;
-        }
-        if (dist->coordinator_host || dist->coordinator_port) {
-            tp_set_err(err, errlen,
-                       "--role coordinator must not use --coordinator");
-            return 0;
+        if (!tp->topology_path) {
+            if (!dist->listen_host || dist->listen_port <= 0) {
+                tp_set_err(err, errlen,
+                           "--role coordinator --tensor-parallel requires --listen HOST PORT "
+                           "or --tp-topology FILE");
+                return 0;
+            }
+            if (dist->coordinator_host || dist->coordinator_port) {
+                tp_set_err(err, errlen,
+                           "--role coordinator must not use --coordinator");
+                return 0;
+            }
+            tp->listen_host = dist->listen_host;
+            tp->listen_port = dist->listen_port;
         }
         tp->role = DS4_TP_LEADER;
-        tp->listen_host = dist->listen_host;
-        tp->listen_port = dist->listen_port;
+        if (tp->topology_path) tp->rank = 0;
     } else if (dist->role == DS4_DISTRIBUTED_WORKER) {
-        if (!dist->coordinator_host || dist->coordinator_port <= 0) {
+        if (!tp->topology_path) {
+            if (!dist->coordinator_host || dist->coordinator_port <= 0) {
+                tp_set_err(err, errlen,
+                           "--role worker --tensor-parallel requires --coordinator HOST PORT "
+                           "or --tp-topology FILE --tp-rank N");
+                return 0;
+            }
+            if (dist->listen_host || dist->listen_port) {
+                tp_set_err(err, errlen,
+                           "--role worker --tensor-parallel must not use --listen");
+                return 0;
+            }
+            tp->leader_host = dist->coordinator_host;
+            tp->leader_port = dist->coordinator_port;
+        } else if (!tp->rank_set) {
             tp_set_err(err, errlen,
-                       "--role worker --tensor-parallel requires --coordinator HOST PORT");
-            return 0;
-        }
-        if (dist->listen_host || dist->listen_port) {
-            tp_set_err(err, errlen,
-                       "--role worker --tensor-parallel must not use --listen");
+                       "--role worker --tensor-parallel --tp-topology requires --tp-rank N");
             return 0;
         }
         tp->role = DS4_TP_WORKER;
-        tp->leader_host = dist->coordinator_host;
-        tp->leader_port = dist->coordinator_port;
     } else {
         tp_set_err(err, errlen, "invalid tensor-parallel role");
         return 0;
@@ -612,16 +1095,12 @@ int ds4_tp_validate_engine_options(
         }
         return 1;
     }
-    bool supported_backend = opt->backend == DS4_BACKEND_METAL;
-#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
-    supported_backend |= opt->backend == DS4_BACKEND_CUDA;
-#endif
-    if (!supported_backend) {
-        tp_set_err(err, errlen, "network tensor parallelism requires Metal or supported CUDA models");
+    if (opt->backend != DS4_BACKEND_METAL) {
+        tp_set_err(err, errlen, "tensor parallelism requires the Metal backend");
         return 0;
     }
-    if (opt->backend == DS4_BACKEND_CUDA && (opt->cuda_tensor_parallel || opt->ssd_streaming)) {
-        tp_set_err(err, errlen, "network CUDA TP requires one GPU per rank and resident expert shards");
+    if (opt->ssd_streaming) {
+        tp_set_err(err, errlen, "tensor parallelism requires resident weights (no --ssd-streaming)");
         return 0;
     }
     if (opt->distributed.role != DS4_DISTRIBUTED_NONE) {
@@ -635,6 +1114,31 @@ int ds4_tp_validate_engine_options(
         tp_set_err(err, errlen, "tensor parallelism does not use distributed layer slices");
         return 0;
     }
+    /* Mesh: validate the rank against the topology world early. */
+    if (opt->tp.topology_path) {
+        ds4_tp_topology topo;
+        if (!ds4_tp_topology_load(opt->tp.topology_path, &topo, err, errlen))
+            return 0;
+        const int world = topo.world;
+        ds4_tp_topology_free(&topo);
+        if (opt->tp.rank < 0 || opt->tp.rank >= world) {
+            tp_set_err(err, errlen,
+                       "--tp-rank %d is out of range for a world-%d mesh",
+                       opt->tp.rank, world);
+            return 0;
+        }
+        if (opt->tp.role == DS4_TP_LEADER && opt->tp.rank != 0) {
+            tp_set_err(err, errlen,
+                       "--role coordinator must be rank 0; --tp-rank %d given",
+                       opt->tp.rank);
+            return 0;
+        }
+        if (opt->tp.role == DS4_TP_WORKER && opt->tp.rank == 0) {
+            tp_set_err(err, errlen,
+                       "--role worker cannot be rank 0 (the leader owns rank 0)");
+            return 0;
+        }
+    }
     return 1;
 }
 
@@ -642,30 +1146,40 @@ int ds4_tp_validate_engine_options(
  * Slab layout.
  * --------------------------------------------------------------------- */
 
-uint64_t ds4_tp_slab_bytes(uint32_t n_layer, uint32_t n_embd) {
+uint64_t ds4_tp_slab_bytes(uint32_t n_layer, uint32_t n_embd, uint32_t world) {
     uint64_t vec = (uint64_t)n_embd * sizeof(float);
     uint64_t slots = (uint64_t)n_layer * DS4_TP_GATES_PER_LAYER;
-    return slots * vec * 2 +    /* out + in vectors */
-           slots * 8 * 2 +      /* in flags + out flag staging */
-           16 +                 /* token slot */
-           slots * 4 +          /* GPU-written gate-ready flags */
-           (uint64_t)n_layer * DS4_TP_BATCH_MAX_ROWS * vec * 2; /* batch out+in */
+    uint64_t peers = world > 1 ? (uint64_t)(world - 1) : 0;
+    return slots * vec * (1 + peers + 1) +   /* out + in(peers) + combined */
+           slots * peers * 8 +               /* per-peer in flags */
+           slots * 8 +                       /* out flag staging */
+           16 +                              /* token slot */
+           slots * 4 +                       /* GPU-written gate-ready flags */
+           (uint64_t)n_layer * DS4_TP_BATCH_MAX_ROWS * vec * (1 + peers + 1) +
+           peers * DS4_TP_RDMA_BULK_SLOTS * DS4_TP_RDMA_MAX_MSG * 2;
 }
 
 static void tp_slab_layout(ds4_tp *tp) {
     uint64_t vec = tp->vec_bytes;
     uint64_t slots = tp->n_slots;
+    uint64_t peers = tp->world > 1 ? (uint64_t)(tp->world - 1) : 0;
     tp->out_off = 0;
     tp->in_off = slots * vec;
-    tp->in_flags_off = tp->in_off + slots * vec;
-    tp->token_off = tp->in_flags_off + slots * 8;
+    tp->in_peer_bytes = peers * vec;
+    tp->combined_off = tp->in_off + slots * peers * vec;
+    tp->in_flags_off = tp->combined_off + slots * vec;
+    tp->token_off = tp->in_flags_off + slots * peers * 8;
     tp->out_flags_off = tp->token_off + 16;
     tp->gpu_flags_off = tp->out_flags_off + slots * 8;
     tp->batch_out_off = tp->gpu_flags_off + slots * 4;
     tp->batch_in_off = tp->batch_out_off +
                        (uint64_t)tp->n_layer * DS4_TP_BATCH_MAX_ROWS * vec;
-    tp->slab_bytes = tp->batch_in_off +
-                     (uint64_t)tp->n_layer * DS4_TP_BATCH_MAX_ROWS * vec;
+    tp->batch_combined_off = tp->batch_in_off +
+                       (uint64_t)tp->n_layer * DS4_TP_BATCH_MAX_ROWS * peers * vec;
+    tp->bulk_stage_bytes = (uint64_t)DS4_TP_RDMA_BULK_SLOTS * DS4_TP_RDMA_MAX_MSG;
+    tp->bulk_stage_off = tp->batch_combined_off +
+                         (uint64_t)tp->n_layer * DS4_TP_BATCH_MAX_ROWS * vec;
+    tp->slab_bytes = tp->bulk_stage_off + tp->bulk_stage_bytes * peers * 2;
 }
 
 uint64_t ds4_tp_slab_gpu_flags_offset(const ds4_tp *tp) {
@@ -682,7 +1196,28 @@ uint64_t ds4_tp_slab_out_offset(const ds4_tp *tp, uint32_t layer, uint32_t gate)
 }
 
 uint64_t ds4_tp_slab_in_offset(const ds4_tp *tp, uint32_t layer, uint32_t gate) {
-    return tp->in_off + (uint64_t)tp_slot(tp, layer, gate) * tp->vec_bytes;
+    /* Base in-slot (world=2: the single peer partial).  The mesh exchange
+     * uses tp_slab_in_peer_offset() below to address each peer's slot. */
+    return tp->in_off + (uint64_t)tp_slot(tp, layer, gate) * tp->in_peer_bytes;
+}
+
+uint64_t ds4_tp_slab_combined_offset(const ds4_tp *tp, uint32_t layer, uint32_t gate) {
+    return tp->combined_off + (uint64_t)tp_slot(tp, layer, gate) * tp->vec_bytes;
+}
+
+/* Peer-labeled in-slot index: peers are ordered by rank (0..world-1
+ * excluding self), so slot index = peer<rank ? peer : peer-1. */
+static uint64_t tp_in_peer_index(const ds4_tp *tp, int peer) {
+    return peer < tp->rank ? (uint64_t)peer : (uint64_t)(peer - 1);
+}
+
+/* Peer-labeled in-slot: peer partials land at index (peer<rank ? peer :
+ * peer-1) inside the slot's (world-1) in-vector block, so the canonical
+ * rank-order sum can walk slots in rank order. */
+static uint64_t tp_slab_in_peer_offset(const ds4_tp *tp, uint32_t layer,
+                                       uint32_t gate, int peer) {
+    return tp->in_off + (uint64_t)tp_slot(tp, layer, gate) * tp->in_peer_bytes +
+           tp_in_peer_index(tp, peer) * tp->vec_bytes;
 }
 
 uint64_t ds4_tp_slab_batch_out_offset(const ds4_tp *tp, uint32_t layer) {
@@ -691,31 +1226,71 @@ uint64_t ds4_tp_slab_batch_out_offset(const ds4_tp *tp, uint32_t layer) {
 }
 
 uint64_t ds4_tp_slab_batch_in_offset(const ds4_tp *tp, uint32_t layer) {
+    /* Base batch-in (world=2: the single peer partial). */
     return tp->batch_in_off +
            (uint64_t)layer * DS4_TP_BATCH_MAX_ROWS * tp->vec_bytes;
 }
 
-static uint32_t tp_gate_mask_count(
-        const uint64_t mask[DS4_TP_GATE_MASK_WORDS]) {
-    uint32_t count = 0;
-    for (uint32_t i = 0; i < DS4_TP_GATE_MASK_WORDS; i++)
-        count += (uint32_t)__builtin_popcountll(mask[i]);
-    return count;
+uint64_t ds4_tp_slab_batch_combined_offset(const ds4_tp *tp, uint32_t layer) {
+    return tp->batch_combined_off +
+           (uint64_t)layer * DS4_TP_BATCH_MAX_ROWS * tp->vec_bytes;
 }
 
-static int tp_gate_mask_fits(
-        const uint64_t mask[DS4_TP_GATE_MASK_WORDS],
-        uint32_t n_slots) {
-    for (uint32_t word = 0; word < DS4_TP_GATE_MASK_WORDS; word++) {
-        uint64_t bits = mask[word];
-        while (bits) {
-            const uint32_t slot =
-                word * 64u + (uint32_t)__builtin_ctzll(bits);
-            if (slot >= n_slots) return 0;
-            bits &= bits - 1u;
+static uint64_t tp_slab_batch_in_peer_offset(const ds4_tp *tp, uint32_t layer,
+                                             int peer) {
+    uint64_t idx = peer < tp->rank ? (uint64_t)peer : (uint64_t)(peer - 1);
+    return tp->batch_in_off +
+           (uint64_t)layer * DS4_TP_BATCH_MAX_ROWS * tp->in_peer_bytes +
+           idx * DS4_TP_BATCH_MAX_ROWS * tp->vec_bytes;
+}
+
+/* Canonical rank-order combine for world>2: sum partial[0] + partial[1] +
+ * ... + partial[world-1] in rank order into the combined slot, where
+ * partial[i] is the local out vector when i==rank and the peer's labeled
+ * in vector otherwise.  The identical expression on every rank keeps the
+ * hidden states bit-exact across the mesh. */
+static void tp_combine(ds4_tp *tp, uint32_t layer, uint32_t gate) {
+    const uint32_t slot = layer * DS4_TP_GATES_PER_LAYER + gate;
+    float *dst = (float *)(tp->slab + tp->combined_off +
+                           (uint64_t)slot * tp->vec_bytes);
+    const float *out = (const float *)(tp->slab + tp->out_off +
+                                       (uint64_t)slot * tp->vec_bytes);
+    const uint64_t words = tp->vec_bytes / sizeof(float);
+    const float *first = tp->rank == 0 ? out :
+        (const float *)(tp->slab +
+            tp_slab_in_peer_offset(tp, layer, gate, 0));
+    memcpy(dst, first, tp->vec_bytes);
+    for (int i = 1; i < tp->world; i++) {
+        /* partial[i] is the local out when i==rank (own slice must be
+         * included), the peer's labeled in vector otherwise. */
+        const float *src = i == tp->rank ? out :
+            (const float *)(tp->slab +
+                tp_slab_in_peer_offset(tp, layer, gate, i));
+        for (uint64_t k = 0; k < words; k++) dst[k] += src[k];
+    }
+}
+
+/* Verify-block batch combine: canonical rank-order sum of the `rows` row
+ * partials (out + per-peer in regions) into batch_combined. */
+static void tp_batch_combine(ds4_tp *tp, uint32_t layer, uint32_t rows) {
+    const uint64_t words = tp->vec_bytes / sizeof(float);
+    const float *out = (const float *)(tp->slab +
+        tp->batch_out_off + (uint64_t)layer * DS4_TP_BATCH_MAX_ROWS * tp->vec_bytes);
+    float *dst = (float *)(tp->slab + ds4_tp_slab_batch_combined_offset(tp, layer));
+    const float *first = tp->rank == 0 ? out :
+        (const float *)(tp->slab +
+            tp_slab_batch_in_peer_offset(tp, layer, 0));
+    memcpy(dst, first, (uint64_t)rows * tp->vec_bytes);
+    for (int i = 1; i < tp->world; i++) {
+        const float *src = i == tp->rank ? out :
+            (const float *)(tp->slab +
+                tp_slab_batch_in_peer_offset(tp, layer, i));
+        for (uint64_t r = 0; r < rows; r++) {
+            const float *sr = src + r * words;
+            float *dr = dst + r * words;
+            for (uint64_t k = 0; k < words; k++) dr[k] += sr[k];
         }
     }
-    return 1;
 }
 
 /* ------------------------------------------------------------------------
@@ -726,12 +1301,8 @@ static int tp_gate_mask_fits(
 
 static int tp_rdma_load_api(ds4_tp_verbs_api *api) {
     if (api->handle) return 1;
-#ifdef __APPLE__
     void *h = dlopen("/usr/lib/librdma.dylib", RTLD_NOW | RTLD_LOCAL);
     if (!h) h = dlopen("librdma.dylib", RTLD_NOW | RTLD_LOCAL);
-#else
-    void *h = dlopen("libibverbs.so.1", RTLD_NOW | RTLD_LOCAL);
-#endif
     if (!h) return 0;
 #define TP_SYM(field, name) \
     do { \
@@ -746,9 +1317,6 @@ static int tp_rdma_load_api(ds4_tp_verbs_api *api) {
     TP_SYM(query_device, "ibv_query_device");
     TP_SYM(query_port, "ibv_query_port");
     TP_SYM(query_gid, "ibv_query_gid");
-#ifdef __linux__
-    TP_SYM(query_gid_ex, "_ibv_query_gid_ex");
-#endif
     TP_SYM(alloc_pd, "ibv_alloc_pd");
     TP_SYM(dealloc_pd, "ibv_dealloc_pd");
     TP_SYM(reg_mr, "ibv_reg_mr");
@@ -758,7 +1326,6 @@ static int tp_rdma_load_api(ds4_tp_verbs_api *api) {
     TP_SYM(create_qp, "ibv_create_qp");
     TP_SYM(destroy_qp, "ibv_destroy_qp");
     TP_SYM(modify_qp, "ibv_modify_qp");
-    TP_SYM(query_qp, "ibv_query_qp");
 #undef TP_SYM
     api->handle = h;
     return 1;
@@ -774,175 +1341,101 @@ static int tp_rdma_probe(ds4_tp_verbs_api *api) {
     return num > 0;
 }
 
-#ifdef __linux__
-/* Prefer the RoCEv2 GID belonging to the control socket's direct-link address.
- * Device order need not agree between hosts with several crossed NIC ports. */
-static int tp_rdma_linux_gid(ds4_tp *tp, struct ibv_context *ctx,
-                              const struct ibv_port_attr *port,
-                              union ibv_gid *gid, int *index) {
-    struct sockaddr_storage local = {0};
-    socklen_t len = sizeof(local);
-    union ibv_gid address = {0};
-    bool have_address = getsockname(tp->control_fd, (struct sockaddr *)&local, &len) == 0;
-    if (have_address && local.ss_family == AF_INET) {
-        address.raw[10] = address.raw[11] = 0xff;
-        memcpy(address.raw + 12, &((struct sockaddr_in *)&local)->sin_addr, 4);
-    } else if (have_address && local.ss_family == AF_INET6) {
-        memcpy(address.raw, &((struct sockaddr_in6 *)&local)->sin6_addr, 16);
-    } else {
-        have_address = false;
-    }
-    int best = 0;
-    const int first = tp->opt.rdma_gid_index_set ? tp->opt.rdma_gid_index : 0;
-    if (first < 0 || first >= port->gid_tbl_len || first > UINT8_MAX) return 0;
-    const int end = tp->opt.rdma_gid_index_set ? first + 1 : port->gid_tbl_len;
-    for (int i = first; i < end && i <= UINT8_MAX; i++) {
-        struct ibv_gid_entry entry = {0};
-        if (tp->rdma.api.query_gid_ex(ctx, 1, (uint32_t)i, &entry, 0, sizeof(entry)) ||
-            entry.gid_type != IBV_GID_TYPE_ROCE_V2) continue;
-        const union ibv_gid zero = {0};
-        if (!memcmp(entry.gid.raw, zero.raw, sizeof(zero.raw))) continue;
-        const int score = have_address && !memcmp(entry.gid.raw, address.raw, 16) ? 2 : 1;
-        if (score > best) {
-            *gid = entry.gid;
-            *index = i;
-            best = score;
-        }
-    }
-    return best;
-}
-#endif
-
-static enum ibv_qp_type tp_rdma_qp_type(void) {
-#ifdef __APPLE__
-    return IBV_QPT_UC;
-#else
-    return IBV_QPT_RC;
-#endif
-}
-
-static int tp_rdma_open(ds4_tp *tp, char *err, size_t errlen) {
-    ds4_tp_rdma *r = &tp->rdma;
+static int tp_rdma_open_link(ds4_tp *tp, int peer, char *err, size_t errlen) {
+    ds4_tp_rdma_link *r = &tp->rdma[peer];
+    ds4_tp_verbs_api *api = &tp->rdma_api;
     int num = 0;
-    struct ibv_device **devs = r->api.get_device_list(&num);
+    struct ibv_device **devs = api->get_device_list(&num);
     if (!devs || num == 0) {
         tp_set_err(err, errlen, "tp rdma: no verbs devices");
-        if (devs) r->api.free_device_list(devs);
+        if (devs) api->free_device_list(devs);
         return 0;
     }
-    /* One verbs device per Thunderbolt port (rdma_enN); pick the active one
-     * unless the caller selected a device explicitly. */
+    /* One verbs device per Thunderbolt port (rdma_enN).  The mesh has one
+     * link per peer; match the IPv4 in the device's mapped GID to the
+     * link's local address so each QP rides the right cable.  The classic
+     * pair (world==2, no topology) keeps the old active-device pick. */
     const char *want_name = tp->opt.rdma_device;
+    const char *link_host = tp_link_host(tp, peer);
+    struct in_addr link_ip;
+    const bool have_ip = link_host &&
+        inet_pton(AF_INET, link_host, &link_ip) == 1;
     char states[256] = "";
-#ifdef __linux__
-    int best = 0, candidates = 0;
-    for (int i = 0; i < num; i++) {
-        const char *name = r->api.get_device_name(devs[i]);
-        if (want_name && strcmp(want_name, name)) continue;
-        struct ibv_context *ctx = r->api.open_device(devs[i]);
-        if (!ctx) continue;
-        struct ibv_port_attr pa = {0};
-        union ibv_gid gid;
-        int index = -1;
-        const int score = !r->api.query_port(ctx, 1, &pa) && pa.state == IBV_PORT_ACTIVE &&
-            pa.link_layer == IBV_LINK_LAYER_ETHERNET ? tp_rdma_linux_gid(tp, ctx, &pa, &gid, &index) : 0;
-        if (score) candidates++;
-        if (score > best) {
-            if (r->ctx) r->api.close_device(r->ctx);
-            r->ctx = ctx;
-            r->port = pa;
-            r->gid = gid;
-            r->gid_index = index;
-            best = score;
-            snprintf(states, sizeof(states), "%s", name);
-        } else {
-            r->api.close_device(ctx);
-        }
-    }
-    r->api.free_device_list(devs);
-    if (!best || (!want_name && best == 1 && candidates > 1)) {
-        tp_set_err(err, errlen,
-            "tp rdma: %s; use the direct RoCE address for --coordinator, or select --rdma-device and --rdma-gid-index",
-            best ? "multiple active ports, none matches the control address" : "no active RoCEv2 GID for the requested device/index");
-        return 0;
-    }
-    fprintf(stderr, "ds4-tp: rdma device %s, RoCEv2 GID %d, RC\n", states, r->gid_index);
-#else
     for (int i = 0; i < num && !r->ctx; i++) {
-        const char *name = r->api.get_device_name(devs[i]);
+        const char *name = api->get_device_name(devs[i]);
         if (want_name && strcmp(want_name, name) != 0) continue;
-        struct ibv_context *ctx = r->api.open_device(devs[i]);
+        struct ibv_context *ctx = api->open_device(devs[i]);
         if (!ctx) continue;
-        struct ibv_port_attr pa = {0};
-        if (r->api.query_port(ctx, 1, &pa) == 0 &&
+        struct ibv_port_attr pa;
+        if (api->query_port(ctx, 1, &pa) == 0 &&
             (pa.state == IBV_PORT_ACTIVE || want_name)) {
-            r->ctx = ctx;
-            r->port = pa;
-            fprintf(stderr, "ds4-tp: rdma device %s (port state %d)\n", name, (int)pa.state);
-            break;
+            /* The driver only connects through the IPv4-mapped GID
+             * (::ffff:a.b.c.d), which exists only when the Thunderbolt
+             * member interface carries its own IPv4. */
+            int gid_idx = -1;
+            for (int g = 0; g < pa.gid_tbl_len; g++) {
+                union ibv_gid tmp;
+                if (api->query_gid(ctx, 1, g, &tmp) != 0) continue;
+                uint64_t hi;
+                uint16_t mid, v4tag;
+                memcpy(&hi, &tmp.raw[0], 8);
+                memcpy(&mid, &tmp.raw[8], 2);
+                memcpy(&v4tag, &tmp.raw[10], 2);
+                if (hi != 0 || mid != 0 || v4tag != 0xffff) continue;
+                if (!have_ip) {
+                    gid_idx = g;
+                    break;
+                }
+                struct in_addr gid_ip;
+                memcpy(&gid_ip, &tmp.raw[12], 4);
+                if (gid_ip.s_addr == link_ip.s_addr) {
+                    gid_idx = g;
+                    break;
+                }
+            }
+            if (gid_idx >= 0) {
+                r->ctx = ctx;
+                r->port = pa;
+                r->gid_index = gid_idx;
+                fprintf(stderr, "ds4-tp: rdma link %d device %s (port state %d)\n",
+                        peer, name, (int)pa.state);
+                break;
+            }
         }
         size_t off = strlen(states);
         snprintf(states + off, sizeof(states) - off, "%s%s=%d",
                  off ? ", " : "", name, (int)pa.state);
-        r->api.close_device(ctx);
+        api->close_device(ctx);
     }
-    r->api.free_device_list(devs);
+    api->free_device_list(devs);
     if (!r->ctx) {
         tp_set_err(err, errlen,
-                   "tp rdma: no device with an active port (%s); is the peer up "
-                   "and rdma_ctl enabled on both machines?", states);
+                   "tp rdma: no device with an active port%s (%s); is the peer up "
+                   "and rdma_ctl enabled on both machines?",
+                   have_ip ? " whose IPv4-mapped GID matches the link address" : "",
+                   states);
         return 0;
     }
-    /* The driver only connects through the IPv4-mapped GID
-     * (::ffff:a.b.c.d), which exists only when the Thunderbolt member
-     * interface carries an IPv4 address (the bridge's address does not
-     * count). */
-    r->gid_index = -1;
-    if (tp->opt.rdma_gid_index_set) {
-        r->gid_index = tp->opt.rdma_gid_index;
-        if (r->api.query_gid(r->ctx, 1, r->gid_index, &r->gid) != 0) {
+    if (!tp->opt.rdma_gid_index_set) {
+        if (api->query_gid(r->ctx, 1, r->gid_index, &r->gid) != 0) {
             tp_set_err(err, errlen, "tp rdma: query_gid(%d): %s",
                        r->gid_index, strerror(errno));
             return 0;
         }
     } else {
-        for (int i = 0; i < r->port.gid_tbl_len; i++) {
-            union ibv_gid tmp;
-            if (r->api.query_gid(r->ctx, 1, i, &tmp) != 0) continue;
-            uint64_t hi;
-            uint16_t mid, v4tag;
-            memcpy(&hi, &tmp.raw[0], 8);
-            memcpy(&mid, &tmp.raw[8], 2);
-            memcpy(&v4tag, &tmp.raw[10], 2);
-            if (hi == 0 && mid == 0 && v4tag == 0xffff) {
-                r->gid = tmp;
-                r->gid_index = i;
-                break;
-            }
-        }
-        if (r->gid_index < 0) {
-            tp_set_err(err, errlen,
-                       "tp rdma: no IPv4-mapped GID on the active port; give the "
-                       "Thunderbolt interface its own IPv4 (e.g. sudo ifconfig en1 "
-                       "inet 10.99.0.2/30 alias) on both machines");
+        r->gid_index = tp->opt.rdma_gid_index;
+        if (api->query_gid(r->ctx, 1, r->gid_index, &r->gid) != 0) {
+            tp_set_err(err, errlen, "tp rdma: query_gid(%d): %s",
+                       r->gid_index, strerror(errno));
             return 0;
         }
     }
-#endif
-    r->pd = r->api.alloc_pd(r->ctx);
+    r->pd = api->alloc_pd(r->ctx);
     if (!r->pd) {
         tp_set_err(err, errlen, "tp rdma: alloc_pd failed");
         return 0;
     }
-    {
-        struct ibv_device_attr da;
-        memset(&da, 0, sizeof(da));
-        if (r->api.query_device && r->api.query_device(r->ctx, &da) == 0) {
-            fprintf(stderr, "ds4-tp: rdma device limits: max_qp_wr %d, max_sge %d, max_cqe %d, max_mr_size %llu\n",
-                    da.max_qp_wr, da.max_sge, da.max_cqe, (unsigned long long)da.max_mr_size);
-        }
-    }
-    r->cq = r->api.create_cq(r->ctx, 512, NULL, NULL, 0);
+    r->cq = api->create_cq(r->ctx, 4096, NULL, NULL, 0);
     if (!r->cq) {
         tp_set_err(err, errlen, "tp rdma: create_cq failed");
         return 0;
@@ -950,208 +1443,42 @@ static int tp_rdma_open(ds4_tp *tp, char *err, size_t errlen) {
     struct ibv_qp_init_attr qia = {0};
     qia.send_cq = r->cq;
     qia.recv_cq = r->cq;
-    qia.qp_type = tp_rdma_qp_type();
-    qia.cap.max_send_wr = 1024;
-    qia.cap.max_recv_wr = 1024;
+    qia.qp_type = IBV_QPT_UC;
+    /* The pipelined ring bulk wavefront holds up to MAX_INFLIGHT rounds in
+     * flight per link, each with BULK_SLOTS send/recv WRs; size the queues
+     * to that (the driver rejects larger recv queues anyway) plus headroom
+     * for the decode ring. */
+    qia.cap.max_send_wr = (uint32_t)(DS4_TP_RDMA_BULK_MAX_INFLIGHT *
+                                     DS4_TP_RDMA_BULK_SLOTS + 32);
+    qia.cap.max_recv_wr = (uint32_t)(DS4_TP_RDMA_BULK_MAX_INFLIGHT *
+                                     DS4_TP_RDMA_BULK_SLOTS + 32);
     qia.cap.max_send_sge = 1;
     qia.cap.max_recv_sge = 1;
     qia.cap.max_inline_data = 0;
-    r->qp = r->api.create_qp(r->pd, &qia);
+    r->qp = api->create_qp(r->pd, &qia);
     if (!r->qp) {
-        qia.cap.max_send_wr = 256;
-        qia.cap.max_recv_wr = 64;
-        r->qp = r->api.create_qp(r->pd, &qia);
-    }
-    if (!r->qp) {
-        tp_set_err(err, errlen, "tp rdma: create_qp: %s", strerror(errno));
+        tp_set_err(err, errlen, "tp rdma: create_qp(UC): %s", strerror(errno));
         return 0;
     }
+    fprintf(stderr, "ds4-tp: QP peer %d send_wr=%u recv_wr=%u\n",
+            peer, qia.cap.max_send_wr, qia.cap.max_recv_wr);
     r->max_inline = qia.cap.max_inline_data;
-    r->recv_depth = qia.cap.max_recv_wr ? qia.cap.max_recv_wr : 64u;
-    r->send_depth = qia.cap.max_send_wr ? qia.cap.max_send_wr : 256u;
-    if (r->recv_depth > 4096u) r->recv_depth = 4096u;
-    if (r->send_depth > 4096u) r->send_depth = 4096u;
 
-    const int mutex_error = pthread_mutex_init(&r->post_lock, NULL);
-    if (mutex_error) {
-        tp_set_err(err, errlen, "tp rdma: post mutex: %s", strerror(mutex_error));
-        return 0;
-    }
-    r->post_lock_ready = true;
+    pthread_mutex_init(&r->post_lock, NULL);
     return 1;
 }
 
-#define DS4_TP_RDMA_WARM_WR_TAG (UINT64_C(1) << 62)
+static int tp_rdma_post_gate_recv(ds4_tp *tp, int peer, uint64_t seq);
 
-static const char *tp_wc_status_str(int status);
-
-/* Warm-up round after the ready barrier.  A fresh UC queue pair over
- * Thunderbolt RDMA sometimes cannot deliver in one direction at all, and UC
- * never reports a lost message: such runs timed out at the first bulk round
- * with no completions.  This round proves both directions before any real
- * traffic (the caller recreates the queue pair when it fails).  Each side posts exactly one full-size receive and resends
- * a tagged message until the peer confirms receipt over the control
- * channel.  A dropped UC message never arrives late, so once both sides
- * have received, no stray message can reach the receive queue. */
-/* "Receives posted" barrier.  On Apple's Thunderbolt RDMA a UC send that
- * reaches a queue pair with no receive posted is not just lost: that
- * direction of the pair stops delivering for good.  Every sender therefore
- * waits for the peer's word that its receives are posted before posting
- * sends (one control-channel round trip). */
-static int tp_rdma_posted_barrier(ds4_tp *tp, uint32_t tag) {
-    uint32_t t = 0, b = 0, theirs = 0;
-    if (!tp_send_frame(tp->control_fd, DS4_TP_FRAME_RDMA_POSTED, &tag, sizeof(tag))) return 0;
-    if (!tp_read_frame_header(tp->control_fd, &t, &b) ||
-        t != DS4_TP_FRAME_RDMA_POSTED || b != sizeof(theirs) ||
-        !tp_read_full(tp->control_fd, &theirs, sizeof(theirs)) || theirs != tag) {
-        return 0;
-    }
-    return 1;
-}
-
-static int tp_rdma_warm_up(ds4_tp *tp, char *err, size_t errlen) {
-    ds4_tp_rdma *r = &tp->rdma;
-    uint8_t *wsend = tp->slab + tp->batch_out_off;
-    uint8_t *wrecv = tp->slab + tp->batch_in_off;
-    /* Full-size message: 64 B warm messages pass on a fresh direction while
-     * the first 16 KB chunks are still dropped. */
-    const uint32_t bytes = DS4_TP_RDMA_MAX_MSG;
-    memset(wsend, 0x5A, bytes);
-    memset(wrecv, 0, bytes);
-    struct ibv_sge rsge = {
-        .addr = (uintptr_t)wrecv, .length = bytes, .lkey = r->mr->lkey,
-    };
-    struct ibv_recv_wr rwr;
-    memset(&rwr, 0, sizeof(rwr));
-    rwr.wr_id = DS4_TP_RDMA_WARM_WR_TAG;
-    rwr.sg_list = &rsge;
-    rwr.num_sge = 1;
-    struct ibv_recv_wr *bad_r = NULL;
-    if (ibv_post_recv(r->qp, &rwr, &bad_r) != 0) {
-        tp_set_err(err, errlen, "tp rdma: warm-up post_recv: %s", strerror(errno));
-        return 0;
-    }
-    if (!tp_rdma_posted_barrier(tp, 0xfeedu)) {
-        tp_set_err(err, errlen, "tp rdma: warm-up posted barrier failed");
-        return 0;
-    }
-    int got_recv = 0, peer_got = 0, attempts = 0;
-    bool warm_send_done = false;
-    const bool reliable = tp_rdma_qp_type() == IBV_QPT_RC;
-    for (int attempt = 0; attempt < (reliable ? 1 : 20) && !(got_recv && peer_got); attempt++) {
-        attempts = attempt + 1;
-        int send_done = peer_got;
-        if (!peer_got) {
-            struct ibv_sge ssge = {
-                .addr = (uintptr_t)wsend, .length = bytes, .lkey = r->mr->lkey,
-            };
-            struct ibv_send_wr swr;
-            memset(&swr, 0, sizeof(swr));
-            swr.wr_id = DS4_TP_RDMA_WARM_WR_TAG;
-            swr.sg_list = &ssge;
-            swr.num_sge = 1;
-            swr.opcode = IBV_WR_SEND;
-            swr.send_flags = IBV_SEND_SIGNALED;
-            struct ibv_send_wr *bad_s = NULL;
-            if (ibv_post_send(r->qp, &swr, &bad_s) != 0) {
-                tp_set_err(err, errlen, "tp rdma: warm-up post_send: %s", strerror(errno));
-                return 0;
-            }
-        }
-        const double deadline = tp_now_sec() + (reliable ? tp->gate_timeout_ms / 1000.0 : 0.1);
-        while (tp_now_sec() < deadline && !(send_done && got_recv)) {
-            struct ibv_wc wc[8];
-            int n = ibv_poll_cq(r->cq, 8, wc);
-            if (n < 0) {
-                tp_set_err(err, errlen, "tp rdma: warm-up poll_cq failed");
-                return 0;
-            }
-            for (int i = 0; i < n; i++) {
-                if (wc[i].status != IBV_WC_SUCCESS) {
-                    tp_set_err(err, errlen, "tp rdma: warm-up completion error: %s",
-                               tp_wc_status_str(wc[i].status));
-                    return 0;
-                }
-                if (wc[i].wr_id != DS4_TP_RDMA_WARM_WR_TAG) continue;
-                if (wc[i].opcode & IBV_WC_RECV) got_recv = 1;
-                else send_done = 1;
-            }
-        }
-        warm_send_done = send_done != 0;
-        uint32_t mine = (uint32_t)got_recv, theirs = 0, t = 0, b = 0;
-        if (!tp_send_frame(tp->control_fd, DS4_TP_FRAME_RDMA_WARM, &mine, sizeof(mine)) ||
-            !tp_read_frame_header(tp->control_fd, &t, &b) ||
-            t != DS4_TP_FRAME_RDMA_WARM || b != sizeof(theirs) ||
-            !tp_read_full(tp->control_fd, &theirs, sizeof(theirs))) {
-            tp_set_err(err, errlen, "tp rdma: warm-up status exchange failed");
-            return 0;
-        }
-        peer_got = theirs != 0;
-    }
-    if (!(got_recv && peer_got) || (reliable && !warm_send_done)) {
-        tp_set_err(err, errlen, "tp rdma: warm-up failed after %d attempts (recv %d, peer %d)",
-                   attempts, got_recv, peer_got);
-        r->warm_failed = !reliable;
-        return 0;
-    }
-    fprintf(stderr, "ds4-tp: rdma warm-up ok (%d attempt%s), queue depth recv %u send %u\n",
-            attempts, attempts == 1 ? "" : "s", r->recv_depth, r->send_depth);
-    return 1;
-}
-
-static int tp_rdma_post_gate_recv(ds4_tp *tp, uint64_t seq);
-
-/* A freshly created UC queue pair over Thunderbolt RDMA sometimes cannot
- * deliver in one direction at all (every send silently dropped, observed
- * right after a working run and after role swaps).  Recreating the pair
- * (new queue pair number) and re-exchanging the info fixes it; both sides
- * take this path in lockstep because the warm-up status exchange tells
- * them the same outcome. */
-static int tp_rdma_recreate_qp(ds4_tp *tp, char *err, size_t errlen) {
-    ds4_tp_rdma *r = &tp->rdma;
-    if (r->qp) { r->api.destroy_qp(r->qp); r->qp = NULL; }
-    if (r->cq) { r->api.destroy_cq(r->cq); r->cq = NULL; }
-    r->cq = r->api.create_cq(r->ctx, 512, NULL, NULL, 0);
-    if (!r->cq) {
-        tp_set_err(err, errlen, "tp rdma: create_cq (retry) failed");
-        return 0;
-    }
-    struct ibv_qp_init_attr qia = {0};
-    qia.send_cq = r->cq;
-    qia.recv_cq = r->cq;
-    qia.qp_type = tp_rdma_qp_type();
-    qia.cap.max_send_wr = 1024;
-    qia.cap.max_recv_wr = 1024;
-    qia.cap.max_send_sge = 1;
-    qia.cap.max_recv_sge = 1;
-    qia.cap.max_inline_data = 0;
-    r->qp = r->api.create_qp(r->pd, &qia);
-    if (!r->qp) {
-        qia.cap.max_send_wr = 256;
-        qia.cap.max_recv_wr = 64;
-        r->qp = r->api.create_qp(r->pd, &qia);
-    }
-    if (!r->qp) {
-        tp_set_err(err, errlen, "tp rdma: create_qp (retry): %s", strerror(errno));
-        return 0;
-    }
-    r->max_inline = qia.cap.max_inline_data;
-    r->recv_depth = qia.cap.max_recv_wr ? qia.cap.max_recv_wr : 64u;
-    r->send_depth = qia.cap.max_send_wr ? qia.cap.max_send_wr : 256u;
-    if (r->recv_depth > 4096u) r->recv_depth = 4096u;
-    if (r->send_depth > 4096u) r->send_depth = 4096u;
-    r->send_outstanding = 0;
-    r->recv_done = 0;
-    return 1;
-}
-
-static int tp_rdma_register_and_exchange(ds4_tp *tp, char *err, size_t errlen) {
-    ds4_tp_rdma *r = &tp->rdma;
-    if (!r->mr) {
-        r->mr = r->api.reg_mr(r->pd, tp->slab, tp->slab_bytes,
-                              IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ |
-                              IBV_ACCESS_REMOTE_WRITE);
-    }
+/* Register the slab on one link's device and bring the UC QP to RTS, then
+ * barrier with the peer over the pair's data socket (the mesh exchanges
+ * one RDMA_INFO per link; the classic pair has exactly one). */
+static int tp_rdma_info_exchange(ds4_tp *tp, int peer, char *err, size_t errlen) {
+    ds4_tp_rdma_link *r = &tp->rdma[peer];
+    ds4_tp_verbs_api *api = &tp->rdma_api;
+    r->mr = api->reg_mr(r->pd, tp->slab, tp->slab_bytes,
+                        IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ |
+                        IBV_ACCESS_REMOTE_WRITE);
     if (!r->mr) {
         tp_set_err(err, errlen, "tp rdma: reg_mr(%llu bytes): %s",
                    (unsigned long long)tp->slab_bytes, strerror(errno));
@@ -1161,28 +1488,24 @@ static int tp_rdma_register_and_exchange(ds4_tp *tp, char *err, size_t errlen) {
     mine.slab_base = (uint64_t)(uintptr_t)tp->slab;
     mine.rkey = r->mr->rkey;
     mine.qpn = r->qp->qp_num;
-    mine.psn = ((uint32_t)(getpid() ^ (uintptr_t)tp) + r->setup_attempt * 0x1000u) & 0xffffff;
+    mine.psn = (uint32_t)(getpid() ^ (uintptr_t)tp ^ (uintptr_t)r) & 0xffffff;
     mine.mtu = (uint32_t)r->port.active_mtu;
     mine.lid = r->port.lid;
     memcpy(mine.gid, r->gid.raw, 16);
     mine.link_layer = r->port.link_layer;
-    mine.reliable = tp_rdma_qp_type() == IBV_QPT_RC;
-    if (!tp_send_frame(tp->control_fd, DS4_TP_FRAME_RDMA_INFO, &mine, sizeof(mine))) {
+    if (!tp_send_frame(tp->data_fd[peer], DS4_TP_FRAME_RDMA_INFO,
+                       &mine, sizeof(mine))) {
         tp_set_err(err, errlen, "tp rdma: info send failed");
         return 0;
     }
     uint32_t type = 0, bytes = 0;
-    if (!tp_read_frame_header(tp->control_fd, &type, &bytes) ||
+    if (!tp_read_frame_header(tp->data_fd[peer], &type, &bytes) ||
         type != DS4_TP_FRAME_RDMA_INFO || bytes != sizeof(r->peer) ||
-        !tp_read_full(tp->control_fd, &r->peer, sizeof(r->peer))) {
+        !tp_read_full(tp->data_fd[peer], &r->peer, sizeof(r->peer))) {
         tp_set_err(err, errlen, "tp rdma: info recv failed");
         return 0;
     }
 
-    if (r->peer.reliable != mine.reliable || r->peer.link_layer != mine.link_layer) {
-        tp_set_err(err, errlen, "tp rdma: incompatible queue-pair transport");
-        return 0;
-    }
     /* INIT -> RTR -> RTS with the exact recipe the driver accepts (same as
      * JACCL): MTU 1024 and GRH via the IPv4-mapped GID. */
     struct ibv_qp_attr a = {0};
@@ -1191,7 +1514,7 @@ static int tp_rdma_register_and_exchange(ds4_tp *tp, char *err, size_t errlen) {
     a.port_num = 1;
     a.qp_access_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ |
                         IBV_ACCESS_REMOTE_WRITE;
-    if (r->api.modify_qp(r->qp, &a,
+    if (api->modify_qp(r->qp, &a,
             IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS) != 0) {
         tp_set_err(err, errlen, "tp rdma: modify INIT: %s", strerror(errno));
         return 0;
@@ -1199,17 +1522,6 @@ static int tp_rdma_register_and_exchange(ds4_tp *tp, char *err, size_t errlen) {
     memset(&a, 0, sizeof(a));
     a.qp_state = IBV_QPS_RTR;
     a.path_mtu = IBV_MTU_1024;
-    int rtr_mask = IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN | IBV_QP_RQ_PSN;
-    if (mine.reliable) {
-        if (r->peer.mtu < IBV_MTU_256 || r->peer.mtu > IBV_MTU_4096) {
-            tp_set_err(err, errlen, "tp rdma: invalid peer MTU");
-            return 0;
-        }
-        a.path_mtu = (enum ibv_mtu)(mine.mtu < r->peer.mtu ? mine.mtu : r->peer.mtu);
-        a.max_dest_rd_atomic = 1;
-        a.min_rnr_timer = 12;
-        rtr_mask |= IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER;
-    }
     a.dest_qp_num = r->peer.qpn;
     a.rq_psn = r->peer.psn;
     a.ah_attr.dlid = (uint16_t)r->peer.lid;
@@ -1218,22 +1530,16 @@ static int tp_rdma_register_and_exchange(ds4_tp *tp, char *err, size_t errlen) {
     memcpy(a.ah_attr.grh.dgid.raw, r->peer.gid, 16);
     a.ah_attr.grh.sgid_index = (uint8_t)r->gid_index;
     a.ah_attr.grh.hop_limit = 1;
-    if (r->api.modify_qp(r->qp, &a, rtr_mask) != 0) {
+    if (api->modify_qp(r->qp, &a,
+            IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
+            IBV_QP_RQ_PSN) != 0) {
         tp_set_err(err, errlen, "tp rdma: modify RTR: %s", strerror(errno));
         return 0;
     }
     memset(&a, 0, sizeof(a));
     a.qp_state = IBV_QPS_RTS;
     a.sq_psn = mine.psn;
-    int rts_mask = IBV_QP_STATE | IBV_QP_SQ_PSN;
-    if (mine.reliable) {
-        a.timeout = 14;
-        a.retry_cnt = 3;
-        a.rnr_retry = 3;
-        a.max_rd_atomic = 1;
-        rts_mask |= IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY | IBV_QP_MAX_QP_RD_ATOMIC;
-    }
-    if (r->api.modify_qp(r->qp, &a, rts_mask) != 0) {
+    if (api->modify_qp(r->qp, &a, IBV_QP_STATE | IBV_QP_SQ_PSN) != 0) {
         tp_set_err(err, errlen, "tp rdma: modify RTS: %s", strerror(errno));
         return 0;
     }
@@ -1252,18 +1558,25 @@ static int tp_rdma_register_and_exchange(ds4_tp *tp, char *err, size_t errlen) {
     }
     /* Leave the receive queue empty for an initial bulk prefill.  The first
      * decode gate arms the normal lookahead window after prefill finishes. */
-    if (!tp_send_frame(tp->control_fd, DS4_TP_FRAME_RDMA_READY, NULL, 0)) {
+    if (!tp_send_frame(tp->data_fd[peer], DS4_TP_FRAME_RDMA_READY, NULL, 0)) {
         tp_set_err(err, errlen, "tp rdma: ready send failed");
         return 0;
     }
     uint32_t rtype = 0, rbytes = 0;
-    if (!tp_read_frame_header(tp->control_fd, &rtype, &rbytes) ||
+    if (!tp_read_frame_header(tp->data_fd[peer], &rtype, &rbytes) ||
         rtype != DS4_TP_FRAME_RDMA_READY || rbytes != 0) {
         tp_set_err(err, errlen, "tp rdma: ready barrier failed");
         return 0;
     }
-    if (getenv("DS4_TP_DISABLE_RDMA_WARMUP") == NULL &&
-        !tp_rdma_warm_up(tp, err, errlen)) return 0;
+    return 1;
+}
+
+static int tp_rdma_register_and_exchange(ds4_tp *tp, char *err, size_t errlen) {
+    for (int m = 0; m < tp->world; m++) {
+        if (m == tp->rank) continue;
+        if (tp->data_fd[m] < 0) continue;
+        if (!tp_rdma_info_exchange(tp, m, err, errlen)) return 0;
+    }
     return 1;
 }
 
@@ -1279,55 +1592,29 @@ static const char *tp_wc_status_str(int status) {
  * (identity mapping); GLM's schedule from the hello skips dense layers
  * and the ATTN slots. */
 static uint32_t tp_gate_slot(const ds4_tp *tp, uint64_t seq) {
-    if (tp->gate_slot_mask[0] || tp->gate_slot_mask[1] ||
-        tp->gate_slot_mask[2]) {
-        uint32_t ordinal = (uint32_t)((seq - 1) % tp->gates_per_token);
-        for (uint32_t word = 0; word < DS4_TP_GATE_MASK_WORDS; word++) {
-            uint64_t bits = tp->gate_slot_mask[word];
-            const uint32_t count = (uint32_t)__builtin_popcountll(bits);
-            if (ordinal >= count) {
-                ordinal -= count;
-                continue;
-            }
-            while (ordinal > 0) {
-                bits &= bits - 1u;
-                ordinal--;
-            }
-            return word * 64u + (uint32_t)__builtin_ctzll(bits);
-        }
-        return tp->n_slots;
-    }
     if (tp->gates_per_token == 0)
         return (uint32_t)((seq - 1) % tp->n_slots);
     return tp->gate_slot_start +
            (uint32_t)((seq - 1) % tp->gates_per_token) * tp->gate_slot_step;
 }
 
-/* Reap completions: send CQEs free send-queue slots, recv CQEs advance the
- * arrival watermark (UC is in-order, so gate seq recv completions arrive
- * monotonically).  Returns 0 on any completion error. */
-static int tp_rdma_drain_cq(ds4_tp *tp) {
-    ds4_tp_rdma *r = &tp->rdma;
+/* Reap completions for one link: send CQEs free send-queue slots, recv
+ * CQEs advance the arrival watermark (UC is in-order, so gate seq recv
+ * completions arrive monotonically).  Returns 0 on any completion error. */
+static int tp_rdma_drain_cq(ds4_tp *tp, int peer) {
+    ds4_tp_rdma_link *r = &tp->rdma[peer];
     struct ibv_wc wc[16];
     int n = ibv_poll_cq(r->cq, 16, wc);
     if (n < 0) return 0;
     for (int i = 0; i < n; i++) {
         if (wc[i].status != IBV_WC_SUCCESS) {
-            fprintf(stderr, "ds4-tp: rdma completion error: %s (wr_id %llu)\n",
-                    tp_wc_status_str(wc[i].status),
+            fprintf(stderr, "ds4-tp: rdma completion error (link %d): %s (wr_id %llu)\n",
+                    peer, tp_wc_status_str(wc[i].status),
                     (unsigned long long)wc[i].wr_id);
             return 0;
         }
         if (wc[i].opcode & IBV_WC_RECV) {
-            if (wc[i].wr_id & DS4_TP_RDMA_BLOCK_WR_TAG) {
-                if (wc[i].byte_len == 0) {
-                    fprintf(stderr, "ds4-tp: rdma verify-block receive of 0 bytes\n");
-                    return 0;
-                }
-                r->block_recv_done++;
-            } else if (wc[i].wr_id > r->recv_done) {
-                r->recv_done = wc[i].wr_id;
-            }
+            if (wc[i].wr_id > r->recv_done) r->recv_done = wc[i].wr_id;
         } else if (r->send_outstanding > 0) {
             r->send_outstanding--;
         }
@@ -1335,192 +1622,57 @@ static int tp_rdma_drain_cq(ds4_tp *tp) {
     return 1;
 }
 
-static int tp_rdma_ensure_work_requests(ds4_tp_rdma *r) {
-    if (r->win_sge && r->win_rwr && r->win_swr) return 1;
-    free(r->win_sge); free(r->win_rwr); free(r->win_swr);
-    const uint32_t recv = r->recv_depth ? r->recv_depth : 64u;
-    const uint32_t send = r->send_depth ? r->send_depth : 256u;
-    const uint32_t cap = recv > send ? recv : send;
-    r->win_sge = calloc(2u * cap, sizeof(*r->win_sge));
-    r->win_rwr = calloc(cap, sizeof(*r->win_rwr));
-    r->win_swr = calloc(cap, sizeof(*r->win_swr));
-    if (!r->win_sge || !r->win_rwr || !r->win_swr) {
-        fprintf(stderr, "ds4-tp: work-request allocation failed\n");
-        return 0;
-    }
-    return 1;
-}
-
-/* Verify-block window helpers. */
-static int tp_rdma_block_post_layer(ds4_tp *tp, uint32_t layer) {
-    ds4_tp_rdma *r = &tp->rdma;
-    const uint32_t rows = r->block_rows;
-    const uint32_t chunks = (uint32_t)((tp->vec_bytes + DS4_TP_RDMA_MAX_MSG - 1u) /
-                                       DS4_TP_RDMA_MAX_MSG);
-    const uint32_t n = rows * chunks;
-    if (n == 0 || n > r->recv_depth || !tp_rdma_ensure_work_requests(r)) return 0;
-    struct ibv_sge *sge = r->win_sge;
-    struct ibv_recv_wr *wr = r->win_rwr;
-    memset(wr, 0, (size_t)n * sizeof(*wr));
-    const uintptr_t base =
-        (uintptr_t)(tp->slab + ds4_tp_slab_batch_in_offset(tp, layer));
-    uint32_t wi = 0;
-    for (uint32_t row = 0; row < rows; row++) {
-        for (uint64_t off = 0; off < tp->vec_bytes; ) {
-            const uint64_t len = tp->vec_bytes - off > DS4_TP_RDMA_MAX_MSG ?
-                DS4_TP_RDMA_MAX_MSG : tp->vec_bytes - off;
-            const int last = off + len == tp->vec_bytes;
-            sge[wi].addr = base + (uintptr_t)row * tp->vec_bytes + off;
-            sge[wi].length = (uint32_t)len;
-            sge[wi].lkey = r->mr->lkey;
-            wr[wi].wr_id = last ?
-                (DS4_TP_RDMA_BLOCK_WR_TAG | ((uint64_t)layer * rows + row + 1u)) : 0;
-            wr[wi].sg_list = &sge[wi];
-            wr[wi].num_sge = 1;
-            if (wi != 0) wr[wi - 1u].next = &wr[wi];
-            wi++;
-            off += len;
-        }
-    }
-    struct ibv_recv_wr *bad = NULL;
-    if (ibv_post_recv(r->qp, wr, &bad) != 0) {
-        fprintf(stderr, "ds4-tp: rdma verify-block post_recv(layer %u): %s\n",
-                layer, strerror(errno));
-        return 0;
-    }
-    r->block_posted = layer + 1u;
-    return 1;
-}
-
-static int tp_rdma_block_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows) {
-    ds4_tp_rdma *r = &tp->rdma;
-    if (!r->block_active || rows != r->block_rows || layer >= r->block_layers ||
-        layer + 1u != r->block_posted) {
-        fprintf(stderr, "ds4-tp: verify-block gate out of order (layer %u rows %u, posted %u/%u rows %u)\n",
-                layer, rows, r->block_posted, r->block_layers, r->block_rows);
-        return 0;
-    }
-    pthread_mutex_lock(&r->post_lock);
-    int ok = 1;
-    /* Post the next layer's receives BEFORE this layer's sends: the peer
-     * can only send layer+1 after it has received this send, so its send
-     * never reaches an unposted queue. */
-    if (layer + 1u < r->block_layers) ok = tp_rdma_block_post_layer(tp, layer + 1u);
-    const uint32_t chunks = (uint32_t)((tp->vec_bytes + DS4_TP_RDMA_MAX_MSG - 1u) /
-                                       DS4_TP_RDMA_MAX_MSG);
-    const uint32_t n = rows * chunks;
-    if (ok) {
-        struct ibv_sge *sge = r->win_sge + r->recv_depth / 2u;   /* separate half of the arrays */
-        struct ibv_send_wr *wr = r->win_swr;
-        if (n > r->recv_depth / 2u || n > r->send_depth) ok = 0;
-        if (ok) {
-            memset(wr, 0, (size_t)n * sizeof(*wr));
-            const uintptr_t base =
-                (uintptr_t)(tp->slab + ds4_tp_slab_batch_out_offset(tp, layer));
-            uint32_t wi = 0;
-            for (uint32_t row = 0; row < rows; row++) {
-                for (uint64_t off = 0; off < tp->vec_bytes; ) {
-                    const uint64_t len = tp->vec_bytes - off > DS4_TP_RDMA_MAX_MSG ?
-                        DS4_TP_RDMA_MAX_MSG : tp->vec_bytes - off;
-                    sge[wi].addr = base + (uintptr_t)row * tp->vec_bytes + off;
-                    sge[wi].length = (uint32_t)len;
-                    sge[wi].lkey = r->mr->lkey;
-                    wr[wi].wr_id = DS4_TP_RDMA_BLOCK_WR_TAG | 1u;
-                    wr[wi].sg_list = &sge[wi];
-                    wr[wi].num_sge = 1;
-                    wr[wi].opcode = IBV_WR_SEND;
-                    wr[wi].send_flags = IBV_SEND_SIGNALED;
-                    if (wi != 0) wr[wi - 1u].next = &wr[wi];
-                    wi++;
-                    off += len;
-                }
-            }
-            struct ibv_send_wr *bad = NULL;
-            if (ibv_post_send(r->qp, wr, &bad) != 0) {
-                fprintf(stderr, "ds4-tp: rdma verify-block post_send(layer %u): %s\n",
-                        layer, strerror(errno));
-                ok = 0;
-            } else {
-                r->send_outstanding += n;
-            }
-        }
-    }
-    pthread_mutex_unlock(&r->post_lock);
-    const uint64_t want = (uint64_t)(layer + 1u) * rows;
-    double deadline = 0.0;
-    uint32_t peer_poll = 0;
-    while (ok && r->block_recv_done < want) {
-        ok = tp_rdma_drain_cq(tp);
-        if (ok && (++peer_poll & 0x3fffu) == 0 && tp_peer_closed(tp)) {
-            fprintf(stderr, "ds4-tp: peer disconnected during verify-block gate\n");
-            ok = 0;
-        }
-        if (deadline == 0.0) deadline = tp_now_sec() + (double)tp->gate_timeout_ms / 1000.0;
-        else if (tp_now_sec() > deadline) {
-            fprintf(stderr, "ds4-tp: timeout waiting verify-block gate layer %u (%llu/%llu rows)\n",
-                    layer, (unsigned long long)r->block_recv_done, (unsigned long long)want);
-            ok = 0;
-        }
-    }
-    return ok;
-}
-
-/* Arm the receive for gate seq: UC delivery order pairs the peer's seq'th
- * send with our seq'th posted recv, landing it in the in-slot the combine
- * kernel reads. */
-static int tp_rdma_post_gate_recv(ds4_tp *tp, uint64_t seq) {
-    ds4_tp_rdma *r = &tp->rdma;
+/* Arm the receive for gate seq on one link: UC delivery order pairs the
+ * peer's seq'th send with our seq'th posted recv, landing it in that
+ * peer's labeled in-slot. */
+static int tp_rdma_post_gate_recv(ds4_tp *tp, int peer, uint64_t seq) {
+    ds4_tp_rdma_link *r = &tp->rdma[peer];
     const uint32_t slot = tp_gate_slot(tp, seq);
     const uintptr_t base =
-        (uintptr_t)(tp->slab + tp->in_off + (uint64_t)slot * tp->vec_bytes);
+        (uintptr_t)(tp->slab + tp->in_off +
+                    (uint64_t)slot * tp->in_peer_bytes +
+                    tp_in_peer_index(tp, peer) * tp->vec_bytes);
     /* Vectors above the driver's 16KB message cap ride as two chunks
      * landing contiguously in the slot. UC delivery is in-order and both
      * sides post/send strictly in seq order, so the k'th send always
      * matches the k'th recv; only the FINAL chunk carries the seq as
      * wr_id, so the arrival watermark advances when the slot is whole. */
-    struct ibv_sge sge[2];
-    struct ibv_recv_wr wr[2];
-    memset(wr, 0, sizeof(wr));
-    uint32_t count = 0;
-    for (uint64_t off = 0; off < tp->vec_bytes; count++) {
+    uint64_t off = 0;
+    while (off < tp->vec_bytes) {
         const uint64_t len = tp->vec_bytes - off > DS4_TP_RDMA_MAX_MSG ?
             DS4_TP_RDMA_MAX_MSG : tp->vec_bytes - off;
         const int last = off + len == tp->vec_bytes;
-        sge[count].addr = base + off;
-        sge[count].length = (uint32_t)len;
-        sge[count].lkey = r->mr->lkey;
-        wr[count].wr_id = last ? seq : 0;
-        wr[count].sg_list = &sge[count];
-        wr[count].num_sge = 1;
-        if (count != 0) wr[count - 1u].next = &wr[count];
+        struct ibv_sge sge;
+        struct ibv_recv_wr wr, *bad = NULL;
+        memset(&wr, 0, sizeof(wr));
+        sge.addr = base + off;
+        sge.length = (uint32_t)len;
+        sge.lkey = r->mr->lkey;
+        wr.wr_id = last ? seq : 0;
+        wr.sg_list = &sge;
+        wr.num_sge = 1;
+        if (ibv_post_recv(r->qp, &wr, &bad) != 0) {
+            fprintf(stderr, "ds4-tp: rdma post_recv(link %d seq %llu off %llu): %s\n",
+                    peer, (unsigned long long)seq, (unsigned long long)off,
+                    strerror(errno));
+            return 0;
+        }
         off += len;
-    }
-    struct ibv_recv_wr *bad = NULL;
-    if (ibv_post_recv(r->qp, wr, &bad) != 0) {
-        fprintf(stderr, "ds4-tp: rdma post_recv(seq %llu): %s\n",
-                (unsigned long long)seq, strerror(errno));
-        return 0;
     }
     return 1;
 }
 
-/* One decode gate: ensure the receive window is armed, send our partial,
- * wait for the peer's receive completion, and advance the window. */
-/* Per-gate-kind RDMA timing (DS4_TP_GATE_PROFILE): post cost and the wait
- * for the peer's partial, printed every 860 gates. */
-static double g_rdma_stat_post_us[2];
-static double g_rdma_stat_wait_us[2];
-static uint64_t g_rdma_stat_count[2];
-static int g_rdma_stat_enabled = -1;
-
-static int tp_rdma_window_barrier(ds4_tp *tp, uint8_t tag);
-
+/* Canonical rank-order combine for world>2: sum partial[0] + partial[1] +
+ * ... + partial[world-1] in rank order into the combined slot, where
+ * partial[i] is the local out vector when i==rank and the peer's labeled
+ * in vector otherwise.  The identical expression on every rank keeps the
+ * hidden states bit-exact across the mesh. */
+/* One decode gate: broadcast/gather over every link.  Each rank sends its
+ * partial to all peers, posts receives from all peers, waits for every
+ * recv completion, then (world>2) folds the canonical rank-order sum into
+ * the combined slot for the GPU combine. */
 static int tp_rdma_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint64_t seq) {
-    ds4_tp_rdma *r = &tp->rdma;
     const uint32_t slot = layer * DS4_TP_GATES_PER_LAYER + gate;
-    if (g_rdma_stat_enabled < 0) g_rdma_stat_enabled = getenv("DS4_TP_GATE_PROFILE") != NULL;
-    const double st0 = g_rdma_stat_enabled ? tp_now_sec() : 0.0;
-    double st1 = 0.0;
     if (getenv("DS4_TP_GATE_TRACE")) {
         fprintf(stderr, "ds4-tp: gate trace l=%u g=%u seq=%llu want_slot=%u\n",
                 layer, gate, (unsigned long long)seq, tp_gate_slot(tp, seq));
@@ -1532,93 +1684,241 @@ static int tp_rdma_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint
     }
     const uintptr_t send_base =
         (uintptr_t)(tp->slab + tp->out_off + (uint64_t)slot * tp->vec_bytes);
-    pthread_mutex_lock(&r->post_lock);
     int ok = 1;
-    if (!r->recv_window_active) {
-        for (uint64_t s = seq; ok && s < seq + DS4_TP_RDMA_RECV_WINDOW; s++)
-            ok = tp_rdma_post_gate_recv(tp, s);
-        /* UC does not retry a send that arrives before the peer posts its
-         * receive. This is needed once per window, not at every decode gate. */
-        if (ok) ok = tp_rdma_window_barrier(tp, 0xD1u);
-        if (ok) r->recv_window_active = true;
-    }
-    struct ibv_sge send_sge[2];
-    struct ibv_send_wr send_wr[2];
-    memset(send_wr, 0, sizeof(send_wr));
-    uint32_t send_count = 0;
-    for (uint64_t off = 0; ok && off < tp->vec_bytes; send_count++) {
-        const uint64_t len = tp->vec_bytes - off > DS4_TP_RDMA_MAX_MSG ?
-            DS4_TP_RDMA_MAX_MSG : tp->vec_bytes - off;
-        send_sge[send_count].addr = send_base + off;
-        send_sge[send_count].length = (uint32_t)len;
-        send_sge[send_count].lkey = r->mr->lkey;
-        send_wr[send_count].wr_id = seq;
-        send_wr[send_count].sg_list = &send_sge[send_count];
-        send_wr[send_count].num_sge = 1;
-        send_wr[send_count].opcode = IBV_WR_SEND;
-        send_wr[send_count].send_flags = IBV_SEND_SIGNALED;
-        if (send_count != 0) send_wr[send_count - 1u].next = &send_wr[send_count];
-        off += len;
-    }
-    if (ok) {
-        struct ibv_send_wr *bad = NULL;
-        ok = ibv_post_send(r->qp, send_wr, &bad) == 0;
-        if (!ok) {
-            fprintf(stderr, "ds4-tp: rdma post_send: %s\n", strerror(errno));
-        } else {
-            r->send_outstanding += send_count;
+    /* Arm each link's lookahead window and post this gate's send. */
+    for (int m = 0; ok && m < tp->world; m++) {
+        if (m == tp->rank) continue;
+        ds4_tp_rdma_link *r = &tp->rdma[m];
+        pthread_mutex_lock(&r->post_lock);
+        if (!r->recv_window_active) {
+            for (uint64_t s = seq; ok && s < seq + DS4_TP_RDMA_RECV_WINDOW; s++)
+                ok = tp_rdma_post_gate_recv(tp, m, s);
+            if (ok) r->recv_window_active = true;
         }
+        for (uint64_t off = 0; ok && off < tp->vec_bytes; ) {
+            const uint64_t len = tp->vec_bytes - off > DS4_TP_RDMA_MAX_MSG ?
+                DS4_TP_RDMA_MAX_MSG : tp->vec_bytes - off;
+            struct ibv_sge sge;
+            struct ibv_send_wr wr, *bad = NULL;
+            memset(&wr, 0, sizeof(wr));
+            sge.addr = send_base + off;
+            sge.length = (uint32_t)len;
+            sge.lkey = r->mr->lkey;
+            wr.wr_id = seq;
+            wr.sg_list = &sge;
+            wr.num_sge = 1;
+            wr.opcode = IBV_WR_SEND;
+            wr.send_flags = IBV_SEND_SIGNALED;
+            ok = ibv_post_send(r->qp, &wr, &bad) == 0;
+            if (!ok) {
+                fprintf(stderr, "ds4-tp: rdma post_send(link %d): %s\n",
+                        m, strerror(errno));
+            } else {
+                r->send_outstanding++;
+            }
+            off += len;
+        }
+        pthread_mutex_unlock(&r->post_lock);
     }
-    if (g_rdma_stat_enabled) st1 = tp_now_sec();
 
     double deadline = 0.0;
     uint32_t peer_poll = 0;
-    while (ok && r->recv_done < seq) {
-        ok = tp_rdma_drain_cq(tp);
-        if (ok && (++peer_poll & 0x3fffu) == 0 && tp_peer_closed(tp)) {
-            fprintf(stderr, "ds4-tp: peer disconnected during RDMA gate\n");
-            ok = 0;
+    while (ok) {
+        bool all_done = true;
+        for (int m = 0; m < tp->world; m++) {
+            if (m == tp->rank) continue;
+            if (tp->rdma[m].recv_done < seq) { all_done = false; break; }
         }
-        if (deadline == 0.0) {
-            deadline = tp_now_sec() + (double)tp->gate_timeout_ms / 1000.0;
+        if (all_done) break;
+        for (int m = 0; ok && m < tp->world; m++) {
+            if (m == tp->rank) continue;
+            if (!tp_rdma_drain_cq(tp, m)) ok = 0;
         }
+        if (ok && (peer_poll++ & 0x3fffu) == 0) {
+            for (int m = 0; ok && m < tp->world; m++) {
+                if (m == tp->rank) continue;
+                if (tp_peer_closed(tp, m)) {
+                    fprintf(stderr, "ds4-tp: peer %d disconnected during RDMA gate\n", m);
+                    ok = 0;
+                }
+            }
+        }
+        if (deadline == 0.0) deadline = tp_now_sec() + (double)tp->timeout_sec;
         else if (tp_now_sec() > deadline) {
-            fprintf(stderr, "ds4-tp: timeout waiting gate seq %llu (recv_done %llu)\n",
-                    (unsigned long long)seq, (unsigned long long)r->recv_done);
+            fprintf(stderr, "ds4-tp: timeout waiting gate seq %llu\n",
+                    (unsigned long long)seq);
             ok = 0;
         }
     }
-    if (g_rdma_stat_enabled && ok && gate < 2u) {
-        const double st2 = tp_now_sec();
-        g_rdma_stat_post_us[gate] += (st1 - st0) * 1e6;
-        g_rdma_stat_wait_us[gate] += (st2 - st1) * 1e6;
-        if (++g_rdma_stat_count[gate] % 430 == 0) {
-            fprintf(stderr, "ds4-tp: rdma gate %u: post %.1f us, peer wait %.1f us (n=%llu)\n",
-                    gate, g_rdma_stat_post_us[gate] / (double)g_rdma_stat_count[gate],
-                    g_rdma_stat_wait_us[gate] / (double)g_rdma_stat_count[gate],
-                    (unsigned long long)g_rdma_stat_count[gate]);
-        }
+    for (int m = 0; ok && m < tp->world; m++) {
+        if (m == tp->rank) continue;
+        ds4_tp_rdma_link *r = &tp->rdma[m];
+        pthread_mutex_lock(&r->post_lock);
+        ok = tp_rdma_post_gate_recv(tp, m, seq + DS4_TP_RDMA_RECV_WINDOW);
+        if (ok) r->last_gate_seq = seq;
+        pthread_mutex_unlock(&r->post_lock);
     }
-    if (ok) ok = tp_rdma_post_gate_recv(tp, seq + DS4_TP_RDMA_RECV_WINDOW);
-    if (ok) r->last_gate_seq = seq;
-    pthread_mutex_unlock(&r->post_lock);
+    if (ok && tp->world > 2) tp_combine(tp, layer, gate);
     return ok;
 }
 
-static int tp_rdma_big_gate_capable(const ds4_tp *tp) {
+/* Ring all-reduce for one decode gate (world>2 partial mesh).  Every node
+ * circulates its running sum to ring-next and folds in ring-prev's message;
+ * after world-1 hops every rank holds the identical full-row sum.  The
+ * world-1 hop recvs land in this gate slot's per-peer in regions (unused by
+ * the ring combine), with wr_id = seq*16 + hop so the per-link recv_done
+ * watermark tracks per-hop completion.  The ring shares one monotonic seq
+ * counter across every gate type, so the watermark stays ordered. */
+/* RDMA ring all-reduce has no per-message TCP barrier (unlike the classic
+ * gate), so the peer's hop-0 send can overtake our recv posting when ring
+ * waves drift, scrambling the UC matching (recv k pairs with send k+j).
+ * Fix: a one-byte ready handshake per gate on the data sockets -- each rank
+ * tells its prev it has posted recvs, and waits for its next to post recvs
+ * before sending.  The handshake forms a ring in the reverse direction and
+ * bounds the skew to zero. */
+static int tp_rdma_ring_ready(ds4_tp *tp) {
+    const int next = (tp->rank + 1) % tp->world;
+    const int prev = (tp->rank + tp->world - 1) % tp->world;
+    char go = 0;
+    if (!tp_write_full(tp->data_fd[prev], &go, 1)) return 0;
+    if (!tp_read_full(tp->data_fd[next], &go, 1)) return 0;
+    return 1;
+}
+
+static int tp_rdma_gate_exchange_ring(ds4_tp *tp, uint32_t layer, uint32_t gate,
+                                      uint64_t seq) {
+    const uint32_t slot = layer * DS4_TP_GATES_PER_LAYER + gate;
+    if (slot != tp_gate_slot(tp, seq)) return 0;
+    if (!tp_rdma_ring_ready(tp)) return 0;
+    const int next = (tp->rank + 1) % tp->world;
+    const int prev = (tp->rank + tp->world - 1) % tp->world;
+    if (tp->data_fd[next] < 0 || tp->data_fd[prev] < 0) return 0;
+    ds4_tp_rdma_link *rn = &tp->rdma[next];
+    ds4_tp_rdma_link *rp = &tp->rdma[prev];
+    float *accum = (float *)(tp->slab + tp->combined_off +
+                             (uint64_t)slot * tp->vec_bytes);
+    const float *out = (const float *)(tp->slab + tp->out_off +
+                                       (uint64_t)slot * tp->vec_bytes);
+    const uint64_t words = tp->vec_bytes / sizeof(float);
+    const uint32_t hops = (uint32_t)tp->world - 1u;
+
+    pthread_mutex_lock(&rp->post_lock);
+    for (uint32_t h = 0; h < hops; h++) {
+        uintptr_t base = (uintptr_t)(tp->slab + tp->in_off +
+            (uint64_t)slot * tp->in_peer_bytes + (uint64_t)h * tp->vec_bytes);
+        uint64_t off = 0;
+        while (off < tp->vec_bytes) {
+            const uint64_t len = tp->vec_bytes - off > DS4_TP_RDMA_MAX_MSG ?
+                DS4_TP_RDMA_MAX_MSG : tp->vec_bytes - off;
+            const int last = off + len == tp->vec_bytes;
+            struct ibv_sge sge;
+            struct ibv_recv_wr wr, *bad = NULL;
+            memset(&wr, 0, sizeof(wr));
+            sge.addr = base + off;
+            sge.length = (uint32_t)len;
+            sge.lkey = rp->mr->lkey;
+            wr.wr_id = last ? (uint64_t)seq * 16u + h : 0;
+            wr.sg_list = &sge;
+            wr.num_sge = 1;
+            if (ibv_post_recv(rp->qp, &wr, &bad) != 0) {
+                fprintf(stderr,
+                        "ds4-tp: ring rdma post_recv(prev seq %llu hop %u): %s\n",
+                        (unsigned long long)seq, h, strerror(errno));
+                pthread_mutex_unlock(&rp->post_lock);
+                return 0;
+            }
+            off += len;
+        }
+    }
+    pthread_mutex_unlock(&rp->post_lock);
+
+    int ok = 1;
+    for (uint32_t h = 0; ok && h < hops; h++) {
+        /* Send the relay message: this rank's own partial on hop 0, then the
+         * message received on the previous hop (each node relays each
+         * partial once around the ring). */
+        const void *relay = h == 0 ? (const void *)out :
+            (const void *)(tp->slab + tp->in_off +
+                (uint64_t)slot * tp->in_peer_bytes +
+                (uint64_t)(h - 1) * tp->vec_bytes);
+        const uintptr_t send_base = (uintptr_t)relay;
+        pthread_mutex_lock(&rn->post_lock);
+        for (uint64_t off = 0; ok && off < tp->vec_bytes; ) {
+            const uint64_t len = tp->vec_bytes - off > DS4_TP_RDMA_MAX_MSG ?
+                DS4_TP_RDMA_MAX_MSG : tp->vec_bytes - off;
+            struct ibv_sge sge;
+            struct ibv_send_wr wr, *bad = NULL;
+            memset(&wr, 0, sizeof(wr));
+            sge.addr = send_base + off;
+            sge.length = (uint32_t)len;
+            sge.lkey = rn->mr->lkey;
+            wr.wr_id = seq;
+            wr.sg_list = &sge;
+            wr.num_sge = 1;
+            wr.opcode = IBV_WR_SEND;
+            wr.send_flags = IBV_SEND_SIGNALED;
+            ok = ibv_post_send(rn->qp, &wr, &bad) == 0;
+            if (!ok) {
+                fprintf(stderr, "ds4-tp: ring rdma post_send(next seq %llu hop %u): %s\n",
+                        (unsigned long long)seq, h, strerror(errno));
+            } else {
+                rn->send_outstanding++;
+            }
+            off += len;
+        }
+        pthread_mutex_unlock(&rn->post_lock);
+        if (!ok) return 0;
+
+        double deadline = tp_now_sec() + (double)tp->timeout_sec;
+        uint32_t peer_poll = 0;
+        while (ok && rp->recv_done < (uint64_t)seq * 16u + h) {
+            /* Drain both links: prev's CQ reaps the hop recv, next's CQ
+             * reaps this hop's sends (each link has its own CQ; without the
+             * next drain the send queue fills and post_send returns EAGAIN). */
+            ok = tp_rdma_drain_cq(tp, prev);
+            if (ok) ok = tp_rdma_drain_cq(tp, next);
+            if (ok && (peer_poll++ & 0x3fffu) == 0) {
+                if (tp_peer_closed(tp, prev) || tp_peer_closed(tp, next)) {
+                    fprintf(stderr, "ds4-tp: peer %d/%d disconnected during ring gate\n",
+                            prev, next);
+                    ok = 0;
+                }
+            }
+            if (tp_now_sec() > deadline) {
+                fprintf(stderr,
+                        "ds4-tp: ring timeout gate seq %llu hop %u (recv_done %llu)\n",
+                        (unsigned long long)seq, h,
+                        (unsigned long long)rp->recv_done);
+                ok = 0;
+            }
+        }
+        if (!ok) return 0;
+    }
+    /* Canonical rank-order fold: every rank sums partial[0..world-1] in the
+     * same FP order, keeping the hidden state bit-exact across the ring. */
+    tp_ring_fold(tp, out,
+                 (const float *)(tp->slab + tp->in_off +
+                     (uint64_t)slot * tp->in_peer_bytes),
+                 words, words, accum);
+    return 1;
+}
+
+
+static int tp_rdma_big_gate_capable(const ds4_tp *tp, int peer) {
     const uint64_t stage_bytes =
         (uint64_t)DS4_TP_RDMA_BULK_SLOTS * DS4_TP_RDMA_MAX_MSG;
     const uint64_t batch_region_bytes =
         (uint64_t)tp->n_layer * DS4_TP_BATCH_MAX_ROWS * tp->vec_bytes;
-    return tp->rdma.qp && tp->rdma.mr && batch_region_bytes >= stage_bytes;
+    return tp->rdma[peer].qp && tp->rdma[peer].mr &&
+           batch_region_bytes >= stage_bytes;
 }
 
 /* Decode keeps a lookahead window of receives on the latency QP. Before a
  * later prompt can reuse that QP for bulk rows, consume those receives with
- * dummy sends on both ranks. The TCP big-gate header exchange is the barrier
- * that guarantees both sides have reached this transition. */
-static int tp_rdma_drain_decode_window(ds4_tp *tp) {
-    ds4_tp_rdma *r = &tp->rdma;
+ * dummy sends on both ends of the link. The TCP big-gate header exchange is
+ * the barrier that guarantees both sides have reached this transition. */
+static int tp_rdma_drain_decode_window(ds4_tp *tp, int peer) {
+    ds4_tp_rdma_link *r = &tp->rdma[peer];
     if (!r->recv_window_active) return 1;
 
     const uint32_t chunks_per_gate =
@@ -1643,7 +1943,7 @@ static int tp_rdma_drain_decode_window(ds4_tp *tp) {
             wr[wi].sg_list = &sge[wi];
             wr[wi].num_sge = 1;
             wr[wi].opcode = IBV_WR_SEND;
-            wr[wi].send_flags = IBV_SEND_SIGNALED;
+            wr[wi].send_flags = wi + 1u == nwr ? IBV_SEND_SIGNALED : 0;
             if (wi > 0) wr[wi - 1u].next = &wr[wi];
             wi++;
             off += len;
@@ -1660,11 +1960,10 @@ static int tp_rdma_drain_decode_window(ds4_tp *tp) {
     }
 
     uint32_t recv_done = 0;
-    uint32_t send_done = 0;
-    const double deadline =
-        tp_now_sec() + (double)tp->gate_timeout_ms / 1000.0;
+    int send_done = 0;
+    const double deadline = tp_now_sec() + (double)tp->timeout_sec;
     uint32_t peer_poll = 0;
-    while (recv_done < nwr || send_done < nwr || r->send_outstanding) {
+    while (recv_done < nwr || !send_done) {
         struct ibv_wc wc[DS4_TP_RDMA_RECV_WINDOW * 2u + 1u];
         int n = ibv_poll_cq(r->cq,
                            (int)(DS4_TP_RDMA_RECV_WINDOW * 2u + 1u), wc);
@@ -1682,14 +1981,15 @@ static int tp_rdma_drain_decode_window(ds4_tp *tp) {
             if (wc[i].opcode & IBV_WC_RECV) {
                 recv_done++;
             } else if (wc[i].wr_id & DS4_TP_RDMA_BULK_WR_TAG) {
-                send_done++;
+                send_done = 1;
             } else if (r->send_outstanding > 0) {
                 r->send_outstanding--;
             }
         }
-        if ((peer_poll++ & 0x3fffu) == 0 && tp_peer_closed(tp)) {
+        if ((peer_poll++ & 0x3fffu) == 0 && tp_peer_closed(tp, peer)) {
             fprintf(stderr,
-                    "ds4-tp: peer disconnected while draining RDMA receives\n");
+                    "ds4-tp: peer %d disconnected while draining RDMA receives\n",
+                    peer);
             pthread_mutex_unlock(&r->post_lock);
             return 0;
         }
@@ -1710,209 +2010,214 @@ static int tp_rdma_drain_decode_window(ds4_tp *tp) {
 /* Large prefill row swaps share the latency QP.  No future decode receives
  * are queued, so each round can post its 1 MiB receive window before sending
  * the matching 16 KiB messages.  Verify scratch provides already-registered
- * staging memory and is idle during normal prefill. */
-/* One-byte barrier on the batch socket: both sides have their receives
- * posted for the coming window before either posts a send (a UC send with
- * no receive posted kills that direction on this driver). */
-static int tp_rdma_window_barrier(ds4_tp *tp, uint8_t tag) {
-    uint8_t peer = 0;
-    if (!tp_write_full(tp->data_fd, &tag, 1) || !tp_read_full(tp->data_fd, &peer, 1)) return 0;
-    return peer == tag;
-}
+ * staging memory and is idle during normal prefill.  Per-link: sends `out`
+ * to peer and receives the peer's `in` into `in` (world>2 callers provide a
+ * per-peer buffer of (world-1)*bytes). */
+/* Parallel bulk exchange state: each peer's 25 MB prefill gate is chunked
+ * into rounds of DS4_TP_RDMA_BULK_SLOTS x 16 KB messages.  The per-peer
+ * transfers are posted on their own QP/link so all peers advance
+ * concurrently; the previous implementation ran the three peers strictly
+ * one after another, making the gate latency 3x the round-trip count. */
+typedef struct {
+    int        peer;
+    const void *out;
+    void       *in;
+    uint64_t   bytes;
+    int        direct;
+    uint64_t   stage_send_off;
+    uint64_t   stage_recv_off;
+    uint64_t   off;
+    uint32_t   chunks;
+    uint64_t   round_bytes;
+    uint64_t   chunk_off[DS4_TP_RDMA_BULK_SLOTS];
+    uint32_t   lens[DS4_TP_RDMA_BULK_SLOTS];
+    uint32_t   recv_done;
+    int        send_done;
+    int        posted;
+} tp_rdma_bulk_peer;
 
-/* Big-gate exchange (prefill partials): windows of up to recv_depth
- * messages; every window posts its receives, crosses the barrier, then
- * streams sends in send-depth sub-batches. Metal-owned payloads are staged
- * through the registered slab because Apple's verbs provider rejects direct
- * registration of these buffers. */
-static int tp_rdma_big_gate_exchange(ds4_tp *tp,
-                                     const void *out,
-                                     void *in,
-                                     uint64_t bytes) {
-    ds4_tp_rdma *r = &tp->rdma;
-    if (!tp_rdma_big_gate_capable(tp) || r->recv_window_active) {
-        fprintf(stderr, "ds4-tp: big gate unavailable or decode window still active\n");
-        return 0;
-    }
+static int tp_rdma_bulk_peer_init(ds4_tp *tp, tp_rdma_bulk_peer *st,
+                                  int peer, const void *out, void *in,
+                                  uint64_t bytes) {
+    ds4_tp_rdma_link *r = &tp->rdma[peer];
+    if (!tp_rdma_big_gate_capable(tp, peer) || r->recv_window_active) return 0;
     const uintptr_t slab_lo = (uintptr_t)tp->slab;
     const uintptr_t slab_hi = slab_lo + tp->slab_bytes;
     const uintptr_t out_lo = (uintptr_t)out;
     const uintptr_t in_lo = (uintptr_t)in;
-    const bool in_slab =
+    memset(st, 0, sizeof(*st));
+    st->peer = peer;
+    st->out = out;
+    st->in = in;
+    st->bytes = bytes;
+    st->direct =
         out_lo >= slab_lo && out_lo <= slab_hi && bytes <= slab_hi - out_lo &&
         in_lo >= slab_lo && in_lo <= slab_hi && bytes <= slab_hi - in_lo;
-    struct ibv_mr *out_mr = r->mr;
-    struct ibv_mr *in_mr = r->mr;
-    const bool direct = in_slab;
-    uint8_t *stage_send = tp->slab + tp->batch_out_off;
-    uint8_t *stage_recv = tp->slab + tp->batch_in_off;
-    const uint64_t stage_bytes = (uint64_t)tp->n_layer * DS4_TP_BATCH_MAX_ROWS * tp->vec_bytes;
-    uint32_t depth = r->recv_depth ? r->recv_depth : 64u;
-    if (depth > 256u) depth = 256u;
-    if (!direct) {
-        const uint32_t stage_slots = (uint32_t)(stage_bytes / DS4_TP_RDMA_MAX_MSG);
-        if (depth > stage_slots) depth = stage_slots;
-        if (depth == 0u) return 0;
-        out_mr = in_mr = r->mr;
+    const uint64_t pidx = tp_in_peer_index(tp, peer);
+    st->stage_send_off = tp->bulk_stage_off + pidx * tp->bulk_stage_bytes;
+    st->stage_recv_off = tp->bulk_stage_off +
+                         (uint64_t)(tp->world - 1) * tp->bulk_stage_bytes +
+                         pidx * tp->bulk_stage_bytes;
+    return 1;
+}
+
+/* Post one round of chunks for this peer (non-blocking). */
+static int tp_rdma_bulk_peer_post(ds4_tp *tp, tp_rdma_bulk_peer *st) {
+    ds4_tp_rdma_link *r = &tp->rdma[st->peer];
+    if (st->posted || st->off >= st->bytes) return 1;
+    const uint64_t remaining = st->bytes - st->off;
+    uint32_t chunks = (uint32_t)((remaining + DS4_TP_RDMA_MAX_MSG - 1u) /
+                                 DS4_TP_RDMA_MAX_MSG);
+    if (chunks > DS4_TP_RDMA_BULK_SLOTS) chunks = DS4_TP_RDMA_BULK_SLOTS;
+    uint8_t *stage_send = tp->slab + st->stage_send_off;
+    uint8_t *stage_recv = tp->slab + st->stage_recv_off;
+    uint64_t round_bytes = 0;
+    for (uint32_t i = 0; i < chunks; i++) {
+        const uint64_t left = remaining - round_bytes;
+        st->lens[i] = (uint32_t)(left > DS4_TP_RDMA_MAX_MSG ?
+                                 DS4_TP_RDMA_MAX_MSG : left);
+        st->chunk_off[i] = st->direct ? round_bytes :
+            (uint64_t)i * DS4_TP_RDMA_MAX_MSG;
+        if (!st->direct) {
+            memcpy(stage_send + st->chunk_off[i],
+                   (const uint8_t *)st->out + st->off + round_bytes,
+                   st->lens[i]);
+        }
+        round_bytes += st->lens[i];
     }
-    if (!tp_rdma_ensure_work_requests(r)) return 0;
-    const uint32_t send_depth = r->send_depth ? r->send_depth : 256u;
-    uint64_t off = 0;
-    uint8_t tag = 1;
-    while (off < bytes) {
-        const uint64_t remaining = bytes - off;
-        uint32_t chunks = (uint32_t)((remaining + DS4_TP_RDMA_MAX_MSG - 1u) / DS4_TP_RDMA_MAX_MSG);
-        if (chunks > depth) chunks = depth;
-        uint64_t win_bytes = 0;
-        for (uint32_t i = 0; i < chunks; i++) {
-            const uint64_t left = remaining - win_bytes;
-            const uint32_t len = (uint32_t)(left > DS4_TP_RDMA_MAX_MSG ? DS4_TP_RDMA_MAX_MSG : left);
-            const uint64_t coff = win_bytes;
-            if (!direct) {
-                memcpy(stage_send + coff, (const uint8_t *)out + off + coff, len);
-            }
-            r->win_sge[i] = (struct ibv_sge) {
-                .addr = direct ? in_lo + off + coff : (uintptr_t)(stage_recv + coff),
-                .length = len,
-                .lkey = in_mr->lkey,
-            };
-            memset(&r->win_rwr[i], 0, sizeof(r->win_rwr[i]));
-            r->win_rwr[i].wr_id = DS4_TP_RDMA_BULK_WR_TAG | ((uint64_t)i + 1u);
-            r->win_rwr[i].sg_list = &r->win_sge[i];
-            r->win_rwr[i].num_sge = 1;
-            r->win_rwr[i].next = i + 1u < chunks ? &r->win_rwr[i + 1u] : NULL;
-            r->win_sge[depth + i] = (struct ibv_sge) {
-                .addr = direct ? out_lo + off + coff : (uintptr_t)(stage_send + coff),
-                .length = len,
-                .lkey = out_mr->lkey,
-            };
-            win_bytes += len;
-        }
-        /* Post in chains of 64 (the chain length the driver is known to
-         * accept); the work requests are already linked, so cut the links at
-         * chain ends. */
-        for (uint32_t c0 = 0; c0 < chunks; c0 += 64u) {
-            const uint32_t c1 = c0 + 64u < chunks ? c0 + 64u : chunks;
-            r->win_rwr[c1 - 1u].next = NULL;
-            struct ibv_recv_wr *bad_recv = NULL;
-            if (ibv_post_recv(r->qp, &r->win_rwr[c0], &bad_recv) != 0) {
-                fprintf(stderr, "ds4-tp: big gate post_recv(%u of %u): %s\n", c0, chunks, strerror(errno));
-                return 0;
-            }
-        }
-        atomic_thread_fence(memory_order_release);
-        if (!tp_rdma_window_barrier(tp, tag)) {
-            fprintf(stderr, "ds4-tp: big gate window barrier failed\n");
+    st->chunks = chunks;
+    st->round_bytes = round_bytes;
+    st->recv_done = 0;
+    st->send_done = 0;
+
+    struct ibv_sge recv_sge[DS4_TP_RDMA_BULK_SLOTS];
+    struct ibv_recv_wr recv_wr[DS4_TP_RDMA_BULK_SLOTS];
+    memset(recv_wr, 0, sizeof(recv_wr));
+    for (uint32_t i = 0; i < chunks; i++) {
+        recv_sge[i] = (struct ibv_sge) {
+            .addr = st->direct ?
+                (uintptr_t)((uint8_t *)st->in + st->off + st->chunk_off[i]) :
+                (uintptr_t)(stage_recv + st->chunk_off[i]),
+            .length = st->lens[i],
+            .lkey = r->mr->lkey,
+        };
+        recv_wr[i].wr_id = DS4_TP_RDMA_BULK_WR_TAG | ((uint64_t)i + 1u);
+        recv_wr[i].sg_list = &recv_sge[i];
+        recv_wr[i].num_sge = 1;
+        recv_wr[i].next = i + 1u < chunks ? &recv_wr[i + 1u] : NULL;
+    }
+    struct ibv_recv_wr *bad_recv = NULL;
+    if (ibv_post_recv(r->qp, recv_wr, &bad_recv) != 0) {
+        fprintf(stderr, "ds4-tp: bulk rdma post_recv: %s\n", strerror(errno));
+        return 0;
+    }
+    atomic_thread_fence(memory_order_release);
+    struct ibv_sge send_sge[DS4_TP_RDMA_BULK_SLOTS];
+    struct ibv_send_wr send_wr[DS4_TP_RDMA_BULK_SLOTS];
+    memset(send_wr, 0, sizeof(send_wr));
+    for (uint32_t i = 0; i < chunks; i++) {
+        send_sge[i] = (struct ibv_sge) {
+            .addr = st->direct ?
+                (uintptr_t)((uint8_t *)st->out + st->off + st->chunk_off[i]) :
+                (uintptr_t)(stage_send + st->chunk_off[i]),
+            .length = st->lens[i],
+            .lkey = r->mr->lkey,
+        };
+        send_wr[i].wr_id = DS4_TP_RDMA_BULK_WR_TAG | ((uint64_t)i + 1u);
+        send_wr[i].sg_list = &send_sge[i];
+        send_wr[i].num_sge = 1;
+        send_wr[i].opcode = IBV_WR_SEND;
+        send_wr[i].send_flags = i + 1u == chunks ? IBV_SEND_SIGNALED : 0;
+        send_wr[i].next = i + 1u < chunks ? &send_wr[i + 1u] : NULL;
+    }
+    struct ibv_send_wr *bad_send = NULL;
+    if (ibv_post_send(r->qp, send_wr, &bad_send) != 0) {
+        fprintf(stderr, "ds4-tp: bulk rdma post_send: %s\n", strerror(errno));
+        return 0;
+    }
+    st->posted = 1;
+    return 1;
+}
+
+/* Poll this peer's CQ; advance the round when its chunks complete. */
+static int tp_rdma_bulk_peer_poll(ds4_tp *tp, tp_rdma_bulk_peer *st) {
+    ds4_tp_rdma_link *r = &tp->rdma[st->peer];
+    struct ibv_wc wc[DS4_TP_RDMA_BULK_SLOTS + 1u];
+    int n = ibv_poll_cq(r->cq, (int)(DS4_TP_RDMA_BULK_SLOTS + 1u), wc);
+    if (n < 0) return 0;
+    for (int i = 0; i < n; i++) {
+        if (wc[i].status != IBV_WC_SUCCESS) {
+            fprintf(stderr, "ds4-tp: bulk rdma completion error: %s\n",
+                    tp_wc_status_str(wc[i].status));
             return 0;
         }
-        tag++;
-        /* Apple also completes unsignaled sends. Request and count every
-         * message: counting those CQEs as completed batches releases staging
-         * memory while later sends still read it. */
-        uint32_t sent = 0, send_done = 0, recv_done = 0;
-        uint64_t recv_seen[4] = {0}, send_seen[4] = {0};
-        const double deadline = tp_now_sec() + (double)tp->gate_timeout_ms / 1000.0 + 2.0;
-        uint32_t peer_poll = 0;
-        while (recv_done < chunks || send_done < chunks) {
-            if (sent < chunks && sent - send_done < send_depth) {
-                uint32_t n = chunks - sent;
-                if (n > 64u) n = 64u;
-                if (n > send_depth - (sent - send_done))
-                    n = send_depth - (sent - send_done);
-                for (uint32_t i = 0; i < n; i++) {
-                    struct ibv_send_wr *w = &r->win_swr[i];
-                    memset(w, 0, sizeof(*w));
-                    w->wr_id = DS4_TP_RDMA_BULK_WR_TAG | ((uint64_t)(sent + i) + 1u);
-                    w->sg_list = &r->win_sge[depth + sent + i];
-                    w->num_sge = 1;
-                    w->opcode = IBV_WR_SEND;
-                    w->send_flags = IBV_SEND_SIGNALED;
-                    w->next = i + 1u < n ? &r->win_swr[i + 1u] : NULL;
-                }
-                struct ibv_send_wr *bad_send = NULL;
-                if (ibv_post_send(r->qp, r->win_swr, &bad_send) != 0) {
-                    fprintf(stderr, "ds4-tp: big gate post_send(%u): %s\n", n, strerror(errno));
-                    return 0;
-                }
-                sent += n;
+        if ((wc[i].wr_id & DS4_TP_RDMA_BULK_WR_TAG) == 0) {
+            /* A final latency-QP send completion can remain queued when a
+             * later prompt starts a bulk gate. */
+            if (wc[i].opcode & IBV_WC_RECV) {
+                if (wc[i].wr_id > r->recv_done) r->recv_done = wc[i].wr_id;
+            } else if (r->send_outstanding > 0) {
+                r->send_outstanding--;
             }
-            struct ibv_wc wc[64];
-            int nwc = ibv_poll_cq(r->cq, 64, wc);
-            if (nwc < 0) {
-                fprintf(stderr, "ds4-tp: big gate poll_cq failed at %llu/%llu bytes: %s\n",
-                    (unsigned long long)off, (unsigned long long)bytes, strerror(errno));
-                return 0;
-            }
-            for (int i = 0; i < nwc; i++) {
-                if (wc[i].status != IBV_WC_SUCCESS) {
-                    fprintf(stderr, "ds4-tp: big gate completion error: %s\n",
-                            tp_wc_status_str(wc[i].status));
-                    return 0;
-                }
-                if ((wc[i].wr_id & DS4_TP_RDMA_BULK_WR_TAG) == 0) {
-                    if (wc[i].opcode & IBV_WC_RECV) {
-                        if (wc[i].wr_id > r->recv_done) r->recv_done = wc[i].wr_id;
-                    } else if (r->send_outstanding > 0) {
-                        r->send_outstanding--;
-                    }
-                    continue;
-                }
-                const uint64_t idx = (wc[i].wr_id & ~DS4_TP_RDMA_BULK_WR_TAG) - 1u;
-                const bool received = (wc[i].opcode & IBV_WC_RECV) != 0;
-                uint64_t *seen = received ? recv_seen : send_seen;
-                if (idx >= (received ? chunks : sent) ||
-                    (seen[idx / 64u] & (UINT64_C(1) << (idx % 64u)))) {
-                    fprintf(stderr, "ds4-tp: duplicate or invalid big gate completion %llu\n",
-                        (unsigned long long)wc[i].wr_id);
-                    return 0;
-                }
-                seen[idx / 64u] |= UINT64_C(1) << (idx % 64u);
-                if (received) {
-                    const uint32_t want = idx + 1u < chunks || win_bytes % DS4_TP_RDMA_MAX_MSG == 0u
-                        ? (uint32_t)DS4_TP_RDMA_MAX_MSG : (uint32_t)(win_bytes % DS4_TP_RDMA_MAX_MSG);
-                    if (wc[i].byte_len != want) {
-                        fprintf(stderr, "ds4-tp: big gate chunk %llu received %u bytes, expected %u\n",
-                                (unsigned long long)idx, wc[i].byte_len, want);
-                        return 0;
-                    }
-                    recv_done++;
-                } else {
-                    send_done++;
-                }
-            }
-            if (nwc == 0 && (peer_poll++ & 0x3fffu) == 0 && tp_peer_closed(tp)) {
-                fprintf(stderr, "ds4-tp: peer disconnected during big gate\n");
-                return 0;
-            }
-            if (nwc == 0 && tp_now_sec() > deadline) {
-                fprintf(stderr, "ds4-tp: timeout in big gate window (%u/%u recvs, %u/%u sends, %u sent)\n",
-                        recv_done, chunks, send_done, chunks, sent);
-                return 0;
+            continue;
+        }
+        if (wc[i].opcode & IBV_WC_RECV) st->recv_done++;
+        else st->send_done = 1;
+    }
+    if (st->posted && st->recv_done >= st->chunks && st->send_done) {
+        if (!st->direct) {
+            uint64_t round_bytes = 0;
+            for (uint32_t i = 0; i < st->chunks; i++) {
+                memcpy((uint8_t *)st->in + st->off + round_bytes,
+                       tp->slab + st->stage_recv_off + st->chunk_off[i],
+                       st->lens[i]);
+                round_bytes += st->lens[i];
             }
         }
-        atomic_thread_fence(memory_order_acquire);
-        if (!direct) {
-            memcpy((uint8_t *)in + off, stage_recv, win_bytes);
+        st->off += st->round_bytes;
+        st->posted = 0;
+    }
+    return 1;
+}
+
+/* Drive one peer's bulk transfer to completion, posting each next round as
+ * the previous finishes so its rounds interleave with the other peers'. */
+static int tp_rdma_bulk_peer_finish(ds4_tp *tp, tp_rdma_bulk_peer *st) {
+    const double deadline = tp_now_sec() + (double)tp->timeout_sec;
+    uint32_t peer_poll = 0;
+    while (st->off < st->bytes) {
+        if (!st->posted) {
+            if (!tp_rdma_bulk_peer_post(tp, st)) return 0;
         }
-        off += win_bytes;
+        if (!tp_rdma_bulk_peer_poll(tp, st)) return 0;
+        if ((peer_poll++ & 0x3fffu) == 0 && tp_peer_closed(tp, st->peer)) {
+            fprintf(stderr,
+                    "ds4-tp: peer %d disconnected during bulk RDMA gate\n",
+                    st->peer);
+            return 0;
+        }
+        if (tp_now_sec() > deadline) {
+            fprintf(stderr,
+                    "ds4-tp: timeout waiting for bulk RDMA round (%u/%u "
+                    "recvs, send=%d)\n",
+                    st->recv_done, st->chunks, st->send_done);
+            return 0;
+        }
     }
     return 1;
 }
 
 static void tp_rdma_close(ds4_tp *tp) {
-    ds4_tp_rdma *r = &tp->rdma;
-    free(r->win_sge); free(r->win_rwr); free(r->win_swr);
-    r->win_sge = NULL; r->win_rwr = NULL; r->win_swr = NULL;
-    if (r->qp) r->api.destroy_qp(r->qp);
-    if (r->mr) r->api.dereg_mr(r->mr);
-    if (r->cq) r->api.destroy_cq(r->cq);
-    if (r->pd) r->api.dealloc_pd(r->pd);
-    if (r->ctx) r->api.close_device(r->ctx);
-    if (r->post_lock_ready) pthread_mutex_destroy(&r->post_lock);
-    if (r->api.handle) dlclose(r->api.handle);
-    r->api.handle = NULL;
-    r->post_lock_ready = false;
-    r->qp = NULL; r->mr = NULL; r->cq = NULL; r->pd = NULL; r->ctx = NULL;
+    ds4_tp_verbs_api *api = &tp->rdma_api;
+    for (int m = 0; m < DS4_TP_MAX_WORLD; m++) {
+        ds4_tp_rdma_link *r = &tp->rdma[m];
+        if (r->qp) api->destroy_qp(r->qp);
+        if (r->mr) api->dereg_mr(r->mr);
+        if (r->cq) api->destroy_cq(r->cq);
+        if (r->pd) api->dealloc_pd(r->pd);
+        if (r->ctx) api->close_device(r->ctx);
+        r->qp = NULL; r->mr = NULL; r->cq = NULL; r->pd = NULL; r->ctx = NULL;
+    }
 }
 
 #endif /* DS4_TP_HAVE_VERBS */
@@ -1921,8 +2226,21 @@ static void tp_rdma_close(ds4_tp *tp) {
  * Bring-up.
  * --------------------------------------------------------------------- */
 
-static int tp_hello_exchange(ds4_tp *tp, const ds4_tp_identity *id, int rdma_ok,
-                             char *err, size_t errlen) {
+/* DS4_TP_BIG_TCP: only an explicit true value (1/true/yes/on) forces the TCP
+ * ring bulk for the big gate; 0/false/no/off and empty disable it.  The
+ * choice is per-rank and is ANDed across ranks in the hello, so all ranks
+ * agree on the big-gate transport (mixed settings fall back to RDMA). */
+static int ds4_tp_big_tcp_env(void) {
+    const char *v = getenv("DS4_TP_BIG_TCP");
+    if (!v || !*v) return 0;
+    if (!strcmp(v, "0") || !strcmp(v, "false") || !strcmp(v, "no") ||
+        !strcmp(v, "off") || !strcmp(v, "FALSE") || !strcmp(v, "NO") ||
+        !strcmp(v, "OFF")) return 0;
+    return 1;
+}
+
+static int tp_hello_exchange(ds4_tp *tp, int peer, const ds4_tp_identity *id,
+                             int rdma_ok, char *err, size_t errlen) {
     ds4_tp_hello_fixed mine = {
         .magic = DS4_TP_MAGIC,
         .version = DS4_TP_PROTOCOL_VERSION,
@@ -1938,70 +2256,143 @@ static int tp_hello_exchange(ds4_tp *tp, const ds4_tp_identity *id, int rdma_ok,
         .gate_slot_start = id->gate_slot_start,
         .gate_slot_step = id->gate_slot_step,
         .gates_per_token = id->gates_per_token,
+        .world = (uint32_t)tp->world,
+        .rank = (uint32_t)tp->rank,
+        .big_tcp = (uint32_t)ds4_tp_big_tcp_env(),
     };
-    memcpy(mine.gate_slot_mask, id->gate_slot_mask,
-           sizeof(mine.gate_slot_mask));
     ds4_tp_hello_fixed theirs;
-    if (!tp_write_full(tp->control_fd, &mine, sizeof(mine)) ||
-        !tp_read_full(tp->control_fd, &theirs, sizeof(theirs))) {
-        tp_set_err(err, errlen, "tp hello exchange failed");
-        return 0;
+    int got_theirs = 0;
+    if (tp->ring) {
+        if (tp->rank == 0) {
+            if (!tp_ctrl_send(tp, peer, DS4_TP_FRAME_HELLO,
+                              &mine, sizeof(mine))) {
+                tp_set_err(err, errlen, "tp hello send failed");
+                return 0;
+            }
+            uint32_t type = 0, bytes = 0;
+            uint8_t *payload = NULL;
+            if (!tp_ctrl_recv(tp, peer, &type, &payload, &bytes) ||
+                type != DS4_TP_FRAME_HELLO || bytes != sizeof(theirs)) {
+                free(payload);
+                tp_set_err(err, errlen, "tp hello recv failed");
+                return 0;
+            }
+            memcpy(&theirs, payload, sizeof(theirs));
+            free(payload);
+            got_theirs = 1;
+        } else {
+            uint32_t type = 0, bytes = 0;
+            uint8_t *payload = NULL;
+            if (!tp_ctrl_recv(tp, 0, &type, &payload, &bytes) ||
+                type != DS4_TP_FRAME_HELLO || bytes != sizeof(theirs)) {
+                free(payload);
+                tp_set_err(err, errlen, "tp hello recv failed");
+                return 0;
+            }
+            memcpy(&theirs, payload, sizeof(theirs));
+            free(payload);
+            if (!tp_ctrl_send(tp, 0, DS4_TP_FRAME_HELLO,
+                              &mine, sizeof(mine))) {
+                tp_set_err(err, errlen, "tp hello send failed");
+                return 0;
+            }
+        }
+    } else {
+        const int fd = tp->control_fd[peer];
+        if (!tp_write_full(fd, &mine, sizeof(mine)) ||
+            !tp_read_full(fd, &theirs, sizeof(theirs))) {
+            tp_set_err(err, errlen, "tp hello exchange failed");
+            return 0;
+        }
+        got_theirs = 1;
     }
-    if (theirs.magic != DS4_TP_MAGIC) {
-        tp_set_err(err, errlen, "tp hello: bad magic (mixed byte order or wrong peer?)");
-        return 0;
-    }
-    if (theirs.version != DS4_TP_PROTOCOL_VERSION) {
-        tp_set_err(err, errlen, "tp hello: protocol version %u != %u",
-                   theirs.version, DS4_TP_PROTOCOL_VERSION);
-        return 0;
-    }
-    if (theirs.role == mine.role) {
-        tp_set_err(err, errlen, "tp hello: both sides claim role %u", mine.role);
-        return 0;
-    }
-    if (theirs.gguf_bytes != mine.gguf_bytes || theirs.model_id != mine.model_id ||
-        theirs.n_layer != mine.n_layer || theirs.n_embd != mine.n_embd ||
-        theirs.n_vocab != mine.n_vocab || theirs.quant_bits != mine.quant_bits ||
-        theirs.gate_slot_start != mine.gate_slot_start ||
-        theirs.gate_slot_step != mine.gate_slot_step ||
-        theirs.gates_per_token != mine.gates_per_token ||
-        memcmp(theirs.gate_slot_mask, mine.gate_slot_mask,
-               sizeof(mine.gate_slot_mask)) != 0) {
-        tp_set_err(err, errlen,
-                   "tp hello: model mismatch (peer gguf=%llu id=%u layers=%u embd=%u "
-                   "vocab=%u qbits=%u)",
-                   (unsigned long long)theirs.gguf_bytes, theirs.model_id,
-                   theirs.n_layer, theirs.n_embd, theirs.n_vocab, theirs.quant_bits);
-        return 0;
-    }
-    const uint32_t mask_count = tp_gate_mask_count(mine.gate_slot_mask);
-    const uint32_t n_slots = mine.n_layer * DS4_TP_GATES_PER_LAYER;
-    if ((mask_count != 0 && mask_count != mine.gates_per_token) ||
-        !tp_gate_mask_fits(mine.gate_slot_mask, n_slots)) {
-        tp_set_err(err, errlen,
-                   "tp hello: invalid gate schedule mask (%u bits, %u gates, %u slots)",
-                   mask_count, mine.gates_per_token, n_slots);
-        return 0;
+    if (got_theirs) {
+        if (theirs.magic != DS4_TP_MAGIC) {
+            tp_set_err(err, errlen, "tp hello: bad magic (mixed byte order or wrong peer?)");
+            return 0;
+        }
+        if (theirs.version != DS4_TP_PROTOCOL_VERSION) {
+            tp_set_err(err, errlen, "tp hello: protocol version %u != %u",
+                       theirs.version, DS4_TP_PROTOCOL_VERSION);
+            return 0;
+        }
+        if (theirs.world != (uint32_t)tp->world) {
+            tp_set_err(err, errlen, "tp hello: world %u != %u",
+                       theirs.world, tp->world);
+            return 0;
+        }
+        if (theirs.rank == (uint32_t)tp->rank) {
+            tp_set_err(err, errlen, "tp hello: both sides claim rank %u", tp->rank);
+            return 0;
+        }
+        if (tp->rank == 0 && theirs.rank != (uint32_t)peer) {
+            tp_set_err(err, errlen, "tp hello: worker on link to rank %d claims rank %u",
+                       peer, theirs.rank);
+            return 0;
+        }
+        if (theirs.role == mine.role) {
+            tp_set_err(err, errlen, "tp hello: both sides claim role %u", mine.role);
+            return 0;
+        }
+        if (theirs.gguf_bytes != mine.gguf_bytes || theirs.model_id != mine.model_id ||
+            theirs.n_layer != mine.n_layer || theirs.n_embd != mine.n_embd ||
+            theirs.n_vocab != mine.n_vocab || theirs.quant_bits != mine.quant_bits ||
+            theirs.gate_slot_start != mine.gate_slot_start ||
+            theirs.gate_slot_step != mine.gate_slot_step ||
+            theirs.gates_per_token != mine.gates_per_token) {
+            tp_set_err(err, errlen,
+                       "tp hello: model mismatch (peer gguf=%llu id=%u layers=%u embd=%u "
+                       "vocab=%u qbits=%u)",
+                       (unsigned long long)theirs.gguf_bytes, theirs.model_id,
+                       theirs.n_layer, theirs.n_embd, theirs.n_vocab, theirs.quant_bits);
+            return 0;
+        }
     }
     tp->peer_ctx = theirs.ctx_size;
     tp->n_layer = id->n_layer;
     tp->n_embd = id->n_embd;
     tp->vec_bytes = (uint64_t)id->n_embd * sizeof(float);
-    tp->n_slots = n_slots;
+    tp->n_slots = id->n_layer * DS4_TP_GATES_PER_LAYER;
     tp->gate_slot_start = id->gate_slot_start;
     tp->gate_slot_step = id->gate_slot_step;
     tp->gates_per_token = id->gates_per_token;
-    memcpy(tp->gate_slot_mask, id->gate_slot_mask,
-           sizeof(tp->gate_slot_mask));
     tp_slab_layout(tp);
-    /* Transport decision: RDMA only when both sides can. */
-    int want_rdma = tp->opt.transport != DS4_TP_TRANSPORT_TCP;
-    tp->rdma_active = want_rdma && rdma_ok && theirs.rdma_ok;
-    if (tp->opt.transport == DS4_TP_TRANSPORT_RDMA && !tp->rdma_active) {
-        tp_set_err(err, errlen, "tp: --transport rdma but %s side has no active device",
-                   rdma_ok ? "the peer" : "this");
-        return 0;
+    if (tp->rank == 0) {
+        /* Leader collects each worker's rdma_ok; the mesh-wide decision is
+         * broadcast after the hello barrier. */
+        tp->peer_rdma_ok[peer] = theirs.rdma_ok;
+        tp->peer_big_tcp[peer] = theirs.big_tcp;
+    } else {
+        /* Worker: the leader broadcasts the transport decision. */
+        uint32_t mode = 0;
+        if (tp->ring) {
+            uint32_t type = 0, bytes = 0;
+            uint8_t *payload = NULL;
+            if (!tp_ctrl_recv(tp, 0, &type, &payload, &bytes) ||
+                type != DS4_TP_FRAME_RDMA_MODE || bytes != sizeof(mode)) {
+                free(payload);
+                tp_set_err(err, errlen, "tp rdma: mode barrier failed");
+                return 0;
+            }
+            memcpy(&mode, payload, sizeof(mode));
+            free(payload);
+        } else {
+            const int fd = tp->control_fd[0];
+            uint32_t type = 0, bytes = 0;
+            if (!tp_read_frame_header(fd, &type, &bytes) ||
+                type != DS4_TP_FRAME_RDMA_MODE || bytes != sizeof(mode) ||
+                !tp_read_full(fd, &mode, sizeof(mode))) {
+                tp_set_err(err, errlen, "tp rdma: mode barrier failed");
+                return 0;
+            }
+        }
+        tp->rdma_active = (mode & 1u) != 0;
+        tp->big_tcp_override = (mode & 2u) != 0;
+        if (tp->opt.transport == DS4_TP_TRANSPORT_RDMA && !tp->rdma_active) {
+            tp_set_err(err, errlen,
+                       "tp: --transport rdma but a peer has no active device");
+            return 0;
+        }
     }
     return 1;
 }
@@ -2020,101 +2411,338 @@ int ds4_tp_create(
         return 0;
     }
     tp->opt = *opt;
-    tp->rank = opt->role == DS4_TP_LEADER ? 0 : 1;
-    tp->control_fd = -1;
-    tp->data_fd = -1;
     tp->timeout_sec = DS4_TP_DEFAULT_TIMEOUT_SEC;
     const char *tmo = getenv("DS4_TP_TIMEOUT_SEC");
     if (tmo) tp->timeout_sec = (uint64_t)atoi(tmo);
-    tp->gate_timeout_ms = DS4_TP_DEFAULT_GATE_TIMEOUT_MS;
-    const char *gate_tmo = getenv("DS4_TP_GATE_TIMEOUT_MS");
-    if (gate_tmo) {
-        const long value = strtol(gate_tmo, NULL, 10);
-        if (value > 0 && value <= 60000) tp->gate_timeout_ms = (uint64_t)value;
+    for (int i = 0; i < DS4_TP_MAX_WORLD; i++) {
+        tp->control_fd[i] = -1;
+        tp->data_fd[i] = -1;
     }
+
+    /* Resolve the mesh: topology file, or the classic 2-node options. */
+    if (opt->topology_path) {
+        if (!ds4_tp_topology_load(opt->topology_path, &tp->topo, err, errlen))
+            goto fail;
+        tp->world = tp->topo.world;
+        if (!opt->rank_set) {
+            tp_set_err(err, errlen, "--tp-topology requires --tp-rank");
+            goto fail;
+        }
+        tp->rank = opt->rank;
+    } else {
+        tp->world = 2;
+        tp->rank = opt->role == DS4_TP_LEADER ? 0 : 1;
+        tp->topo.world = 2;
+        tp->topo.node[0].link[0].peer = 1;
+        tp->topo.node[0].link[0].host =
+            strdup(opt->listen_host && opt->listen_host[0]
+                   ? opt->listen_host : "0.0.0.0");
+        tp->topo.node[0].link[0].port =
+            opt->listen_port > 0 ? opt->listen_port : 9000;
+        tp->topo.node[0].n_links = 1;
+    }
+    if (tp->world < 2 || tp->world > DS4_TP_MAX_WORLD ||
+        tp->rank < 0 || tp->rank >= tp->world) {
+        tp_set_err(err, errlen, "tp: invalid mesh rank %d / world %d",
+                   tp->rank, tp->world);
+        goto fail;
+    }
+    tp->ring = tp_topology_ring(&tp->topo);
+    const bool new_format = tp->topo.node[0].control_host != NULL;
 
     int rdma_ok = 0;
 #ifdef DS4_TP_HAVE_VERBS
     if (opt->transport != DS4_TP_TRANSPORT_TCP &&
         (uint64_t)id->n_embd * sizeof(float) <= 2ull * DS4_TP_RDMA_MAX_MSG)
-        rdma_ok = tp_rdma_probe(&tp->rdma.api);
+        rdma_ok = tp_rdma_probe(&tp->rdma_api);
 #endif
 
-    int listener = -1;
-    if (tp->rank == 0) {
-        listener = tp_listen(opt->listen_host, opt->listen_port, err, errlen);
-        if (listener < 0) goto fail;
-        fprintf(stderr, "ds4-tp: waiting for worker on %s:%d ...\n",
-                opt->listen_host ? opt->listen_host : "0.0.0.0", opt->listen_port);
-        tp->control_fd = accept(listener, NULL, NULL);
-        if (tp->control_fd < 0) {
-            tp_set_err(err, errlen, "tp accept: %s", strerror(errno));
-            goto fail;
+    int leader_listener[DS4_TP_MAX_WORLD];
+    for (int i = 0; i < DS4_TP_MAX_WORLD; i++) leader_listener[i] = -1;
+
+    /* Phase A: control plane.  Ring mode opens per-link control sockets to
+     * the two ring neighbours and starts the relay threads (the leader has
+     * no direct link to most workers, so control frames relay through the
+     * ring).  Non-ring meshes ride the LAN control addresses when present
+     * (new format), else the per-link control plane. */
+    for (int i = 0; i < DS4_TP_MAX_WORLD; i++) {
+        tp->ctrl_fd[i] = -1;
+        tp->ctrl_q[i] = NULL;
+        pthread_mutex_init(&tp->ctrl_mu[i], NULL);
+    }
+    tp->ctrl_thread_count = 0;
+    if (tp->ring) {
+        for (int i = 0; i < tp->world; i++) {
+            tp->ctrl_q[i] = calloc(1, sizeof(tp_ctrl_queue));
+            if (!tp->ctrl_q[i]) {
+                tp_set_err(err, errlen, "tp: out of memory for ctrl queues");
+                goto fail;
+            }
+            tp_ctrl_queue_init(tp->ctrl_q[i]);
+        }
+        for (int m = 0; m < tp->world; m++) {
+            if (m == tp->rank) continue;
+            const int li = tp_node_link_index(&tp->topo, tp->rank, m);
+            if (li < 0) continue;
+            const int cport = tp->topo.node[tp->rank].link[li].port +
+                              DS4_TP_CTRL_PORT_DELTA;
+            if (m > tp->rank) {
+                int lfd = tp_listen(tp->topo.node[tp->rank].link[li].host,
+                                    cport, err, errlen);
+                if (lfd < 0) goto fail;
+                tp->ctrl_fd[m] = accept(lfd, NULL, NULL);
+                close(lfd);
+                if (tp->ctrl_fd[m] < 0) {
+                    tp_set_err(err, errlen, "tp ctrl accept: %s", strerror(errno));
+                    goto fail;
+                }
+                tp_socket_tune(tp->ctrl_fd[m]);
+            } else {
+                const int pj = tp_node_link_index(&tp->topo, m, tp->rank);
+                if (pj < 0) {
+                    tp_set_err(err, errlen,
+                               "tp: node %d has no link to rank %d (ctrl)",
+                               m, tp->rank);
+                    goto fail;
+                }
+                tp->ctrl_fd[m] = tp_dial(
+                    tp->topo.node[m].link[pj].host,
+                    tp->topo.node[m].link[pj].port + DS4_TP_CTRL_PORT_DELTA,
+                    (double)tp->timeout_sec, err, errlen);
+                if (tp->ctrl_fd[m] < 0) goto fail;
+                tp_socket_tune(tp->ctrl_fd[m]);
+            }
+            fprintf(stderr, "ds4-tp: ring ctrl link to peer %d up\n", m);
+        }
+        /* Start one relay reader per physical control socket. */
+        for (int m = 0; m < tp->world; m++) {
+            if (tp->ctrl_fd[m] < 0) continue;
+            tp_ring_ctrl_ctx *cctx = calloc(1, sizeof(*cctx));
+            if (!cctx) {
+                tp_set_err(err, errlen, "tp: out of memory for ctrl thread");
+                goto fail;
+            }
+            cctx->tp = tp;
+            cctx->peer = m;
+            if (pthread_create(&tp->ctrl_thread[tp->ctrl_thread_count],
+                               NULL, tp_ring_ctrl_reader, cctx) != 0) {
+                free(cctx);
+                tp_set_err(err, errlen, "tp: pthread_create ctrl relay failed");
+                goto fail;
+            }
+            tp->ctrl_thread_count++;
+        }
+    } else if (tp->rank == 0) {
+        /* Open every worker listener BEFORE accepting any.  A worker that
+         * connects early is then queued by the kernel (SYN-ACK, backlog);
+         * with the old open-then-accept-per-worker order its SYN hit a not-
+         * yet-open port, and macOS cached that RST as EHOSTUNREACH, after
+         * which it stopped sending SYNs and every retry failed locally. */
+        for (int m = 1; m < tp->world; m++) {
+            int fd = -1;
+            if (new_format) {
+                char portbuf[16];
+                snprintf(portbuf, sizeof(portbuf), "%d",
+                         tp->topo.node[0].control_port + m);
+                fd = tp_listen(tp->topo.node[0].control_host, atoi(portbuf),
+                               err, errlen);
+            } else {
+                const int li = tp_node_link_index(&tp->topo, 0, m);
+                if (li < 0) continue;
+                fd = tp_listen(tp->topo.node[0].link[li].host,
+                               tp->topo.node[0].link[li].port,
+                               err, errlen);
+            }
+            leader_listener[m] = fd;
+            if (fd < 0) goto fail;
+        }
+        for (int m = 1; m < tp->world; m++) {
+            if (leader_listener[m] < 0) continue;
+            fprintf(stderr, "ds4-tp: waiting for worker %d on %s:%d ...\n",
+                    m, new_format ? tp->topo.node[0].control_host :
+                                    tp->topo.node[0].link[tp_node_link_index(&tp->topo, 0, m)].host,
+                    new_format ? tp->topo.node[0].control_port + m :
+                                 tp->topo.node[0].link[tp_node_link_index(&tp->topo, 0, m)].port);
+            tp->control_fd[m] = accept(leader_listener[m], NULL, NULL);
+            if (tp->control_fd[m] < 0) {
+                tp_set_err(err, errlen, "tp accept: %s", strerror(errno));
+                goto fail;
+            }
+            tp_socket_tune(tp->control_fd[m]);
         }
     } else {
-        tp->control_fd = tp_dial(opt->leader_host, opt->leader_port,
-                                 (double)tp->timeout_sec, err, errlen);
-        if (tp->control_fd < 0) goto fail;
+        if (new_format) {
+            char portbuf[16];
+            snprintf(portbuf, sizeof(portbuf), "%d",
+                     tp->topo.node[0].control_port + tp->rank);
+            tp->control_fd[0] = tp_dial(tp->topo.node[0].control_host,
+                                        atoi(portbuf),
+                                        (double)tp->timeout_sec, err, errlen);
+        } else {
+            const int li = tp_node_link_index(&tp->topo, 0, tp->rank);
+            if (li < 0) {
+                tp_set_err(err, errlen,
+                           "tp: no control link from node 0 to rank %d",
+                           tp->rank);
+                goto fail;
+            }
+            tp->control_fd[0] = tp_dial_src(tp->topo.node[0].link[li].host,
+                                            tp->topo.node[0].link[li].port,
+                                            tp_link_host(tp, 0),
+                                            (double)tp->timeout_sec, err, errlen);
+        }
+        if (tp->control_fd[0] < 0) goto fail;
+        tp_socket_tune(tp->control_fd[0]);
     }
-    tp_socket_tune(tp->control_fd);
 
-    if (!tp_hello_exchange(tp, id, rdma_ok, err, errlen)) goto fail;
-
-#ifdef DS4_TP_HAVE_VERBS
-    if (tp->rdma_active) {
-        if (!tp_rdma_open(tp, err, errlen)) goto fail;
+    /* Phase B: hello barrier.  The leader exchanges identities with every
+     * worker, decides the mesh-wide transport, and broadcasts the mode. */
+    if (tp->rank == 0) {
+        for (int m = 1; m < tp->world; m++) {
+            if (!tp->ring && tp->control_fd[m] < 0) continue;
+            if (!tp_hello_exchange(tp, m, id, rdma_ok, err, errlen)) goto fail;
+        }
+        int want_rdma = tp->opt.transport != DS4_TP_TRANSPORT_TCP;
+        bool all_ok = rdma_ok != 0;
+        for (int m = 1; m < tp->world; m++) {
+            if (tp->control_fd[m] >= 0 && !tp->peer_rdma_ok[m]) all_ok = false;
+            if (tp->ring && !tp->peer_rdma_ok[m]) all_ok = false;
+        }
+        tp->rdma_active = want_rdma && all_ok;
+        if (tp->opt.transport == DS4_TP_TRANSPORT_RDMA && !tp->rdma_active) {
+            tp_set_err(err, errlen,
+                       "tp: --transport rdma but a peer has no active device");
+            goto fail;
+        }
+        /* TCP big-gate override only if every connected rank opts in. */
+        int all_big_tcp = ds4_tp_big_tcp_env() != 0;
+        for (int m = 1; m < tp->world; m++) {
+            if (tp->control_fd[m] >= 0 && !tp->peer_big_tcp[m]) {
+                all_big_tcp = 0;
+            }
+        }
+        tp->big_tcp_override = all_big_tcp != 0;
+        uint32_t mode = (tp->rdma_active ? 1u : 0u) |
+                        (tp->big_tcp_override ? 2u : 0u);
+        for (int m = 1; m < tp->world; m++) {
+            if (tp->ring) {
+                if (!tp_ctrl_send(tp, m, DS4_TP_FRAME_RDMA_MODE,
+                                  &mode, sizeof(mode))) goto fail;
+            } else if (tp->control_fd[m] >= 0) {
+                if (!tp_send_frame(tp->control_fd[m], DS4_TP_FRAME_RDMA_MODE,
+                                   &mode, sizeof(mode))) goto fail;
+            }
+        }
+    } else {
+        if (!tp_hello_exchange(tp, 0, id, rdma_ok, err, errlen)) goto fail;
     }
-#endif
-    {
-        /* Second socket dedicated to gate traffic so control frames never
-         * interleave with gate payloads.  Created under RDMA too for
-         * headers, verify-block gates, and transport fallback. */
+
+    /* Phase C: data sockets for direct peers.  Each node has one link per
+     * direct peer; the lower-rank side of a pair listens, the higher rank
+     * dials the lower's link address.  For per-link control (old format) the
+     * leader reuses the control listener for the data accept; otherwise it
+     * opens a fresh data listener per direct peer.  The classic 2-node pair
+     * (no topology file) only lists node 0's address, so the worker dials it
+     * directly. */
+    if (tp->world == 2 && tp->topo.node[1].n_links == 0) {
         if (tp->rank == 0) {
-            tp->data_fd = accept(listener, NULL, NULL);
-            if (tp->data_fd < 0) {
+            if (leader_listener[1] < 0) {
+                tp_set_err(err, errlen, "tp: classic leader data listener missing");
+                goto fail;
+            }
+            tp->data_fd[1] = accept(leader_listener[1], NULL, NULL);
+            leader_listener[1] = -1;
+            if (tp->data_fd[1] < 0) {
                 tp_set_err(err, errlen, "tp data accept: %s", strerror(errno));
                 goto fail;
             }
+            tp_socket_tune(tp->data_fd[1]);
         } else {
-            tp->data_fd = tp_dial(opt->leader_host, opt->leader_port,
-                                  (double)tp->timeout_sec, err, errlen);
-            if (tp->data_fd < 0) goto fail;
+            tp->data_fd[0] = tp_dial_src(tp->topo.node[0].link[0].host,
+                                         tp->topo.node[0].link[0].port,
+                                         tp_link_host(tp, 0),
+                                         (double)tp->timeout_sec, err, errlen);
+            if (tp->data_fd[0] < 0) goto fail;
+            tp_socket_tune(tp->data_fd[0]);
         }
-        tp_socket_tune(tp->data_fd);
-        if (!tp_socket_set_gate_timeout(tp->data_fd, tp->gate_timeout_ms)) {
-            tp_set_err(err, errlen, "tp data socket timeout: %s", strerror(errno));
-            goto fail;
+    } else {
+    for (int m = 0; m < tp->world; m++) {
+        if (m == tp->rank) continue;
+        const int li = tp_node_link_index(&tp->topo, tp->rank, m);
+        if (li < 0) continue;   /* not a direct peer */
+        if (m > tp->rank) {
+            int fd;
+            if (tp->rank == 0 && !new_format && leader_listener[m] >= 0) {
+                fd = leader_listener[m];
+                leader_listener[m] = -1;
+            } else {
+                fd = tp_listen(tp->topo.node[tp->rank].link[li].host,
+                               tp->topo.node[tp->rank].link[li].port,
+                               err, errlen);
+                if (fd < 0) goto fail;
+            }
+            tp->data_fd[m] = accept(fd, NULL, NULL);
+            if (tp->rank == 0 && !new_format) {
+                /* listener was transferred to data_fd */
+            } else {
+                close(fd);
+            }
+            if (tp->data_fd[m] < 0) {
+                tp_set_err(err, errlen, "tp data accept: %s", strerror(errno));
+                goto fail;
+            }
+            tp_socket_tune(tp->data_fd[m]);
+        } else {
+            const int pj = tp_node_link_index(&tp->topo, m, tp->rank);
+            if (pj < 0) {
+                tp_set_err(err, errlen,
+                           "tp: node %d has no link to rank %d", m, tp->rank);
+                goto fail;
+            }
+            tp->data_fd[m] = tp_dial_src(tp->topo.node[m].link[pj].host,
+                                         tp->topo.node[m].link[pj].port,
+                                         tp->topo.node[tp->rank].link[li].host,
+                                         (double)tp->timeout_sec, err, errlen);
+            if (tp->data_fd[m] < 0) goto fail;
+            tp_socket_tune(tp->data_fd[m]);
         }
     }
-    if (listener >= 0) close(listener);
-    fprintf(stderr, "ds4-tp: %s connected, transport=%s gate-timeout=%llums\n",
-            tp->rank == 0 ? "worker" : "leader",
-            tp->rdma_active ? "rdma" : "tcp",
-            (unsigned long long)tp->gate_timeout_ms);
+    }
+    for (int i = 0; i < DS4_TP_MAX_WORLD; i++) {
+        if (leader_listener[i] >= 0) close(leader_listener[i]);
+    }
+
+    /* Phase D: RDMA QPs, one per direct link. */
+#ifdef DS4_TP_HAVE_VERBS
+    if (tp->rdma_active) {
+        for (int m = 0; m < tp->world; m++) {
+            if (m == tp->rank) continue;
+            if (tp->data_fd[m] < 0) continue;
+            if (!tp_rdma_open_link(tp, m, err, errlen)) goto fail;
+        }
+    }
+#endif
+
+    fprintf(stderr, "ds4-tp: rank %d/%d connected, transport=%s%s\n",
+            tp->rank, tp->world, tp->rdma_active ? "rdma" : "tcp",
+            tp->ring ? " ring" : "");
     *out = tp;
     return 1;
 fail:
-    if (listener >= 0) close(listener);
+    for (int i = 0; i < DS4_TP_MAX_WORLD; i++) {
+        if (leader_listener[i] >= 0) close(leader_listener[i]);
+    }
     ds4_tp_free(tp);
     return 0;
 }
 
 int ds4_tp_attach_slab(ds4_tp *tp, void *base, char *err, size_t errlen) {
     tp->slab = base;
-    memset(tp->slab + tp->in_flags_off, 0, (uint64_t)tp->n_slots * 8);
+    memset(tp->slab + tp->in_flags_off, 0,
+           (uint64_t)tp->n_slots * (uint64_t)(tp->world > 1 ? tp->world - 1 : 0) * 8);
     memset(tp->slab + tp->token_off, 0, 16);
 #ifdef DS4_TP_HAVE_VERBS
-    if (tp->rdma_active) {
-        for (;;) {
-            tp->rdma.warm_failed = 0;
-            if (tp_rdma_register_and_exchange(tp, err, errlen)) return 1;
-            if (!tp->rdma.warm_failed || tp->rdma.setup_attempt >= 3) return 0;
-            tp->rdma.setup_attempt++;
-            fprintf(stderr, "ds4-tp: %s; recreating the queue pair (setup attempt %u)\n",
-                    err, tp->rdma.setup_attempt + 1u);
-            if (!tp_rdma_recreate_qp(tp, err, errlen)) return 0;
-        }
-    }
+    if (tp->rdma_active) return tp_rdma_register_and_exchange(tp, err, errlen);
 #endif
     (void)err; (void)errlen;
     return 1;
@@ -2125,22 +2753,39 @@ void ds4_tp_free(ds4_tp *tp) {
 #ifdef DS4_TP_HAVE_VERBS
     tp_rdma_close(tp);
 #endif
-    if (tp->control_fd >= 0) close(tp->control_fd);
-    if (tp->data_fd >= 0) close(tp->data_fd);
+    for (int i = 0; i < DS4_TP_MAX_WORLD; i++) {
+        if (tp->control_fd[i] >= 0) close(tp->control_fd[i]);
+        if (tp->data_fd[i] >= 0) close(tp->data_fd[i]);
+        if (tp->ctrl_fd[i] >= 0) close(tp->ctrl_fd[i]);
+    }
+    for (int i = 0; i < tp->ctrl_thread_count; i++) {
+        if (tp->ctrl_thread[i]) pthread_join(tp->ctrl_thread[i], NULL);
+    }
+    for (int i = 0; i < DS4_TP_MAX_WORLD; i++) {
+        pthread_mutex_destroy(&tp->ctrl_mu[i]);
+    }
+    for (int i = 0; i < DS4_TP_MAX_WORLD; i++) {
+        if (tp->ctrl_q[i]) {
+            /* Drain and free any queued frames. */
+            tp_ctrl_msg *m = tp->ctrl_q[i]->head;
+            while (m) {
+                tp_ctrl_msg *next = m->next;
+                free(m->payload);
+                free(m);
+                m = next;
+            }
+            pthread_mutex_destroy(&tp->ctrl_q[i]->mu);
+            pthread_cond_destroy(&tp->ctrl_q[i]->cv);
+            free(tp->ctrl_q[i]);
+            tp->ctrl_q[i] = NULL;
+        }
+    }
+    ds4_tp_topology_free(&tp->topo);
     free(tp);
 }
 
-void ds4_tp_detach_slab(ds4_tp *tp) {
-    if (!tp) return;
-#ifdef DS4_TP_HAVE_VERBS
-    tp_rdma_close(tp);
-#endif
-    tp->slab = NULL;
-    tp->rdma_active = false;
-    ds4_tp_mark_failed(tp);
-}
-
 int ds4_tp_rank(const ds4_tp *tp) { return tp->rank; }
+int ds4_tp_world(const ds4_tp *tp) { return tp ? tp->world : 0; }
 bool ds4_tp_is_rdma(const ds4_tp *tp) { return tp->rdma_active; }
 uint32_t ds4_tp_peer_ctx(const ds4_tp *tp) { return tp->peer_ctx; }
 bool ds4_tp_failed(const ds4_tp *tp) {
@@ -2154,124 +2799,156 @@ void ds4_tp_mark_failed(ds4_tp *tp) {
  * Gate exchange.
  * --------------------------------------------------------------------- */
 
-int ds4_tp_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint64_t seq) {
-#ifdef DS4_TP_HAVE_VERBS
-    if (tp->rdma_active) return tp_rdma_gate_exchange(tp, layer, gate, seq);
-#endif
-    /* Send header and payload together without depending on socket capacity. */
+/* TCP decode-gate per-link send/recv.  Header and payload go out in one
+ * writev so NODELAY does not split them into two segments. */
+static int tp_tcp_gate_send(ds4_tp *tp, int peer, uint32_t layer,
+                            uint32_t gate, uint64_t seq) {
     ds4_tp_gate_header h = { DS4_TP_MAGIC, (uint16_t)layer, (uint16_t)gate, seq };
+    struct iovec iov[2] = {
+        { &h, sizeof(h) },
+        { tp->slab + ds4_tp_slab_out_offset(tp, layer, gate), tp->vec_bytes },
+    };
+    size_t want = sizeof(h) + tp->vec_bytes;
+    ssize_t w = writev(tp->data_fd[peer], iov, 2);
+    if (w < 0 || (size_t)w != want) {
+        if (w < 0) return 0;
+        size_t done = (size_t)w;
+        if (done < sizeof(h)) {
+            if (!tp_write_full(tp->data_fd[peer], (char *)&h + done,
+                               sizeof(h) - done)) return 0;
+            done = sizeof(h);
+        }
+        uint64_t payload_done = done - sizeof(h);
+        if (!tp_write_full(tp->data_fd[peer],
+                           tp->slab + ds4_tp_slab_out_offset(tp, layer, gate) +
+                               payload_done,
+                           tp->vec_bytes - payload_done))
+            return 0;
+    }
+    return 1;
+}
+
+static int tp_tcp_gate_recv(ds4_tp *tp, int peer, uint32_t layer,
+                            uint32_t gate, uint64_t seq) {
     ds4_tp_gate_header ph;
-    if (!tp_tcp_exchange(tp, &h, &ph,
-            tp->slab + ds4_tp_slab_out_offset(tp, layer, gate),
-            tp->slab + ds4_tp_slab_in_offset(tp, layer, gate), tp->vec_bytes)) return 0;
-    if (ph.magic != DS4_TP_MAGIC || ph.layer != layer || ph.gate != gate || ph.seq != seq) {
-        fprintf(stderr, "ds4-tp: gate desync: got l=%u g=%u seq=%llu, want l=%u g=%u seq=%llu\n",
+    if (!tp_read_full(tp->data_fd[peer], &ph, sizeof(ph))) return 0;
+    if (ph.magic != DS4_TP_MAGIC || ph.layer != layer ||
+        ph.gate != gate || ph.seq != seq) {
+        fprintf(stderr,
+                "ds4-tp: gate desync: got l=%u g=%u seq=%llu, want l=%u g=%u seq=%llu\n",
                 ph.layer, ph.gate, (unsigned long long)ph.seq,
                 layer, gate, (unsigned long long)seq);
         return 0;
     }
-    return 1;
+    return tp_read_full(tp->data_fd[peer],
+                        tp->slab + tp_slab_in_peer_offset(tp, layer, gate, peer),
+                        tp->vec_bytes);
 }
 
-/* Verify-block batch gate: one exchange per layer moving all block rows at
- * once. The payload lives in the registered slab, so RDMA sends it directly;
- * TCP exchanges both directions concurrently. */
-/* Verify-block window: called on both ranks right before a speculative
- * verify block whose every layer ends in one batch gate of `rows` rows.
- * Drains the decode receive window, posts the first layer's receives,
- * crosses one control-byte barrier (so both sides are posted before any
- * send), and from then on each gate posts the next layer's receives and
- * sends its rows without any handshake.  Returns 1 also when RDMA is not
- * in use (the TCP fallback keeps its per-gate headers). */
-int ds4_tp_batch_block_begin(ds4_tp *tp, uint32_t rows, uint32_t n_layers) {
+int ds4_tp_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint64_t seq) {
+    if (tp->ring) {
 #ifdef DS4_TP_HAVE_VERBS
-    if (!tp->rdma_active || !tp_rdma_big_gate_capable(tp)) return 1;
-    if (getenv("DS4_TP_DISABLE_VERIFY_WINDOW")) return 1;
-    ds4_tp_rdma *r = &tp->rdma;
-    if (rows == 0 || rows > DS4_TP_BATCH_MAX_ROWS || n_layers == 0 || r->block_active) return 0;
-    if (!tp_rdma_drain_decode_window(tp)) return 0;
-    pthread_mutex_lock(&r->post_lock);
-    r->block_active = true;
-    r->block_rows = rows;
-    r->block_layers = n_layers;
-    r->block_posted = 0;
-    r->block_recv_done = 0;
-    const int ok = tp_rdma_block_post_layer(tp, 0);
-    pthread_mutex_unlock(&r->post_lock);
-    if (!ok) { r->block_active = false; return 0; }
-    if (!tp_rdma_window_barrier(tp, 0xB5u)) { r->block_active = false; return 0; }
-    if (getenv("DS4_TP_BIG_GATE_DEBUG"))
-        fprintf(stderr, "ds4-tp: verify window armed: %u rows x %u layers\n", rows, n_layers);
-    return 1;
-#else
-    (void)tp; (void)rows; (void)n_layers;
-    return 1;
+        if (tp->rdma_active) return tp_rdma_gate_exchange_ring(tp, layer, gate, seq);
 #endif
-}
-
-/* End of the verify block: every gate must have been exchanged (all
- * posted receives consumed) and our signaled sends reaped. */
-int ds4_tp_batch_block_end(ds4_tp *tp) {
-#ifdef DS4_TP_HAVE_VERBS
-    ds4_tp_rdma *r = &tp->rdma;
-    if (!r->block_active) return 1;
-    int ok = 1;
-    const uint64_t want = (uint64_t)r->block_layers * r->block_rows;
-    double deadline = tp_now_sec() + (double)tp->gate_timeout_ms / 1000.0;
-    while (ok && (r->block_recv_done < want || r->send_outstanding > 0)) {
-        ok = tp_rdma_drain_cq(tp);
-        if (ok && tp_now_sec() > deadline) {
-            fprintf(stderr, "ds4-tp: verify-block end: %llu/%llu rows received, %u sends pending\n",
-                    (unsigned long long)r->block_recv_done, (unsigned long long)want,
-                    r->send_outstanding);
-            ok = 0;
+        /* TCP ring: circulate the running sum through next/prev.  Each hop
+         * writes the accumulator to next and reads prev's message into the
+         * hop buffer (a different socket each way, so no deadlock). */
+        const uint32_t slot = layer * DS4_TP_GATES_PER_LAYER + gate;
+        const int next = (tp->rank + 1) % tp->world;
+        const int prev = (tp->rank + tp->world - 1) % tp->world;
+        if (tp->data_fd[next] < 0 || tp->data_fd[prev] < 0) return 0;
+        float *accum = (float *)(tp->slab + tp->combined_off +
+                                 (uint64_t)slot * tp->vec_bytes);
+        const float *out = (const float *)(tp->slab + tp->out_off +
+                                           (uint64_t)slot * tp->vec_bytes);
+        const uint64_t words = tp->vec_bytes / sizeof(float);
+        const uint32_t hops = (uint32_t)tp->world - 1u;
+        for (uint32_t h = 0; h < hops; h++) {
+            const void *relay = h == 0 ? (const void *)out :
+                (const void *)(tp->slab + tp->in_off +
+                    (uint64_t)slot * tp->in_peer_bytes +
+                    (uint64_t)(h - 1) * tp->vec_bytes);
+            ds4_tp_gate_header hh = { DS4_TP_MAGIC, (uint16_t)layer,
+                                      (uint16_t)gate, seq };
+            if (!tp_write_full(tp->data_fd[next], &hh, sizeof(hh)) ||
+                !tp_write_full(tp->data_fd[next], relay, tp->vec_bytes)) return 0;
+            ds4_tp_gate_header ph;
+            if (!tp_read_full(tp->data_fd[prev], &ph, sizeof(ph))) return 0;
+            if (ph.magic != DS4_TP_MAGIC || ph.layer != layer ||
+                ph.gate != gate || ph.seq != seq) {
+                fprintf(stderr,
+                        "ds4-tp: ring gate desync: got l=%u g=%u seq=%llu, want l=%u g=%u seq=%llu\n",
+                        ph.layer, ph.gate, (unsigned long long)ph.seq,
+                        layer, gate, (unsigned long long)seq);
+                return 0;
+            }
+            float *src = (float *)(tp->slab + tp->in_off +
+                (uint64_t)slot * tp->in_peer_bytes + (uint64_t)h * tp->vec_bytes);
+            if (!tp_read_full(tp->data_fd[prev], src, tp->vec_bytes)) return 0;
         }
+        /* Canonical rank-order fold: identical FP sum on every rank. */
+        tp_ring_fold(tp, out,
+                     (const float *)(tp->slab + tp->in_off +
+                         (uint64_t)slot * tp->in_peer_bytes),
+                     words, words, accum);
+        return 1;
     }
-    if (getenv("DS4_TP_BIG_GATE_DEBUG"))
-        fprintf(stderr, "ds4-tp: verify window closed: %llu/%llu rows, ok=%d\n",
-                (unsigned long long)r->block_recv_done, (unsigned long long)want, ok);
-    r->block_active = false;
-    return ok;
-#else
-    (void)tp;
-    return 1;
+#ifdef DS4_TP_HAVE_VERBS
+    if (tp->rdma_active) return tp_rdma_gate_exchange(tp, layer, gate, seq);
 #endif
+    /* TCP: broadcast/gather over every link.  Each link is a full-duplex
+     * socket, so the symmetric write-then-read cannot deadlock (16KB per
+     * direction, socket buffers absorb). */
+    for (int m = 0; m < tp->world; m++) {
+        if (m == tp->rank) continue;
+        if (!tp_tcp_gate_send(tp, m, layer, gate, seq)) return 0;
+    }
+    for (int m = 0; m < tp->world; m++) {
+        if (m == tp->rank) continue;
+        if (!tp_tcp_gate_recv(tp, m, layer, gate, seq)) return 0;
+    }
+    if (tp->world > 2) tp_combine(tp, layer, gate);
+    return 1;
 }
 
-int ds4_tp_batch_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows,
-                               uint64_t seq) {
-    if (tp->data_fd < 0 || rows == 0 || rows > DS4_TP_BATCH_MAX_ROWS) return 0;
-    const uint64_t bytes = (uint64_t)rows * tp->vec_bytes;
+static int tp_rdma_ring_bulk_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
+                                      const void *out, void *in, uint64_t bytes,
+                                      uint64_t hop_stride, uint16_t gate,
+                                      float *fold_dst);
+
+static int tp_tcp_batch_send(ds4_tp *tp, int peer, uint32_t layer,
+                             uint32_t rows, uint64_t seq) {
     ds4_tp_gate_header h = { DS4_TP_BATCH_MAGIC, (uint16_t)layer,
                              (uint16_t)rows, seq };
-#ifdef DS4_TP_HAVE_VERBS
-    if (tp->rdma_active && tp->rdma.block_active)
-        return tp_rdma_block_gate_exchange(tp, layer, rows);
-    if (tp->rdma_active && tp_rdma_big_gate_capable(tp)) {
-        if (!tp_write_full(tp->data_fd, &h, sizeof(h))) return 0;
-        ds4_tp_gate_header ph;
-        if (!tp_read_full(tp->data_fd, &ph, sizeof(ph))) return 0;
-        if (ph.magic != DS4_TP_BATCH_MAGIC || ph.layer != layer ||
-            ph.gate != rows || ph.seq != seq) {
-            fprintf(stderr,
-                    "ds4-tp: batch gate desync: got l=%u rows=%u seq=%llu, "
-                    "want l=%u rows=%u seq=%llu\n",
-                    ph.layer, ph.gate, (unsigned long long)ph.seq,
-                    layer, rows, (unsigned long long)seq);
-            return 0;
+    const uint64_t bytes = (uint64_t)rows * tp->vec_bytes;
+    struct iovec iov[2] = {
+        { &h, sizeof(h) },
+        { tp->slab + ds4_tp_slab_batch_out_offset(tp, layer), bytes },
+    };
+    size_t want = sizeof(h) + bytes;
+    ssize_t w = writev(tp->data_fd[peer], iov, 2);
+    if (w < 0) return 0;
+    if ((size_t)w != want) {
+        size_t done = (size_t)w;
+        if (done < sizeof(h)) {
+            if (!tp_write_full(tp->data_fd[peer], (char *)&h + done,
+                               sizeof(h) - done)) return 0;
+            done = sizeof(h);
         }
-        if (!tp_rdma_drain_decode_window(tp)) return 0;
-        return tp_rdma_big_gate_exchange(
-                tp,
-                tp->slab + ds4_tp_slab_batch_out_offset(tp, layer),
-                tp->slab + ds4_tp_slab_batch_in_offset(tp, layer),
-                bytes);
+        uint64_t payload_done = done - sizeof(h);
+        if (!tp_write_full(tp->data_fd[peer],
+                           tp->slab + ds4_tp_slab_batch_out_offset(tp, layer) +
+                               payload_done,
+                           bytes - payload_done))
+            return 0;
     }
-#endif
+    return 1;
+}
+
+static int tp_tcp_batch_recv(ds4_tp *tp, int peer, uint32_t layer,
+                             uint32_t rows, uint64_t seq) {
     ds4_tp_gate_header ph;
-    if (!tp_tcp_exchange(tp, &h, &ph,
-            tp->slab + ds4_tp_slab_batch_out_offset(tp, layer),
-            tp->slab + ds4_tp_slab_batch_in_offset(tp, layer), bytes)) return 0;
+    if (!tp_read_full(tp->data_fd[peer], &ph, sizeof(ph))) return 0;
     if (ph.magic != DS4_TP_BATCH_MAGIC || ph.layer != layer ||
         ph.gate != rows || ph.seq != seq) {
         fprintf(stderr,
@@ -2281,79 +2958,684 @@ int ds4_tp_batch_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows,
                 layer, rows, (unsigned long long)seq);
         return 0;
     }
+    return tp_read_full(tp->data_fd[peer],
+                        tp->slab + tp_slab_batch_in_peer_offset(tp, layer, peer),
+                        (uint64_t)rows * tp->vec_bytes);
+}
+
+/* Verify-block batch gate: broadcast/gather all block rows per layer.  The
+ * payload lives in the registered slab, so RDMA sends it directly; TCP uses
+ * the symmetric write-then-read fallback on each link. */
+int ds4_tp_batch_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows,
+                               uint64_t seq) {
+    if (rows == 0 || rows > DS4_TP_BATCH_MAX_ROWS) return 0;
+    const uint64_t bytes = (uint64_t)rows * tp->vec_bytes;
+    ds4_tp_gate_header h = { DS4_TP_BATCH_MAGIC, (uint16_t)layer,
+                             (uint16_t)rows, seq };
+    if (tp->ring) {
+#ifdef DS4_TP_HAVE_VERBS
+        if (tp->rdma_active) {
+            return tp_rdma_ring_bulk_exchange(
+                tp, layer, seq,
+                (const void *)(tp->slab + ds4_tp_slab_batch_out_offset(tp, layer)),
+                tp->slab + tp->batch_in_off +
+                    (uint64_t)layer * DS4_TP_BATCH_MAX_ROWS *
+                        (tp->world - 1) * tp->vec_bytes,
+                bytes, (uint64_t)DS4_TP_BATCH_MAX_ROWS * tp->vec_bytes,
+                (uint16_t)rows,
+                (float *)(tp->slab + ds4_tp_slab_batch_combined_offset(tp, layer)));
+        }
+#endif
+        /* Ring bulk over TCP: circulate the running sum through next/prev. */
+        const int next = (tp->rank + 1) % tp->world;
+        const int prev = (tp->rank + tp->world - 1) % tp->world;
+        if (tp->data_fd[next] < 0 || tp->data_fd[prev] < 0) return 0;
+        if (!tp_write_full(tp->data_fd[next], &h, sizeof(h))) return 0;
+        ds4_tp_gate_header ph;
+        if (!tp_read_full(tp->data_fd[prev], &ph, sizeof(ph))) return 0;
+        if (ph.magic != DS4_TP_BATCH_MAGIC || ph.layer != layer ||
+            ph.gate != rows || ph.seq != seq) {
+            fprintf(stderr,
+                    "ds4-tp: ring batch desync: got l=%u rows=%u seq=%llu, "
+                    "want l=%u rows=%u seq=%llu\n",
+                    ph.layer, ph.gate, (unsigned long long)ph.seq,
+                    layer, rows, (unsigned long long)seq);
+            return 0;
+        }
+        float *accum = (float *)(tp->slab +
+            ds4_tp_slab_batch_combined_offset(tp, layer));
+        const float *out = (const float *)(tp->slab +
+            ds4_tp_slab_batch_out_offset(tp, layer));
+        const uint64_t words = bytes / sizeof(float);
+        const uint32_t hops = (uint32_t)tp->world - 1u;
+        for (uint32_t h = 0; h < hops; h++) {
+            const void *relay = h == 0 ? (const void *)out :
+                (const void *)(tp->slab + tp->batch_in_off +
+                    (uint64_t)layer * DS4_TP_BATCH_MAX_ROWS * (tp->world - 1) *
+                        tp->vec_bytes +
+                    (uint64_t)(h - 1) * DS4_TP_BATCH_MAX_ROWS * tp->vec_bytes);
+            float *hopbuf = (float *)(tp->slab + tp->batch_in_off +
+                (uint64_t)layer * DS4_TP_BATCH_MAX_ROWS * (tp->world - 1) *
+                    tp->vec_bytes +
+                (uint64_t)h * DS4_TP_BATCH_MAX_ROWS * tp->vec_bytes);
+            uint64_t off = 0;
+            while (off < bytes) {
+                const uint64_t n = bytes - off > DS4_TP_BIG_CHUNK ?
+                    DS4_TP_BIG_CHUNK : bytes - off;
+                if (!tp_write_full(tp->data_fd[next], (char *)relay + off, n))
+                    return 0;
+                if (!tp_read_full(tp->data_fd[prev], (char *)hopbuf + off, n))
+                    return 0;
+                off += n;
+            }
+        }
+        /* Canonical rank-order fold into the batch combined slot. */
+        tp_ring_fold(tp, out,
+                     (const float *)(tp->slab + tp->batch_in_off +
+                         (uint64_t)layer * DS4_TP_BATCH_MAX_ROWS *
+                             (tp->world - 1) * tp->vec_bytes),
+                     (uint64_t)DS4_TP_BATCH_MAX_ROWS * tp->vec_bytes /
+                         sizeof(float),
+                     words, accum);
+        return 1;
+    }
+#ifdef DS4_TP_HAVE_VERBS
+    if (tp->rdma_active) {
+        /* Per-link header barrier, decode-window drain, and bulk exchange. */
+        for (int m = 0; m < tp->world; m++) {
+            if (m == tp->rank) continue;
+            if (!tp_write_full(tp->data_fd[m], &h, sizeof(h))) return 0;
+            ds4_tp_gate_header ph;
+            if (!tp_read_full(tp->data_fd[m], &ph, sizeof(ph))) return 0;
+            if (ph.magic != DS4_TP_BATCH_MAGIC || ph.layer != layer ||
+                ph.gate != rows || ph.seq != seq) {
+                fprintf(stderr,
+                        "ds4-tp: batch gate desync: got l=%u rows=%u seq=%llu, "
+                        "want l=%u rows=%u seq=%llu\n",
+                        ph.layer, ph.gate, (unsigned long long)ph.seq,
+                        layer, rows, (unsigned long long)seq);
+                return 0;
+            }
+            if (!tp_rdma_drain_decode_window(tp, m)) return 0;
+        }
+        tp_rdma_bulk_peer st[DS4_TP_MAX_WORLD];
+        int npeers = 0;
+        for (int m = 0; m < tp->world; m++) {
+            if (m == tp->rank) continue;
+            uint8_t *in_peer = tp->slab +
+                tp_slab_batch_in_peer_offset(tp, layer, m);
+            if (!tp_rdma_bulk_peer_init(tp, &st[npeers], m,
+                    tp->slab + ds4_tp_slab_batch_out_offset(tp, layer),
+                    in_peer, bytes))
+                return 0;
+            npeers++;
+        }
+        for (int i = 0; i < npeers; i++) {
+            if (!tp_rdma_bulk_peer_post(tp, &st[i])) return 0;
+        }
+        for (int i = 0; i < npeers; i++) {
+            if (!tp_rdma_bulk_peer_finish(tp, &st[i])) return 0;
+        }
+        if (tp->world > 2) tp_batch_combine(tp, layer, rows);
+        return 1;
+    }
+#endif
+    for (int m = 0; m < tp->world; m++) {
+        if (m == tp->rank) continue;
+        if (!tp_tcp_batch_send(tp, m, layer, rows, seq)) return 0;
+    }
+    for (int m = 0; m < tp->world; m++) {
+        if (m == tp->rank) continue;
+        if (!tp_tcp_batch_recv(tp, m, layer, rows, seq)) return 0;
+    }
+    if (tp->world > 2) tp_batch_combine(tp, layer, rows);
     return 1;
 }
 
-/* Prefill batch gate: RDMA uses the pipelined registered-slab path above. */
-int ds4_tp_big_gate_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
-                             const void *out, void *in, uint64_t bytes) {
-    if (tp->data_fd < 0 || !out || !in || bytes == 0) return 0;
-#ifdef DS4_TP_HAVE_VERBS
-    static int dbg = -1;
-    if (dbg < 0) dbg = getenv("DS4_TP_BIG_GATE_DEBUG") != NULL;
-    const double t_start = dbg ? tp_now_sec() : 0.0;
-#endif
-    /* A cold prefill kernel can make one rank arrive much later than the
-     * other. Match the bulk RDMA window's bounded grace, without relaxing
-     * the decode timeout or any subsequent payload exchange. */
-    if (!tp_socket_set_gate_timeout(tp->data_fd, tp->gate_timeout_ms + 2000u)) return 0;
-    ds4_tp_gate_header h = { DS4_TP_BATCH_MAGIC, (uint16_t)layer, 0xB16u, seq };
+/* Prefill batch gate: RDMA uses the pipelined registered-slab path above.
+ * The fallback alternates 2MB TCP write/read rounds in the same order, so
+ * neither side can fill its send buffer while the peer is also only writing
+ * (the 4MB socket buffers absorb one round).  Mesh: broadcast/gather over
+ * every link; for world>2 the caller provides a per-peer in buffer of
+ * (world-1)*bytes and the graph assembles/combines from peer regions. */
+
+/* Canonical rank-order sum of the big-gate partials into the caller's `in`
+ * (world>2 only; the per-peer regions in `in` hold the raw peer data and
+ * `out` is this rank's partial).  The identical expression on every rank
+ * keeps the hidden states bit-exact. */
+static void tp_big_combine(ds4_tp *tp, const void *out, void *in,
+                           uint64_t bytes) {
+    const uint64_t words = bytes / sizeof(float);
+    const float *o = (const float *)out;
+    float *dst = (float *)in;
+    /* Element-wise canonical rank-order fold: dst is `in` region 0, which
+     * may itself hold a peer partial (peer 1 on rank 0, peer 0 on ranks > 0
+     * under tp_in_peer_index), so a memcpy-first fold would destroy a
+     * partial before it is read.  Accumulate per element, then write. */
+    for (uint64_t k = 0; k < words; k++) {
+        const float *s0 = tp->rank == 0 ? o :
+            (const float *)((uint8_t *)in +
+                            (uint64_t)tp_in_peer_index(tp, 0) * bytes);
+        float acc = s0[k];
+        for (int i = 1; i < tp->world; i++) {
+            const float *src = i == tp->rank ? o :
+                (const float *)((uint8_t *)in +
+                    (uint64_t)tp_in_peer_index(tp, i) * bytes);
+            acc += src[k];
+        }
+        dst[k] = acc;
+    }
+}
+
+/* Canonical rank-order fold for the ring all-reduce: rank r sums
+ * partial[0] + partial[1] + ... + partial[world-1], where partial[i] is the
+ * local out when i==r and the ring hop region holding rank i's partial
+ * otherwise.  Rank i (i != r) arrives at hop (r-1-i) mod world, so its
+ * region index is ((r-1-i) mod world).  The element-wise write makes the
+ * fold in-place safe when dst overlaps a region (the big-gate case writes
+ * the combined sum back into region 0). */
+/* Ring bulk wavefront state: each hop h's round r can post only after hop
+ * h-1's round r done barrier closes -- reading next's dgo for round r --
+ * which keeps the global round boundary that bounds the UC recv/send
+ * matching (a rank's recv for hop h can never pair with prev's hop h+1
+ * messages).  Rounds within one hop stay serial: stage_send[h] and
+ * stage_recv[h] are single-buffered per hop.  With MAX_INFLIGHT 1 the
+ * wavefront degenerates to sequential hops (the prefill-optimal schedule
+ * on this hardware); the state machine also supports a deeper overlap. */
+typedef struct {
+    uint32_t  posted;      /* rounds posted (recv + ready + send) */
+    uint32_t  done;        /* rounds consumed: copy + dgo write done */
+    uint32_t  done_read;   /* rounds whose dgo was read from next */
+    uint32_t  round;       /* in-flight round index when inflight */
+    uint32_t  chunks;
+    uint32_t  recv_done;
+    int       send_done;
+    int       inflight;
+    uint64_t  round_bytes;
+} tp_ring_bulk_hop;
+
+/* Poll both ring links for the pipelined wavefront: prev's CQ carries the
+ * bulk recv completions of every in-flight round (wr_id encodes the hop),
+ * next's CQ carries the bulk send completions.  Non-bulk completions update
+ * the per-link gate-seq watermark / send-outstanding count. */
+static int tp_rdma_ring_bulk_wave_poll(ds4_tp *tp, int prev, int next,
+                                       tp_ring_bulk_hop *st, uint32_t hops) {
+    ds4_tp_rdma_link *rp = &tp->rdma[prev];
+    struct ibv_wc wc[DS4_TP_RDMA_BULK_SLOTS + 1u];
+    int n = ibv_poll_cq(rp->cq, (int)(DS4_TP_RDMA_BULK_SLOTS + 1u), wc);
+    if (n < 0) return 0;
+    for (int i = 0; i < n; i++) {
+        if (wc[i].status != IBV_WC_SUCCESS) {
+            fprintf(stderr,
+                    "ds4-tp: ring bulk rdma completion error (prev %d): %s\n",
+                    prev, tp_wc_status_str(wc[i].status));
+            return 0;
+        }
+        if (wc[i].opcode & IBV_WC_RECV) {
+            if (wc[i].wr_id & DS4_TP_RDMA_BULK_WR_TAG) {
+                const uint32_t h = (uint32_t)((wc[i].wr_id >> 32) & 0xFFFFu);
+                if (h > 0 && h <= hops) st[h - 1].recv_done++;
+            } else if (wc[i].wr_id > rp->recv_done) {
+                rp->recv_done = wc[i].wr_id;
+            }
+        } else if (rp->send_outstanding > 0) {
+            rp->send_outstanding--;
+        }
+    }
+    ds4_tp_rdma_link *rn = &tp->rdma[next];
+    n = ibv_poll_cq(rn->cq, (int)(DS4_TP_RDMA_BULK_SLOTS + 1u), wc);
+    if (n < 0) return 0;
+    for (int i = 0; i < n; i++) {
+        if (wc[i].status != IBV_WC_SUCCESS) {
+            fprintf(stderr,
+                    "ds4-tp: ring bulk rdma completion error (next %d): %s\n",
+                    next, tp_wc_status_str(wc[i].status));
+            return 0;
+        }
+        if (wc[i].opcode & IBV_WC_RECV) {
+            if (wc[i].wr_id > rn->recv_done) rn->recv_done = wc[i].wr_id;
+        } else if (wc[i].wr_id & DS4_TP_RDMA_BULK_WR_TAG) {
+            const uint32_t h = (uint32_t)((wc[i].wr_id >> 32) & 0xFFFFu);
+            if (h > 0 && h <= hops) {
+                st[h - 1].send_done = 1;
+            } else if (rn->send_outstanding > 0) {
+                /* Drain-send completion (tag with h==0): count against the
+                 * outstanding drain sends, not a bulk round.  The drain
+                 * normally consumes its own completions before the bulk
+                 * exchange, so this is defensive only. */
+                rn->send_outstanding--;
+            }
+        } else if (rn->send_outstanding > 0) {
+            rn->send_outstanding--;
+        }
+    }
+    return 1;
+}
+
+/* RDMA ring bulk exchange: circulate one payload through next/prev (world-1
+ * hops), chunked into DS4_TP_RDMA_BULK_SLOTS x 16 KiB messages per round.
+ * Per-hop recvs land in `in` region h (hop_stride apart); hop h's relay is
+ * out (h==0) or region h-1.  A per-round ready handshake on the data sockets
+ * bounds the UC recv/send matching skew, and a per-round done barrier
+ * (dgo write to prev, dgo read from next after the recv copy) closes the
+ * global round boundary before the next hop's matching round starts.  The
+ * schedule is a wavefront over per-hop state: hop h advances round r only
+ * after hop h-1's round r done barrier, so with a deep-enough recv queue
+ * hop h's round r+1 overlaps hop h+1's round r.  On AppleThunderboltRDMA the
+ * UC queues reject posts past ~128 send / ~192 recv WQEs, so MAX_INFLIGHT 1
+ * keeps one round in flight -- the exchange is sequential, which is optimal
+ * for the single TP service thread (it serializes the handshakes; the
+ * handshake count, not wire round-trips, is the prefill cost).  Each hop has
+ * its own staging slot (stage_send[h]/stage_recv[h]) so a deeper wavefront
+ * would not collide.  Both links' CQs are drained by the wave poll.  The
+ * final canonical rank-order fold writes the combined sum into fold_dst
+ * (region 0 for the big gate, the batch combined slot for the batch gate). */
+static int tp_rdma_ring_bulk_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
+                                      const void *out, void *in, uint64_t bytes,
+                                      uint64_t hop_stride, uint16_t gate,
+                                      float *fold_dst) {
+    const int next = (tp->rank + 1) % tp->world;
+    const int prev = (tp->rank + tp->world - 1) % tp->world;
+    if (tp->data_fd[next] < 0 || tp->data_fd[prev] < 0) return 0;
+    ds4_tp_rdma_link *rn = &tp->rdma[next];
+    ds4_tp_rdma_link *rp = &tp->rdma[prev];
+    if (!rn->qp || !rn->mr || !rp->qp || !rp->mr) return 0;
+    if (bytes == 0) return 0;
+
+    /* Header barrier: write our header to next, read prev's, verify. */
+    ds4_tp_gate_header h = { DS4_TP_BATCH_MAGIC, (uint16_t)layer, gate, seq };
+    if (!tp_write_full(tp->data_fd[next], &h, sizeof(h))) return 0;
     ds4_tp_gate_header ph;
-    const bool header_ok = tp_write_full(tp->data_fd, &h, sizeof(h)) &&
-        tp_read_full(tp->data_fd, &ph, sizeof(ph));
-    if (!header_ok)
-        fprintf(stderr, "ds4-tp: big gate header exchange failed or peer closed (layer %u seq %llu): %s\n",
-                layer, (unsigned long long)seq, strerror(errno));
-    const bool timeout_restored = tp_socket_set_gate_timeout(tp->data_fd, tp->gate_timeout_ms);
-    if (!header_ok || !timeout_restored) return 0;
-#ifdef DS4_TP_HAVE_VERBS
-    const double t_hs = dbg ? tp_now_sec() : 0.0;
-#endif
+    if (!tp_read_full(tp->data_fd[prev], &ph, sizeof(ph))) return 0;
     if (ph.magic != DS4_TP_BATCH_MAGIC || ph.layer != layer ||
-        ph.gate != 0xB16u || ph.seq != seq) {
+        ph.gate != gate || ph.seq != seq) {
         fprintf(stderr,
-                "ds4-tp: big gate desync: got l=%u tag=%x seq=%llu, want l=%u seq=%llu\n",
+                "ds4-tp: ring bulk desync: got l=%u tag=%x seq=%llu, want l=%u seq=%llu\n",
                 ph.layer, ph.gate, (unsigned long long)ph.seq,
                 layer, (unsigned long long)seq);
         return 0;
     }
+
+    /* Drain decode lookahead receives on both links before reusing the QPs. */
+    if (!tp_rdma_drain_decode_window(tp, next)) return 0;
+    if (!tp_rdma_drain_decode_window(tp, prev)) return 0;
+
+    const uintptr_t slab_lo = (uintptr_t)tp->slab;
+    const uintptr_t slab_hi = slab_lo + tp->slab_bytes;
+    /* Direct path: both out and in must fit in the registered slab.  The in
+     * side spans the whole hop region set ((hops-1)*hop_stride + bytes), so
+     * check the full extent, not just the first round. */
+    const uint64_t in_extent = (uint64_t)(tp->world - 2u) * hop_stride + bytes;
+    const int direct = out && in &&
+        (uintptr_t)out >= slab_lo && (uintptr_t)out <= slab_hi &&
+        bytes <= slab_hi - (uintptr_t)out &&
+        (uintptr_t)in >= slab_lo && (uintptr_t)in <= slab_hi &&
+        in_extent <= slab_hi - (uintptr_t)in;
+
+    const uint32_t hops = (uint32_t)tp->world - 1u;
+    const uint64_t ROUND = (uint64_t)DS4_TP_RDMA_BULK_SLOTS * DS4_TP_RDMA_MAX_MSG;
+    const uint64_t total_rounds = (bytes + ROUND - 1u) / ROUND;
+    uint8_t *stage_send = tp->slab + tp->bulk_stage_off;
+    uint8_t *stage_recv = tp->slab + tp->bulk_stage_off +
+                          (uint64_t)(tp->world - 1) * tp->bulk_stage_bytes;
+
+    tp_ring_bulk_hop st[DS4_TP_MAX_WORLD - 1u];
+    memset(st, 0, sizeof(st));
+    uint32_t inflight_count = 0;
+
+    double deadline = tp_now_sec() + (double)tp->timeout_sec;
+    uint32_t peer_poll = 0;
+    while (st[hops - 1].done_read < total_rounds) {
+        const uint64_t done_before = st[hops - 1].done_read;
+        /* Service completions on both links; distribute to the in-flight
+         * rounds by their hop tag. */
+        if (!tp_rdma_ring_bulk_wave_poll(tp, prev, next, st, hops)) return 0;
+
+        /* Complete rounds whose recv + send finished: copy the staging into
+         * the hop region, then run the round-done barrier so the next hop's
+         * matching round may start. */
+        for (uint32_t h = 0; h < hops; h++) {
+            tp_ring_bulk_hop *s = &st[h];
+            if (!s->inflight || s->recv_done < s->chunks || !s->send_done)
+                continue;
+            const uint64_t roff = (uint64_t)s->round * ROUND;
+            if (!direct) {
+                uint64_t c = 0;
+                for (uint32_t i = 0; i < s->chunks; i++) {
+                    const uint64_t left = s->round_bytes - c;
+                    const uint32_t len = (uint32_t)(left > DS4_TP_RDMA_MAX_MSG ?
+                                                    DS4_TP_RDMA_MAX_MSG : left);
+                    memcpy((uint8_t *)in + (uint64_t)h * hop_stride + roff + c,
+                           stage_recv + (uint64_t)h * tp->bulk_stage_bytes +
+                               (uint64_t)i * DS4_TP_RDMA_MAX_MSG,
+                           len);
+                    c += len;
+                }
+            }
+            char dgo = 0;
+            if (!tp_write_full(tp->data_fd[prev], &dgo, 1)) return 0;
+            if (!tp_read_full(tp->data_fd[next], &dgo, 1)) return 0;
+            s->done++;
+            s->done_read++;
+            s->inflight = 0;
+            inflight_count--;
+        }
+
+        /* Post new rounds as their gates open: same-hop serial (stage h free)
+         * and the global round boundary from hop h-1's done barrier. */
+        for (uint32_t h = 0; h < hops; h++) {
+            tp_ring_bulk_hop *s = &st[h];
+            if (s->inflight || s->posted >= total_rounds) continue;
+            const uint32_t r = s->posted;
+            if (s->done < r) continue;
+            if (h > 0 && st[h - 1].done_read < r + 1) continue;
+            if (inflight_count >= DS4_TP_RDMA_BULK_MAX_INFLIGHT) continue;
+
+            const uint64_t roff = (uint64_t)r * ROUND;
+            const uint64_t remaining = bytes - roff;
+            uint32_t chunks = (uint32_t)((remaining + DS4_TP_RDMA_MAX_MSG - 1u) /
+                                         DS4_TP_RDMA_MAX_MSG);
+            if (chunks > DS4_TP_RDMA_BULK_SLOTS) chunks = DS4_TP_RDMA_BULK_SLOTS;
+            uint64_t round_bytes = 0;
+            uint32_t lens[DS4_TP_RDMA_BULK_SLOTS];
+            uint64_t chunk_off[DS4_TP_RDMA_BULK_SLOTS];
+            for (uint32_t i = 0; i < chunks; i++) {
+                const uint64_t left = remaining - round_bytes;
+                lens[i] = (uint32_t)(left > DS4_TP_RDMA_MAX_MSG ?
+                                     DS4_TP_RDMA_MAX_MSG : left);
+                chunk_off[i] = direct ? round_bytes :
+                    (uint64_t)i * DS4_TP_RDMA_MAX_MSG;
+                round_bytes += lens[i];
+            }
+            const void *relay = h == 0 ? out :
+                (const void *)((uint8_t *)in + (uint64_t)(h - 1) * hop_stride);
+            uint8_t *hopbuf = (uint8_t *)in + (uint64_t)h * hop_stride;
+            if (!direct) {
+                uint64_t c = 0;
+                for (uint32_t i = 0; i < chunks; i++) {
+                    memcpy(stage_send + (uint64_t)h * tp->bulk_stage_bytes +
+                               (uint64_t)i * DS4_TP_RDMA_MAX_MSG,
+                           (const uint8_t *)relay + roff + c, lens[i]);
+                    c += lens[i];
+                }
+            }
+
+            struct ibv_sge recv_sge[DS4_TP_RDMA_BULK_SLOTS];
+            struct ibv_recv_wr recv_wr[DS4_TP_RDMA_BULK_SLOTS];
+            memset(recv_wr, 0, sizeof(recv_wr));
+            for (uint32_t i = 0; i < chunks; i++) {
+                recv_sge[i] = (struct ibv_sge) {
+                    .addr = direct ?
+                        (uintptr_t)(hopbuf + roff + chunk_off[i]) :
+                        (uintptr_t)(stage_recv + (uint64_t)h * tp->bulk_stage_bytes +
+                                    chunk_off[i]),
+                    .length = lens[i],
+                    .lkey = rp->mr->lkey,
+                };
+                recv_wr[i].wr_id = DS4_TP_RDMA_BULK_WR_TAG |
+                    ((uint64_t)(h + 1) << 32) | ((uint64_t)i + 1u);
+                recv_wr[i].sg_list = &recv_sge[i];
+                recv_wr[i].num_sge = 1;
+                recv_wr[i].next = i + 1u < chunks ? &recv_wr[i + 1u] : NULL;
+            }
+            struct ibv_recv_wr *bad_recv = NULL;
+            if (ibv_post_recv(rp->qp, recv_wr, &bad_recv) != 0) {
+                fprintf(stderr, "ds4-tp: ring bulk post_recv h=%u r=%u: %s\n",
+                        h, r, strerror(errno));
+                return 0;
+            }
+
+            /* Per-round ready handshake (reverse ring): tell prev we have
+             * posted this round's recvs and wait for next's go, so next has
+             * posted its matching recv before our send lands. */
+            char go = 0;
+            if (!tp_write_full(tp->data_fd[prev], &go, 1)) return 0;
+            if (!tp_read_full(tp->data_fd[next], &go, 1)) return 0;
+
+            struct ibv_sge send_sge[DS4_TP_RDMA_BULK_SLOTS];
+            struct ibv_send_wr send_wr[DS4_TP_RDMA_BULK_SLOTS];
+            memset(send_wr, 0, sizeof(send_wr));
+            for (uint32_t i = 0; i < chunks; i++) {
+                send_sge[i] = (struct ibv_sge) {
+                    .addr = direct ?
+                        (uintptr_t)((const uint8_t *)relay + roff + chunk_off[i]) :
+                        (uintptr_t)(stage_send + (uint64_t)h * tp->bulk_stage_bytes +
+                                    chunk_off[i]),
+                    .length = lens[i],
+                    .lkey = rn->mr->lkey,
+                };
+                send_wr[i].wr_id = DS4_TP_RDMA_BULK_WR_TAG |
+                    ((uint64_t)(h + 1) << 32) | ((uint64_t)i + 1u);
+                send_wr[i].sg_list = &send_sge[i];
+                send_wr[i].num_sge = 1;
+                send_wr[i].opcode = IBV_WR_SEND;
+                send_wr[i].send_flags = i + 1u == chunks ? IBV_SEND_SIGNALED : 0;
+                send_wr[i].next = i + 1u < chunks ? &send_wr[i + 1u] : NULL;
+            }
+            struct ibv_send_wr *bad_send = NULL;
+            if (ibv_post_send(rn->qp, send_wr, &bad_send) != 0) {
+                fprintf(stderr, "ds4-tp: ring bulk post_send: %s\n",
+                        strerror(errno));
+                return 0;
+            }
+
+            s->round = r;
+            s->chunks = chunks;
+            s->round_bytes = round_bytes;
+            s->recv_done = 0;
+            s->send_done = 0;
+            s->inflight = 1;
+            s->posted = r + 1;
+            inflight_count++;
+        }
+
+        if ((peer_poll++ & 0x3fffu) == 0 &&
+            (tp_peer_closed(tp, prev) || tp_peer_closed(tp, next))) {
+            fprintf(stderr,
+                    "ds4-tp: peer %d/%d disconnected during ring bulk\n",
+                    prev, next);
+            return 0;
+        }
+        /* Progress-based deadline: reset whenever the exchange advances, so a
+         * lowered DS4_TP_TIMEOUT_SEC cannot time out a large multi-round gate
+         * that is still making progress (a stall with no progress still
+         * times out). */
+        if (st[hops - 1].done_read > done_before) {
+            deadline = tp_now_sec() + (double)tp->timeout_sec;
+        }
+        if (tp_now_sec() > deadline) {
+            fprintf(stderr,
+                    "ds4-tp: ring bulk timeout (%llu/%llu rounds)\n",
+                    (unsigned long long)st[hops - 1].done_read,
+                    (unsigned long long)total_rounds);
+            return 0;
+        }
+    }
+    /* Canonical rank-order fold into fold_dst (in-place safe when fold_dst
+     * overlaps region 0). */
+    tp_ring_fold(tp, (const float *)out, (const float *)in,
+                 hop_stride / sizeof(float), bytes / sizeof(float),
+                 fold_dst);
+    return 1;
+}
+
+static void tp_ring_fold(ds4_tp *tp, const float *out,
+                         const float *regions, uint64_t region_stride,
+                         uint64_t words, float *dst) {
+    const int w = (int)tp->world;
+    const int r = (int)tp->rank;
+    for (uint64_t k = 0; k < words; k++) {
+        const float *s0 = r == 0 ? out :
+            regions + (uint64_t)((r - 1 + w) % w) * region_stride;
+        float acc = s0[k];
+        for (int i = 1; i < w; i++) {
+            const float *src = i == r ? out :
+                regions + (uint64_t)((r - 1 - i + w) % w) * region_stride;
+            acc += src[k];
+        }
+        dst[k] = acc;
+    }
+}
+
+static int tp_tcp_big_exchange(ds4_tp *tp, int peer,
+                               const void *out, void *in, uint64_t bytes) {
+    uint64_t off = 0;
+    while (off < bytes) {
+        const uint64_t n = bytes - off > DS4_TP_BIG_CHUNK ?
+                           DS4_TP_BIG_CHUNK : bytes - off;
+        if (!tp_write_full(tp->data_fd[peer], (const char *)out + off, n))
+            return 0;
+        if (!tp_read_full(tp->data_fd[peer], (char *)in + off, n)) return 0;
+        off += n;
+    }
+    return 1;
+}
+
+int ds4_tp_big_gate_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
+                             const void *out, void *in, uint64_t bytes) {
+    if (!out || !in || bytes == 0) return 0;
+    ds4_tp_gate_header h = { DS4_TP_BATCH_MAGIC, (uint16_t)layer, 0xB16u, seq };
+    if (tp->ring) {
 #ifdef DS4_TP_HAVE_VERBS
-    if (tp->rdma_active && tp_rdma_big_gate_capable(tp)) {
-        if (!tp_rdma_drain_decode_window(tp)) return 0;
-        const int ok = tp_rdma_big_gate_exchange(tp, out, in, bytes);
-        if (dbg) {
-            static unsigned n;
-            static double hs_acc, tx_acc, last_end;
-            const double t_end = tp_now_sec();
-            hs_acc += t_hs - t_start; tx_acc += t_end - t_hs;
-            if (getenv("DS4_TP_BIG_GATE_DEBUG")[0] == '2')
-                fprintf(stderr, "ds4-tp: big gate #%u layer %u: %llu bytes, since last release %.2f ms, handshake %.2f, transfer %.2f\n",
-                        n + 1, layer, (unsigned long long)bytes,
-                        last_end > 0.0 ? (t_start - last_end) * 1e3 : 0.0,
-                        (t_hs - t_start) * 1e3, (t_end - t_hs) * 1e3);
-            last_end = t_end;
-            if ((++n % 32u) == 0u) {
-                fprintf(stderr, "ds4-tp: big gate %u: %llu bytes, last: handshake wait %.2f ms, transfer %.2f ms; avg over 32: %.2f / %.2f ms\n",
-                        n, (unsigned long long)bytes, (t_hs - t_start) * 1e3, (t_end - t_hs) * 1e3,
-                        hs_acc / 32.0 * 1e3, tx_acc / 32.0 * 1e3);
-                hs_acc = tx_acc = 0.0;
+        /* DS4_TP_BIG_TCP (negotiated across ranks in the hello) forces the
+         * TCP ring bulk for the big gate (the RDMA bulk's per-round
+         * ready/done handshakes cost prefill latency; the TCP write/read has
+         * no explicit handshake). */
+        if (tp->rdma_active && !tp->big_tcp_override) {
+            return tp_rdma_ring_bulk_exchange(tp, layer, seq, out, in, bytes,
+                                              bytes, 0xB16u, (float *)in);
+        }
+#endif
+        /* Ring bulk over TCP: circulate the running sum through next/prev.
+         * The caller's `in` carries (world-1)*bytes; region 0 is the
+         * accumulator and region 1 the per-hop receive buffer. */
+        const int next = (tp->rank + 1) % tp->world;
+        const int prev = (tp->rank + tp->world - 1) % tp->world;
+        if (tp->data_fd[next] < 0 || tp->data_fd[prev] < 0) return 0;
+        if (!tp_write_full(tp->data_fd[next], &h, sizeof(h))) return 0;
+        ds4_tp_gate_header ph;
+        if (!tp_read_full(tp->data_fd[prev], &ph, sizeof(ph))) return 0;
+        if (ph.magic != DS4_TP_BATCH_MAGIC || ph.layer != layer ||
+            ph.gate != 0xB16u || ph.seq != seq) {
+            fprintf(stderr,
+                    "ds4-tp: ring big gate desync: got l=%u tag=%x seq=%llu, "
+                    "want l=%u seq=%llu\n",
+                    ph.layer, ph.gate, (unsigned long long)ph.seq,
+                    layer, (unsigned long long)seq);
+            return 0;
+        }
+        const uint64_t words = bytes / sizeof(float);
+        const uint32_t hops = (uint32_t)tp->world - 1u;
+        /* Each hop's incoming partial lands in its own region h of `in`
+         * ((world-1)*bytes), and hop h's relay is out (h==0) or region h-1.
+         * This also keeps the writes inside (world-1)*bytes for world==3
+         * (the old alternating two-buffer scheme ran past the end).  The
+         * final canonical rank-order fold writes the combined sum back into
+         * region 0 in-place. */
+        for (uint32_t h = 0; h < hops; h++) {
+            const void *relay = h == 0 ? (const void *)out :
+                (const void *)((uint8_t *)in + (uint64_t)(h - 1) * bytes);
+            uint8_t *hopbuf = (uint8_t *)in + (uint64_t)h * bytes;
+            uint64_t off = 0;
+            while (off < bytes) {
+                const uint64_t n = bytes - off > DS4_TP_BIG_CHUNK ?
+                    DS4_TP_BIG_CHUNK : bytes - off;
+                if (!tp_write_full(tp->data_fd[next], (char *)relay + off, n))
+                    return 0;
+                if (!tp_read_full(tp->data_fd[prev], hopbuf + off, n))
+                    return 0;
+                off += n;
             }
         }
-        return ok;
+        tp_ring_fold(tp, (const float *)out, (const float *)in,
+                     words, words, (float *)in);
+        if (getenv("DS4_GLM_TP_DEBUG")) {
+            const float *o = (const float *)out;
+            const float *i0 = (const float *)in;
+            fprintf(stderr,
+                    "ds4-tp: ring big gate l=%u seq=%llu out[0..3]=%g %g %g %g in[0..3]=%g %g %g %g\n",
+                    layer, (unsigned long long)seq,
+                    o[0], o[1], o[2], o[3], i0[0], i0[1], i0[2], i0[3]);
+        }
+        return 1;
+    }
+#ifdef DS4_TP_HAVE_VERBS
+    if (tp->rdma_active) {
+        /* Per-link header barrier and drain, then the bulk exchange with all
+         * peers in flight (each link is its own QP, so the transfers run
+         * concurrently instead of serially). */
+        for (int m = 0; m < tp->world; m++) {
+            if (m == tp->rank) continue;
+            if (!tp_write_full(tp->data_fd[m], &h, sizeof(h))) return 0;
+            ds4_tp_gate_header ph;
+            if (!tp_read_full(tp->data_fd[m], &ph, sizeof(ph))) return 0;
+            if (ph.magic != DS4_TP_BATCH_MAGIC || ph.layer != layer ||
+                ph.gate != 0xB16u || ph.seq != seq) {
+                fprintf(stderr,
+                        "ds4-tp: big gate desync: got l=%u tag=%x seq=%llu, want l=%u seq=%llu\n",
+                        ph.layer, ph.gate, (unsigned long long)ph.seq,
+                        layer, (unsigned long long)seq);
+                return 0;
+            }
+            if (!tp_rdma_drain_decode_window(tp, m)) return 0;
+        }
+        tp_rdma_bulk_peer st[DS4_TP_MAX_WORLD];
+        int npeers = 0;
+        for (int m = 0; m < tp->world; m++) {
+            if (m == tp->rank) continue;
+            uint8_t *in_peer = (uint8_t *)in +
+                (tp->world > 2 ? (uint64_t)tp_in_peer_index(tp, m) * bytes : 0);
+            if (!tp_rdma_bulk_peer_init(tp, &st[npeers], m, out, in_peer, bytes))
+                return 0;
+            npeers++;
+        }
+        for (int i = 0; i < npeers; i++) {
+            if (!tp_rdma_bulk_peer_post(tp, &st[i])) return 0;
+        }
+        for (int i = 0; i < npeers; i++) {
+            if (!tp_rdma_bulk_peer_finish(tp, &st[i])) return 0;
+        }
+        if (getenv("DS4_GLM_TP_DEBUG")) {
+            const float *o = (const float *)out;
+            const float *i0 = (const float *)in;
+            fprintf(stderr,
+                    "ds4-tp: big gate l=%u seq=%llu out[0..3]=%g %g %g %g in[0..3]=%g %g %g %g\n",
+                    layer, (unsigned long long)seq,
+                    o[0], o[1], o[2], o[3], i0[0], i0[1], i0[2], i0[3]);
+        }
+        if (tp->world > 2) tp_big_combine(tp, out, in, bytes);
+        return 1;
     }
 #endif
-    if (!tp_tcp_exchange(tp, NULL, NULL, out, in, bytes)) {
-        fprintf(stderr, "ds4-tp: big gate payload exchange failed (layer %u): %s\n",
-                layer, strerror(errno));
-        return 0;
+    for (int m = 0; m < tp->world; m++) {
+        if (m == tp->rank) continue;
+        if (!tp_write_full(tp->data_fd[m], &h, sizeof(h))) return 0;
+        ds4_tp_gate_header ph;
+        if (!tp_read_full(tp->data_fd[m], &ph, sizeof(ph))) return 0;
+        if (ph.magic != DS4_TP_BATCH_MAGIC || ph.layer != layer ||
+            ph.gate != 0xB16u || ph.seq != seq) {
+            fprintf(stderr,
+                    "ds4-tp: big gate desync: got l=%u tag=%x seq=%llu, want l=%u seq=%llu\n",
+                    ph.layer, ph.gate, (unsigned long long)ph.seq,
+                    layer, (unsigned long long)seq);
+            return 0;
+        }
+    }
+    for (int m = 0; m < tp->world; m++) {
+        if (m == tp->rank) continue;
+        uint8_t *in_peer = (uint8_t *)in +
+            (tp->world > 2 ? (uint64_t)tp_in_peer_index(tp, m) * bytes : 0);
+        if (!tp_tcp_big_exchange(tp, m, out, in_peer, bytes)) return 0;
     }
     if (getenv("DS4_GLM_TP_DEBUG")) {
-        const float *o = (const float *)out, *i = (const float *)in;
+        const float *o = (const float *)out;
+        const float *i0 = (const float *)in;
         fprintf(stderr,
                 "ds4-tp: big gate l=%u seq=%llu out[0..3]=%g %g %g %g in[0..3]=%g %g %g %g\n",
                 layer, (unsigned long long)seq,
-                o[0], o[1], o[2], o[3], i[0], i[1], i[2], i[3]);
+                o[0], o[1], o[2], o[3], i0[0], i0[1], i0[2], i0[3]);
     }
+    if (tp->world > 2) tp_big_combine(tp, out, in, bytes);
     return 1;
 }
 
@@ -2366,23 +3648,6 @@ typedef struct {
     uint32_t count;
     uint32_t reserved;
 } ds4_tp_token_command_header;
-
-typedef struct {
-    uint64_t session_id;
-    uint32_t token_count;
-    uint32_t image_count;
-} ds4_tp_multimodal_command_header;
-
-typedef struct {
-    uint32_t token_start;
-    uint32_t token_count;
-    uint32_t data_width;
-    uint32_t width;
-    uint32_t height;
-    uint32_t content_width;
-    uint32_t content_height;
-    uint8_t fingerprint[32];
-} ds4_tp_vision_wire;
 
 typedef struct {
     uint64_t session_id;
@@ -2414,6 +3679,21 @@ typedef struct {
     uint32_t reserved;
 } ds4_tp_command_ack;
 
+/* Control fan-out: the leader broadcasts a frame to every worker, a worker
+ * sends to its single leader channel (rank 0).  Ring mode relays through
+ * the ring; otherwise the direct per-worker control sockets are used. */
+static int tp_send_control(ds4_tp *tp, uint32_t type,
+                           const void *payload, uint32_t bytes) {
+    if (tp->rank == 0) {
+        for (int m = 1; m < tp->world; m++) {
+            if (!tp_ctrl_send(tp, m, type, payload, bytes)) return 0;
+        }
+    } else {
+        if (!tp_ctrl_send(tp, 0, type, payload, bytes)) return 0;
+    }
+    return 1;
+}
+
 static int tp_send_token_command(ds4_tp *tp, uint32_t type,
                                  uint64_t session_id, const int *tokens,
                                  uint32_t count) {
@@ -2427,20 +3707,20 @@ static int tp_send_token_command(ds4_tp *tp, uint32_t type,
     memcpy(payload, &h, sizeof(h));
     int32_t *wire_tokens = (int32_t *)(payload + sizeof(h));
     for (uint32_t i = 0; i < count; i++) wire_tokens[i] = (int32_t)tokens[i];
-    const int ok = tp_send_frame(tp->control_fd, type, payload, bytes);
+    const int ok = tp_send_control(tp, type, payload, bytes);
     free(payload);
     return ok;
 }
 
 int ds4_tp_send_session_create(ds4_tp *tp, uint64_t session_id, int ctx_size) {
     ds4_tp_value_command msg = { session_id, (int32_t)ctx_size, 0 };
-    return tp_send_frame(tp->control_fd, DS4_TP_FRAME_SESSION_CREATE,
-                         &msg, sizeof(msg));
+    return tp_send_control(tp, DS4_TP_FRAME_SESSION_CREATE,
+                           &msg, sizeof(msg));
 }
 
 int ds4_tp_send_session_destroy(ds4_tp *tp, uint64_t session_id) {
-    return tp_send_frame(tp->control_fd, DS4_TP_FRAME_SESSION_DESTROY,
-                         &session_id, sizeof(session_id));
+    return tp_send_control(tp, DS4_TP_FRAME_SESSION_DESTROY,
+                           &session_id, sizeof(session_id));
 }
 
 int ds4_tp_send_sync(ds4_tp *tp, uint64_t session_id,
@@ -2449,85 +3729,21 @@ int ds4_tp_send_sync(ds4_tp *tp, uint64_t session_id,
                                  tokens, n_tokens);
 }
 
-int ds4_tp_send_sync_multimodal(ds4_tp *tp, uint64_t session_id,
-                                const int *tokens, uint32_t n_tokens,
-                                const ds4_vision_span *images,
-                                uint32_t image_count) {
-    uint64_t bytes64 = sizeof(ds4_tp_multimodal_command_header) +
-                       (uint64_t)n_tokens * sizeof(int32_t);
-    if (!tp || (!tokens && n_tokens) || (!images && image_count) ||
-        tp->n_embd == 0 || bytes64 > UINT32_MAX)
-        return 0;
-    for (uint32_t i = 0; i < image_count; i++) {
-        const uint64_t values = (uint64_t)images[i].embedding.token_count *
-                                tp->n_embd;
-        if (values > UINT64_MAX / sizeof(float)) return 0;
-        const uint64_t data_bytes = values * sizeof(float);
-        const uint64_t add_bytes = sizeof(ds4_tp_vision_wire) + data_bytes;
-        if (!images[i].embedding.data || add_bytes > UINT32_MAX ||
-            bytes64 > UINT32_MAX - add_bytes)
-            return 0;
-        bytes64 += add_bytes;
-    }
-    uint8_t *payload = malloc((size_t)bytes64);
-    if (!payload) return 0;
-    ds4_tp_multimodal_command_header h = {
-        session_id, n_tokens, image_count
-    };
-    memcpy(payload, &h, sizeof(h));
-    uint8_t *p = payload + sizeof(h);
-    int32_t *wire_tokens = (int32_t *)p;
-    for (uint32_t i = 0; i < n_tokens; i++) wire_tokens[i] = tokens[i];
-    p += (uint64_t)n_tokens * sizeof(int32_t);
-    for (uint32_t i = 0; i < image_count; i++) {
-        const ds4_vision_embedding *embedding = &images[i].embedding;
-        ds4_tp_vision_wire wire = {
-            images[i].token_start,
-            embedding->token_count,
-            tp->n_embd,
-            embedding->width,
-            embedding->height,
-            embedding->content_width,
-            embedding->content_height,
-            {0},
-        };
-        memcpy(wire.fingerprint, embedding->fingerprint,
-               sizeof(wire.fingerprint));
-        memcpy(p, &wire, sizeof(wire));
-        p += sizeof(wire);
-        uint64_t data_bytes = (uint64_t)embedding->token_count *
-                              tp->n_embd * sizeof(float);
-        memcpy(p, embedding->data, (size_t)data_bytes);
-        p += data_bytes;
-    }
-    int ok = tp_send_frame(tp->control_fd, DS4_TP_FRAME_SYNC_MULTIMODAL,
-                           payload, (uint32_t)bytes64);
-    free(payload);
-    return ok;
-}
-
 int ds4_tp_send_eval(ds4_tp *tp, uint64_t session_id,
                      uint64_t seq, int token) {
     ds4_tp_eval_command msg = { session_id, seq, (int32_t)token, 0 };
-    return tp_send_frame(tp->control_fd, DS4_TP_FRAME_EVAL, &msg, sizeof(msg));
-}
-
-int ds4_tp_send_glm_mtp(ds4_tp *tp, uint64_t session_id,
-                       uint64_t seq, int token, int limit) {
-    if (limit < 1 || limit > 2) return 0;
-    ds4_tp_eval_command msg = { session_id, seq, (int32_t)token, (uint32_t)limit };
-    return tp_send_frame(tp->control_fd, DS4_TP_FRAME_GLM_MTP, &msg, sizeof(msg));
+    return tp_send_control(tp, DS4_TP_FRAME_EVAL, &msg, sizeof(msg));
 }
 
 int ds4_tp_send_rewind(ds4_tp *tp, uint64_t session_id, int pos) {
     ds4_tp_value_command msg = { session_id, (int32_t)pos, 0 };
-    return tp_send_frame(tp->control_fd, DS4_TP_FRAME_REWIND,
-                         &msg, sizeof(msg));
+    return tp_send_control(tp, DS4_TP_FRAME_REWIND,
+                           &msg, sizeof(msg));
 }
 
 int ds4_tp_send_invalidate(ds4_tp *tp, uint64_t session_id) {
-    return tp_send_frame(tp->control_fd, DS4_TP_FRAME_INVALIDATE,
-                         &session_id, sizeof(session_id));
+    return tp_send_control(tp, DS4_TP_FRAME_INVALIDATE,
+                           &session_id, sizeof(session_id));
 }
 
 int ds4_tp_send_eval_batch(ds4_tp *tp, const ds4_tp_batch_item *items,
@@ -2541,8 +3757,8 @@ int ds4_tp_send_eval_batch(ds4_tp *tp, const ds4_tp_batch_item *items,
     ds4_tp_batch_command_header h = { count, 0 };
     memcpy(payload, &h, sizeof(h));
     memcpy(payload + sizeof(h), items, (size_t)count * sizeof(*items));
-    const int ok = tp_send_frame(tp->control_fd, DS4_TP_FRAME_EVAL_BATCH,
-                                 payload, bytes);
+    const int ok = tp_send_control(tp, DS4_TP_FRAME_EVAL_BATCH,
+                                   payload, bytes);
     free(payload);
     return ok;
 }
@@ -2569,90 +3785,74 @@ int ds4_tp_send_mixed_batch(ds4_tp *tp, uint64_t prefill_session_id,
         wire_tokens[i] = (int32_t)prompt[i];
     }
     memcpy(payload + sizeof(h) + prompt_bytes, items, (size_t)item_bytes);
-    const int ok = tp_send_frame(tp->control_fd, DS4_TP_FRAME_MIXED_BATCH,
-                                 payload, bytes);
+    const int ok = tp_send_control(tp, DS4_TP_FRAME_MIXED_BATCH,
+                                   payload, bytes);
     free(payload);
     return ok;
 }
 
 int ds4_tp_send_command_ack(ds4_tp *tp, uint64_t session_id, int status) {
     ds4_tp_command_ack ack = { session_id, (int32_t)status, 0 };
-    return tp_send_frame(tp->control_fd, DS4_TP_FRAME_COMMAND_ACK,
-                         &ack, sizeof(ack));
-}
-
-int ds4_tp_wait_command_status(ds4_tp *tp, uint64_t session_id, int *status,
-                               const char *operation, char *err, size_t errlen) {
-    uint32_t type = 0, bytes = 0;
-    ds4_tp_command_ack ack;
-    if (!tp_read_frame_header(tp->control_fd, &type, &bytes) ||
-        type != DS4_TP_FRAME_COMMAND_ACK || bytes != sizeof(ack) ||
-        !tp_read_full(tp->control_fd, &ack, sizeof(ack))) {
-        ds4_tp_mark_failed(tp);
-        tp_set_err(err, errlen, "tp: worker failed during %s",
-                   operation ? operation : "command");
-        return 0;
-    }
-    if (ack.session_id != session_id || ack.reserved != 0) {
-        ds4_tp_mark_failed(tp);
-        tp_set_err(err, errlen,
-                   "tp: worker %s failed (session %llu, status %d)",
-                   operation ? operation : "command",
-                   (unsigned long long)ack.session_id, (int)ack.status);
-        return 0;
-    }
-    *status = ack.status;
-    return 1;
+    return tp_send_control(tp, DS4_TP_FRAME_COMMAND_ACK,
+                           &ack, sizeof(ack));
 }
 
 int ds4_tp_wait_command_ack(ds4_tp *tp, uint64_t session_id,
                             const char *operation, char *err, size_t errlen) {
-    int status;
-    if (!ds4_tp_wait_command_status(tp, session_id, &status, operation, err, errlen))
-        return 0;
-    if (status != 0) {
-        tp_set_err(err, errlen, "tp: worker %s failed (session %llu, status %d)",
-                   operation ? operation : "command", (unsigned long long)session_id, status);
-        return 0;
+    for (int m = 0; m < tp->world; m++) {
+        if (m == tp->rank) continue;
+        if (tp->ring) {
+            uint32_t type = 0, bytes = 0;
+            uint8_t *payload = NULL;
+            ds4_tp_command_ack ack;
+            if (!tp_ctrl_recv(tp, m, &type, &payload, &bytes) ||
+                type != DS4_TP_FRAME_COMMAND_ACK || bytes != sizeof(ack)) {
+                free(payload);
+                ds4_tp_mark_failed(tp);
+                tp_set_err(err, errlen, "tp: worker %d failed during %s",
+                           m, operation ? operation : "command");
+                return 0;
+            }
+            memcpy(&ack, payload, sizeof(ack));
+            free(payload);
+            if (ack.session_id != session_id || ack.status != 0) {
+                tp_set_err(err, errlen,
+                           "tp: worker %d %s failed (session %llu, status %d)",
+                           m, operation ? operation : "command",
+                           (unsigned long long)ack.session_id, (int)ack.status);
+                return 0;
+            }
+        } else if (tp->control_fd[m] >= 0) {
+            uint32_t type = 0, bytes = 0;
+            ds4_tp_command_ack ack;
+            if (!tp_read_frame_header(tp->control_fd[m], &type, &bytes) ||
+                type != DS4_TP_FRAME_COMMAND_ACK || bytes != sizeof(ack) ||
+                !tp_read_full(tp->control_fd[m], &ack, sizeof(ack))) {
+                ds4_tp_mark_failed(tp);
+                tp_set_err(err, errlen, "tp: worker %d failed during %s",
+                           m, operation ? operation : "command");
+                return 0;
+            }
+            if (ack.session_id != session_id || ack.status != 0) {
+                tp_set_err(err, errlen,
+                           "tp: worker %d %s failed (session %llu, status %d)",
+                           m, operation ? operation : "command",
+                           (unsigned long long)ack.session_id, (int)ack.status);
+                return 0;
+            }
+        }
     }
-    return 1;
-}
-
-int ds4_tp_sync_checkpoint(ds4_tp *tp, uint32_t point, int current, int total,
-                            bool requested, bool *cancelled) {
-    if (!tp || !cancelled) return 0;
-    struct {
-        uint64_t seq;
-        uint32_t point;
-        int32_t current, total;
-        uint32_t cancelled;
-    } local = {++tp->sync_checkpoint_seq, point, current, total, requested}, peer;
-    uint32_t type, bytes;
-    if (ds4_tp_failed(tp) ||
-        !tp_send_frame(tp->control_fd, DS4_TP_FRAME_SYNC_CHECKPOINT, &local, sizeof(local)) ||
-        !tp_read_frame_header(tp->control_fd, &type, &bytes) ||
-        type != DS4_TP_FRAME_SYNC_CHECKPOINT || bytes != sizeof(peer) ||
-        !tp_read_full(tp->control_fd, &peer, sizeof(peer)) ||
-        peer.seq != local.seq || peer.point != point ||
-        peer.current != current || peer.total != total || peer.cancelled > 1u) {
-        ds4_tp_mark_failed(tp);
-        return 0;
-    }
-    *cancelled = requested || peer.cancelled;
     return 1;
 }
 
 int ds4_tp_send_stop(ds4_tp *tp) {
-    return tp_send_frame(tp->control_fd, DS4_TP_FRAME_STOP, NULL, 0);
+    return tp_send_control(tp, DS4_TP_FRAME_STOP, NULL, 0);
 }
 
 void ds4_tp_command_free(ds4_tp_command *command) {
     if (!command) return;
     free(command->tokens);
     free(command->items);
-    for (uint32_t i = 0; i < command->n_images; i++)
-        ds4_vision_embedding_free(&command->images[i].embedding);
-    free(command->images);
     memset(command, 0, sizeof(*command));
     command->type = DS4_TP_FRAME_ERROR;
 }
@@ -2679,106 +3879,21 @@ static int tp_command_decode_tokens(ds4_tp_command *command,
     return 1;
 }
 
-static int tp_command_decode_multimodal(ds4_tp *tp,
-                                        ds4_tp_command *command,
-                                        const uint8_t *payload,
-                                        uint32_t bytes,
-                                        char *err, size_t errlen) {
-    if (bytes < sizeof(ds4_tp_multimodal_command_header)) return 0;
-    ds4_tp_multimodal_command_header h;
-    memcpy(&h, payload, sizeof(h));
-    uint64_t pos = sizeof(h);
-    uint64_t token_bytes = (uint64_t)h.token_count * sizeof(int32_t);
-    if (pos + token_bytes > bytes) return 0;
-    if (h.image_count > ((uint64_t)bytes - pos - token_bytes) /
-                        sizeof(ds4_tp_vision_wire))
-        return 0;
-    int *tokens = malloc(h.token_count ?
-                         (size_t)h.token_count * sizeof(tokens[0]) : 1u);
-    ds4_vision_span *images = h.image_count ?
-        calloc(h.image_count, sizeof(images[0])) : NULL;
-    if (!tokens || (h.image_count && !images)) {
-        free(tokens);
-        free(images);
-        tp_set_err(err, errlen, "tp: multimodal command allocation failed");
-        return -1;
-    }
-    const int32_t *wire_tokens = (const int32_t *)(payload + pos);
-    for (uint32_t i = 0; i < h.token_count; i++) tokens[i] = wire_tokens[i];
-    pos += token_bytes;
-    for (uint32_t i = 0; i < h.image_count; i++) {
-        if (pos + sizeof(ds4_tp_vision_wire) > bytes) goto malformed;
-        ds4_tp_vision_wire wire;
-        memcpy(&wire, payload + pos, sizeof(wire));
-        pos += sizeof(wire);
-        uint64_t values = (uint64_t)wire.token_count * wire.data_width;
-        if (wire.token_count == 0 || wire.data_width != tp->n_embd ||
-            wire.width == 0 ||
-            values > SIZE_MAX / sizeof(float))
-            goto malformed;
-        uint64_t data_bytes = values * sizeof(float);
-        if (data_bytes > (uint64_t)bytes - pos) goto malformed;
-        images[i].token_start = wire.token_start;
-        images[i].embedding.data = malloc((size_t)data_bytes);
-        if (!images[i].embedding.data) {
-            tp_set_err(err, errlen, "tp: image embedding allocation failed");
-            goto allocation_failed;
-        }
-        images[i].embedding.token_count = wire.token_count;
-        images[i].embedding.width = wire.width;
-        images[i].embedding.height = wire.height;
-        images[i].embedding.content_width = wire.content_width;
-        images[i].embedding.content_height = wire.content_height;
-        memcpy(images[i].embedding.fingerprint, wire.fingerprint,
-               sizeof(wire.fingerprint));
-        memcpy(images[i].embedding.data, payload + pos, (size_t)data_bytes);
-        pos += data_bytes;
-    }
-    if (pos != bytes) goto malformed;
-    command->session_id = h.session_id;
-    command->tokens = tokens;
-    command->n_tokens = h.token_count;
-    command->images = images;
-    command->n_images = h.image_count;
-    return 1;
-
-malformed:
-    tp_set_err(err, errlen, "tp: malformed multimodal sync command");
-allocation_failed:
-    for (uint32_t i = 0; i < h.image_count; i++)
-        ds4_vision_embedding_free(&images[i].embedding);
-    free(images);
-    free(tokens);
-    return 0;
-}
-
 int ds4_tp_recv_command(ds4_tp *tp, ds4_tp_command *command,
                         char *err, size_t errlen) {
     memset(command, 0, sizeof(*command));
     command->type = DS4_TP_FRAME_ERROR;
     uint32_t ftype = 0, bytes = 0;
-    if (!tp_read_frame_header(tp->control_fd, &ftype, &bytes)) {
+    uint8_t *payload = NULL;
+    if (!tp_ctrl_recv(tp, 0, &ftype, &payload, &bytes)) {
         tp_set_err(err, errlen, "tp: control channel closed");
         return 0;
-    }
-    uint8_t *payload = NULL;
-    if (bytes != 0) {
-        payload = malloc(bytes);
-        if (!payload || !tp_read_full(tp->control_fd, payload, bytes)) {
-            free(payload);
-            tp_set_err(err, errlen, "tp: truncated command frame");
-            return 0;
-        }
     }
     int ok = 1;
     switch (ftype) {
     case DS4_TP_FRAME_SYNC:
     case DS4_TP_FRAME_VERIFY:
         ok = tp_command_decode_tokens(command, payload, bytes, err, errlen);
-        break;
-    case DS4_TP_FRAME_SYNC_MULTIMODAL:
-        ok = tp_command_decode_multimodal(tp, command, payload, bytes,
-                                          err, errlen);
         break;
     case DS4_TP_FRAME_SESSION_CREATE:
     case DS4_TP_FRAME_REWIND: {
@@ -2794,20 +3909,13 @@ int ds4_tp_recv_command(ds4_tp *tp, ds4_tp_command *command,
         if (bytes != sizeof(command->session_id)) { ok = 0; break; }
         memcpy(&command->session_id, payload, sizeof(command->session_id));
         break;
-    case DS4_TP_FRAME_EVAL:
-    case DS4_TP_FRAME_GLM_MTP: {
+    case DS4_TP_FRAME_EVAL: {
         ds4_tp_eval_command msg;
         if (bytes != sizeof(msg)) { ok = 0; break; }
         memcpy(&msg, payload, sizeof(msg));
         command->session_id = msg.session_id;
         command->seq = msg.seq;
         command->value = msg.token;
-        if (ftype == DS4_TP_FRAME_GLM_MTP) {
-            if (msg.reserved < 1 || msg.reserved > 2) { ok = 0; break; }
-            command->limit = (int)msg.reserved;
-        } else if (msg.reserved != 0) {
-            ok = 0;
-        }
         break;
     }
     case DS4_TP_FRAME_EVAL_BATCH: {
@@ -2876,21 +3984,89 @@ int ds4_tp_recv_command(ds4_tp *tp, ds4_tp_command *command,
     return 1;
 }
 
+int ds4_tp_send_logits(ds4_tp *tp, const float *chunk, uint32_t vocab) {
+    /* Worker ships its vocab chunk to the leader (rank 0).  The chunk slice
+     * for this rank is derived from the full vocab (remainder-aware). */
+    if (!tp || !chunk || vocab == 0 || tp->world <= 1) return 0;
+    uint32_t off = 0, count = 0;
+    ds4_tp_vocab_slice(vocab, (uint32_t)tp->world, (uint32_t)tp->rank,
+                       &off, &count);
+    if (count == 0) return 0;
+    return tp_send_control(tp, DS4_TP_FRAME_LOGITS,
+                           chunk + (uint64_t)off, count * sizeof(float));
+}
+
+int ds4_tp_recv_logits(ds4_tp *tp, float *dst, uint32_t vocab) {
+    /* Leader receives each worker's chunk into dst at its vocab-split
+     * offset; dst is the base of the leader's full logits buffer (its own
+     * chunk is already computed locally at its own offset). */
+    if (!tp || !dst || vocab == 0) return 0;
+    for (int m = 0; m < tp->world; m++) {
+        if (m == tp->rank) continue;
+        uint32_t off = 0, count = 0;
+        ds4_tp_vocab_slice(vocab, (uint32_t)tp->world, (uint32_t)m,
+                           &off, &count);
+        if (count == 0) continue;
+        const uint32_t want_bytes = count * sizeof(float);
+        uint32_t type = 0, bytes = 0;
+        uint8_t *payload = NULL;
+        if (tp->ring) {
+            if (!tp_ctrl_recv(tp, m, &type, &payload, &bytes)) return 0;
+        } else if (tp->control_fd[m] >= 0) {
+            if (!tp_read_frame_header(tp->control_fd[m], &type, &bytes)) return 0;
+            if (type == DS4_TP_FRAME_LOGITS && bytes == want_bytes) {
+                if (!tp_read_full(tp->control_fd[m],
+                                  dst + (uint64_t)off, bytes))
+                    return 0;
+                continue;
+            }
+            return 0;
+        } else {
+            continue;
+        }
+        if (type != DS4_TP_FRAME_LOGITS || bytes != want_bytes) {
+            free(payload);
+            fprintf(stderr, "ds4-tp: bad logits frame (link %d type %u bytes %u)\n",
+                    m, type, bytes);
+            return 0;
+        }
+        memcpy(dst + (uint64_t)off, payload, bytes);
+        free(payload);
+    }
+    return 1;
+}
+
 int ds4_tp_send_logits_half(ds4_tp *tp, const float *half, uint32_t count) {
-    ds4_tp_frame_header h = { DS4_TP_MAGIC, DS4_TP_FRAME_LOGITS,
-                              count * (uint32_t)sizeof(float) };
-    return tp_write_full(tp->control_fd, &h, sizeof(h)) &&
-           tp_write_full(tp->control_fd, half, count * sizeof(float));
+    /* DSpark verify replay (two-rank pair): ship one logits half to the peer. */
+    if (!tp || !half || count == 0 || tp->world <= 1) return 0;
+    return tp_send_control(tp, DS4_TP_FRAME_LOGITS, half, count * sizeof(float));
 }
 
 int ds4_tp_recv_logits_half(ds4_tp *tp, float *half, uint32_t count) {
+    if (!tp || !half || count == 0 || tp->world <= 1) return 0;
+    const int peer = tp->rank == 0 ? 1 : 0;
+    const uint32_t want_bytes = count * sizeof(float);
     uint32_t type = 0, bytes = 0;
-    if (!tp_read_frame_header(tp->control_fd, &type, &bytes) ||
-        type != DS4_TP_FRAME_LOGITS || bytes != count * sizeof(float)) {
-        fprintf(stderr, "ds4-tp: bad logits frame (type %u bytes %u)\n", type, bytes);
+    uint8_t *payload = NULL;
+    if (tp->ring) {
+        if (!tp_ctrl_recv(tp, peer, &type, &payload, &bytes)) return 0;
+    } else if (peer < DS4_TP_MAX_WORLD && tp->control_fd[peer] >= 0) {
+        if (!tp_read_frame_header(tp->control_fd[peer], &type, &bytes)) return 0;
+        if (type == DS4_TP_FRAME_LOGITS && bytes == want_bytes)
+            return tp_read_full(tp->control_fd[peer], half, bytes);
+        return 0;
+    } else {
         return 0;
     }
-    return tp_read_full(tp->control_fd, half, count * sizeof(float));
+    if (type != DS4_TP_FRAME_LOGITS || bytes != want_bytes) {
+        free(payload);
+        fprintf(stderr, "ds4-tp: bad half-logits frame (link %d type %u bytes %u)\n",
+                peer, type, bytes);
+        return 0;
+    }
+    memcpy(half, payload, bytes);
+    free(payload);
+    return 1;
 }
 
 int ds4_tp_send_verify(ds4_tp *tp, uint64_t session_id,
@@ -2899,46 +4075,91 @@ int ds4_tp_send_verify(ds4_tp *tp, uint64_t session_id,
                                  drafts, n);
 }
 
-int ds4_tp_send_verify_commit(ds4_tp *tp, int32_t mode, int32_t token_count) {
-    struct { int32_t mode; int32_t count; } msg = { mode, token_count };
-    return tp_send_frame(tp->control_fd, DS4_TP_FRAME_VERIFY_COMMIT,
-                         &msg, sizeof(msg));
+int ds4_tp_send_verify_commit(ds4_tp *tp, int32_t full_accept, int32_t replay_n) {
+    struct { int32_t full; int32_t replay; } msg = { full_accept, replay_n };
+    return tp_send_control(tp, DS4_TP_FRAME_VERIFY_COMMIT,
+                           &msg, sizeof(msg));
 }
 
-int ds4_tp_recv_verify_commit(ds4_tp *tp, int32_t *mode, int32_t *token_count) {
+int ds4_tp_recv_verify_commit(ds4_tp *tp, int32_t *full_accept, int32_t *replay_n) {
     uint32_t type = 0, bytes = 0;
-    struct { int32_t mode; int32_t count; } msg;
-    if (!tp_read_frame_header(tp->control_fd, &type, &bytes) ||
-        type != DS4_TP_FRAME_VERIFY_COMMIT || bytes != sizeof(msg) ||
-        !tp_read_full(tp->control_fd, &msg, sizeof(msg))) {
-        fprintf(stderr, "ds4-tp: bad verify-commit frame (type %u bytes %u)\n",
-                type, bytes);
-        return 0;
+    struct { int32_t full; int32_t replay; } msg;
+    if (tp->ring) {
+        uint8_t *payload = NULL;
+        if (!tp_ctrl_recv(tp, 0, &type, &payload, &bytes) ||
+            type != DS4_TP_FRAME_VERIFY_COMMIT || bytes != sizeof(msg)) {
+            free(payload);
+            fprintf(stderr, "ds4-tp: bad verify-commit frame (type %u bytes %u)\n",
+                    type, bytes);
+            return 0;
+        }
+        memcpy(&msg, payload, sizeof(msg));
+        free(payload);
+    } else {
+        const int fd = tp->control_fd[0];
+        if (!tp_read_frame_header(fd, &type, &bytes) ||
+            type != DS4_TP_FRAME_VERIFY_COMMIT || bytes != sizeof(msg) ||
+            !tp_read_full(fd, &msg, sizeof(msg))) {
+            fprintf(stderr, "ds4-tp: bad verify-commit frame (type %u bytes %u)\n",
+                    type, bytes);
+            return 0;
+        }
     }
-    *mode = msg.mode;
-    *token_count = msg.count;
+    *full_accept = msg.full;
+    *replay_n = msg.replay;
     return 1;
 }
 
 int ds4_tp_hash_check(ds4_tp *tp, uint64_t seq, uint64_t hash, char *err, size_t errlen) {
     struct { uint64_t seq; uint64_t hash; } mine = { seq, hash }, theirs;
-    if (!tp_send_frame(tp->control_fd, DS4_TP_FRAME_HASH, &mine, sizeof(mine))) {
+    if (!tp_send_control(tp, DS4_TP_FRAME_HASH, &mine, sizeof(mine))) {
         tp_set_err(err, errlen, "tp: hash send failed");
         return 0;
     }
-    uint32_t type = 0, bytes = 0;
-    if (!tp_read_frame_header(tp->control_fd, &type, &bytes) ||
-        type != DS4_TP_FRAME_HASH || bytes != sizeof(theirs) ||
-        !tp_read_full(tp->control_fd, &theirs, sizeof(theirs))) {
-        tp_set_err(err, errlen, "tp: hash recv failed");
-        return 0;
-    }
-    if (theirs.seq != seq || theirs.hash != hash) {
-        tp_set_err(err, errlen,
-                   "tp: LOCKSTEP DIVERGENCE at seq %llu: local %016llx peer %016llx",
-                   (unsigned long long)seq,
-                   (unsigned long long)hash, (unsigned long long)theirs.hash);
-        return -1;
+    for (int m = 0; m < tp->world; m++) {
+        if (m == tp->rank) continue;
+        uint32_t type = 0, bytes = 0;
+        uint8_t *payload = NULL;
+        if (tp->ring) {
+            if (!tp_ctrl_recv(tp, m, &type, &payload, &bytes)) {
+                tp_set_err(err, errlen, "tp: hash recv failed");
+                return 0;
+            }
+        } else if (tp->control_fd[m] >= 0) {
+            if (!tp_read_frame_header(tp->control_fd[m], &type, &bytes)) {
+                tp_set_err(err, errlen, "tp: hash recv failed");
+                return 0;
+            }
+            if (type == DS4_TP_FRAME_HASH && bytes == sizeof(theirs) &&
+                tp_read_full(tp->control_fd[m], &theirs, sizeof(theirs))) {
+                if (theirs.seq != seq || theirs.hash != hash) {
+                    tp_set_err(err, errlen,
+                               "tp: LOCKSTEP DIVERGENCE at seq %llu (rank %d): local %016llx peer %016llx",
+                               (unsigned long long)seq, m,
+                               (unsigned long long)hash, (unsigned long long)theirs.hash);
+                    return -1;
+                }
+                continue;
+            }
+            tp_set_err(err, errlen, "tp: hash recv failed");
+            return 0;
+        } else {
+            continue;
+        }
+        if (type != DS4_TP_FRAME_HASH || bytes != sizeof(theirs)) {
+            free(payload);
+            tp_set_err(err, errlen, "tp: hash recv failed");
+            return 0;
+        }
+        memcpy(&theirs, payload, sizeof(theirs));
+        free(payload);
+        if (theirs.seq != seq || theirs.hash != hash) {
+            tp_set_err(err, errlen,
+                       "tp: LOCKSTEP DIVERGENCE at seq %llu (rank %d): local %016llx peer %016llx",
+                       (unsigned long long)seq, m,
+                       (unsigned long long)hash, (unsigned long long)theirs.hash);
+            return -1;
+        }
     }
     return 1;
 }
@@ -3002,10 +4223,13 @@ static void tp_worker_session_remove(ds4_tp_worker_sessions *sessions,
 
 static int tp_worker_send_logits(ds4_tp *tp, ds4_session *session,
                                  float *logits, int vocab) {
-    if (!logits || vocab <= 0 || (vocab & 1) != 0) return 0;
-    const uint32_t vhalf = (uint32_t)vocab / 2u;
+    if (!logits || vocab <= 0) return 0;
+    uint32_t off = 0, count = 0;
+    ds4_tp_vocab_slice((uint32_t)vocab, (uint32_t)tp->world,
+                       (uint32_t)tp->rank, &off, &count);
+    if (count == 0) return 0;
     return ds4_session_copy_logits(session, logits, vocab) == vocab &&
-           ds4_tp_send_logits_half(tp, logits + vhalf, vhalf);
+           ds4_tp_send_logits(tp, logits, vocab);
 }
 
 int ds4_tp_worker_run(ds4_engine *engine, const ds4_tp_options *opt) {
@@ -3041,7 +4265,6 @@ int ds4_tp_worker_run(ds4_engine *engine, const ds4_tp_options *opt) {
         malloc((size_t)vocab * sizeof(*logits)) : NULL;
     if (ds4_engine_tp_vocab_split(engine) && !logits) {
         ds4_log(stderr, DS4_LOG_ERROR, "tp worker: logits buffer allocation failed");
-        ds4_engine_tp_unbind(engine);
         ds4_tp_free(tp);
         return 1;
     }
@@ -3108,37 +4331,24 @@ int ds4_tp_worker_run(ds4_engine *engine, const ds4_tp_options *opt) {
             break;
         }
 
-        if (command.type == DS4_TP_FRAME_SYNC ||
-            command.type == DS4_TP_FRAME_SYNC_MULTIMODAL) {
+        if (command.type == DS4_TP_FRAME_SYNC) {
             prompt.len = 0;
             for (uint32_t i = 0; i < command.n_tokens; i++) {
                 ds4_tokens_push(&prompt, command.tokens[i]);
             }
-            int sync_rc = command.type == DS4_TP_FRAME_SYNC_MULTIMODAL ?
-                ds4_session_sync_multimodal(session, &prompt,
-                                            command.images, command.n_images,
-                                            err, sizeof(err)) :
-                ds4_session_sync(session, &prompt, err, sizeof(err));
+            int sync_rc = ds4_session_sync(session, &prompt, err, sizeof(err));
             if (!ds4_tp_send_command_ack(tp, command.session_id, sync_rc)) {
                 rc = 1;
-            } else if (sync_rc != 0 && sync_rc != DS4_SESSION_SYNC_INTERRUPTED) {
+            } else if (sync_rc != 0) {
                 ds4_log(stderr, DS4_LOG_ERROR, "tp worker sync: %s", err);
                 rc = 1;
-            } else if (sync_rc == 0 && ds4_engine_tp_vocab_split(engine) &&
+            } else if (ds4_engine_tp_vocab_split(engine) &&
                        !tp_worker_send_logits(tp, session, logits, vocab)) {
                 rc = 1;
             }
         } else if (command.type == DS4_TP_FRAME_EVAL) {
             if (ds4_session_eval(session, command.value, err, sizeof(err)) != 0) {
                 ds4_log(stderr, DS4_LOG_ERROR, "tp worker eval: %s", err);
-                rc = 1;
-            }
-        } else if (command.type == DS4_TP_FRAME_GLM_MTP) {
-            int spec_rc = ds4_session_glm_tp_spec_cycle(
-                session, command.value, command.limit, err, sizeof(err));
-            if (!ds4_tp_send_command_ack(tp, command.session_id,
-                                         spec_rc < 0 ? 1 : 0) || spec_rc < 0) {
-                ds4_log(stderr, DS4_LOG_ERROR, "tp worker GLM MTP: %s", err);
                 rc = 1;
             }
         } else if (command.type == DS4_TP_FRAME_VERIFY) {
@@ -3214,7 +4424,209 @@ int ds4_tp_worker_run(ds4_engine *engine, const ds4_tp_options *opt) {
     }
     free(sessions.v);
     free(logits);
-    ds4_engine_tp_unbind(engine);
     ds4_tp_free(tp);
     return rc;
+}
+
+/* ------------------------------------------------------------------------
+ * V4.1 / GLM TP entry points ported onto the N-rank transport.
+ * These use the mesh control plane (tp_send_control / tp_ctrl_recv); the
+ * verify-block window is not re-implemented per link (V4.1 does not use
+ * speculative verification), so batch_block_* are no-ops that fall back to
+ * the regular batch gates.
+ * ------------------------------------------------------------------------ */
+
+typedef struct {
+    uint64_t session_id;
+    uint32_t token_count;
+    uint32_t image_count;
+} ds4_tp_multimodal_command_header;
+
+typedef struct {
+    uint32_t token_start;
+    uint32_t token_count;
+    uint32_t data_width;
+    uint32_t width;
+    uint32_t height;
+    uint32_t content_width;
+    uint32_t content_height;
+    uint8_t fingerprint[32];
+} ds4_tp_vision_wire;
+
+int ds4_tp_batch_block_begin(ds4_tp *tp, uint32_t rows, uint32_t n_layers) {
+    (void)tp; (void)rows; (void)n_layers;
+    return 1;
+}
+
+int ds4_tp_batch_block_end(ds4_tp *tp) {
+    (void)tp;
+    return 1;
+}
+
+void ds4_tp_detach_slab(ds4_tp *tp) {
+    if (!tp) return;
+#ifdef DS4_TP_HAVE_VERBS
+    tp_rdma_close(tp);
+#endif
+    tp->slab = NULL;
+    tp->rdma_active = false;
+    ds4_tp_mark_failed(tp);
+}
+
+int ds4_tp_send_glm_mtp(ds4_tp *tp, uint64_t session_id,
+                        uint64_t seq, int token, int limit) {
+    if (!tp || limit < 1 || limit > 2) return 0;
+    ds4_tp_eval_command msg = { session_id, seq, (int32_t)token, (uint32_t)limit };
+    return tp_send_control(tp, DS4_TP_FRAME_GLM_MTP, &msg, sizeof(msg));
+}
+
+int ds4_tp_send_sync_multimodal(ds4_tp *tp, uint64_t session_id,
+                                const int *tokens, uint32_t n_tokens,
+                                const ds4_vision_span *images,
+                                uint32_t image_count) {
+    uint64_t bytes64 = sizeof(ds4_tp_multimodal_command_header) +
+                       (uint64_t)n_tokens * sizeof(int32_t);
+    if (!tp || (!tokens && n_tokens) || (!images && image_count) ||
+        tp->n_embd == 0 || bytes64 > UINT32_MAX)
+        return 0;
+    for (uint32_t i = 0; i < image_count; i++) {
+        const uint64_t values = (uint64_t)images[i].embedding.token_count *
+                                tp->n_embd;
+        if (values > UINT64_MAX / sizeof(float)) return 0;
+        const uint64_t add_bytes = sizeof(ds4_tp_vision_wire) +
+                                   values * sizeof(float);
+        if (!images[i].embedding.data || add_bytes > UINT32_MAX ||
+            bytes64 > UINT32_MAX - add_bytes)
+            return 0;
+        bytes64 += add_bytes;
+    }
+    uint8_t *payload = malloc((size_t)bytes64);
+    if (!payload) return 0;
+    ds4_tp_multimodal_command_header h = { session_id, n_tokens, image_count };
+    memcpy(payload, &h, sizeof(h));
+    uint8_t *p = payload + sizeof(h);
+    int32_t *wire_tokens = (int32_t *)p;
+    for (uint32_t i = 0; i < n_tokens; i++) wire_tokens[i] = tokens[i];
+    p += (uint64_t)n_tokens * sizeof(int32_t);
+    for (uint32_t i = 0; i < image_count; i++) {
+        const ds4_vision_embedding *embedding = &images[i].embedding;
+        ds4_tp_vision_wire wire = {
+            images[i].token_start, embedding->token_count, tp->n_embd,
+            embedding->width, embedding->height,
+            embedding->content_width, embedding->content_height, {0},
+        };
+        memcpy(wire.fingerprint, embedding->fingerprint, sizeof(wire.fingerprint));
+        memcpy(p, &wire, sizeof(wire));
+        p += sizeof(wire);
+        const uint64_t data_bytes = (uint64_t)embedding->token_count *
+                                    tp->n_embd * sizeof(float);
+        memcpy(p, embedding->data, (size_t)data_bytes);
+        p += data_bytes;
+    }
+    const int ok = tp_send_control(tp, DS4_TP_FRAME_SYNC_MULTIMODAL,
+                                   payload, (uint32_t)bytes64);
+    free(payload);
+    return ok;
+}
+
+int ds4_tp_sync_checkpoint(ds4_tp *tp, uint32_t point, int current, int total,
+                           bool requested, bool *cancelled) {
+    struct {
+        uint64_t seq;
+        uint32_t point;
+        int32_t current, total;
+        uint32_t cancelled;
+    } local, peer;
+    if (!tp || !cancelled) return 0;
+    if (tp->world <= 1) { *cancelled = requested; return 1; }
+    local.seq = ++tp->sync_checkpoint_seq;
+    local.point = point;
+    local.current = current;
+    local.total = total;
+    local.cancelled = requested ? 1u : 0u;
+    if (ds4_tp_failed(tp)) return 0;
+    bool any = requested;
+    if (tp->rank == 0) {
+        if (!tp_send_control(tp, DS4_TP_FRAME_SYNC_CHECKPOINT,
+                             &local, sizeof(local))) {
+            ds4_tp_mark_failed(tp);
+            return 0;
+        }
+        for (int m = 1; m < tp->world; m++) {
+            uint32_t type = 0, bytes = 0;
+            uint8_t *payload = NULL;
+            if (!tp_ctrl_recv(tp, m, &type, &payload, &bytes) ||
+                type != DS4_TP_FRAME_SYNC_CHECKPOINT ||
+                bytes != sizeof(peer)) {
+                free(payload);
+                ds4_tp_mark_failed(tp);
+                return 0;
+            }
+            memcpy(&peer, payload, sizeof(peer));
+            free(payload);
+            if (peer.seq != local.seq || peer.point != point ||
+                peer.current != current || peer.total != total ||
+                peer.cancelled > 1u) {
+                ds4_tp_mark_failed(tp);
+                return 0;
+            }
+            any = any || peer.cancelled != 0;
+        }
+    } else {
+        uint32_t type = 0, bytes = 0;
+        uint8_t *payload = NULL;
+        if (!tp_ctrl_recv(tp, 0, &type, &payload, &bytes) ||
+            type != DS4_TP_FRAME_SYNC_CHECKPOINT || bytes != sizeof(peer)) {
+            free(payload);
+            ds4_tp_mark_failed(tp);
+            return 0;
+        }
+        memcpy(&peer, payload, sizeof(peer));
+        free(payload);
+        if (peer.seq != local.seq || peer.point != point ||
+            peer.current != current || peer.total != total ||
+            peer.cancelled > 1u) {
+            ds4_tp_mark_failed(tp);
+            return 0;
+        }
+        if (!tp_send_control(tp, DS4_TP_FRAME_SYNC_CHECKPOINT,
+                             &local, sizeof(local))) {
+            ds4_tp_mark_failed(tp);
+            return 0;
+        }
+        any = any || peer.cancelled != 0;
+    }
+    *cancelled = any;
+    return 1;
+}
+
+int ds4_tp_wait_command_status(ds4_tp *tp, uint64_t session_id, int *status,
+                               const char *operation, char *err, size_t errlen) {
+    if (!tp || !status) return 0;
+    if (tp->world <= 1 || tp->rank != 0) { *status = 0; return 1; }
+    for (int m = 1; m < tp->world; m++) {
+        ds4_tp_command_ack ack;
+        uint32_t type = 0, bytes = 0;
+        uint8_t *payload = NULL;
+        if (!tp_ctrl_recv(tp, m, &type, &payload, &bytes) ||
+            type != DS4_TP_FRAME_COMMAND_ACK || bytes != sizeof(ack)) {
+            free(payload);
+            ds4_tp_mark_failed(tp);
+            tp_set_err(err, errlen, "tp: worker failed during %s",
+                       operation ? operation : "command");
+            return 0;
+        }
+        memcpy(&ack, payload, sizeof(ack));
+        free(payload);
+        if (ack.session_id != session_id) {
+            ds4_tp_mark_failed(tp);
+            tp_set_err(err, errlen,
+                       "tp: worker %s failed (session %llu, status %d)",
+                       operation ? operation : "command",
+                       (unsigned long long)ack.session_id, (int)ack.status);
+            return 0;
+        }
+    }
+    *status = 0;
+    return 1;
 }

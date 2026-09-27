@@ -21,7 +21,7 @@ typedef int (*ds4_gpu_tp_big_exchange_fn)(void *ud, uint32_t layer,
                                         uint64_t seq, const void *out,
                                         void *in, uint64_t bytes);
 
-int ds4_gpu_tp_init(uint32_t rank, ds4_gpu_tensor *slab,
+int ds4_gpu_tp_init(uint32_t rank, uint32_t world, ds4_gpu_tensor *slab,
                     uint64_t gpu_flags_off, uint64_t out_off, uint64_t vec_bytes,
                     ds4_gpu_tp_exchange_fn fn, void *ud);
 void ds4_gpu_tp_shutdown(void);
@@ -33,6 +33,13 @@ void ds4_gpu_tp_set_big_exchange(ds4_gpu_tp_big_exchange_fn fn);
 int ds4_gpu_tp_big_gate_encode(uint32_t layer, uint32_t rows,
                               const ds4_gpu_tensor *out_t,
                               ds4_gpu_tensor *in_t, uint64_t bytes);
+/* Split big gate (N-node mesh): kick publishes the GPU arrival marker and
+ * queues the exchange, returning the gate seq (0 on failure); wait encodes
+ * the release.  Multiple kicks may be in flight on one link. */
+uint64_t ds4_gpu_tp_big_gate_kick(uint32_t layer, uint32_t rows,
+                                  const ds4_gpu_tensor *out_t,
+                                  ds4_gpu_tensor *in_t, uint64_t bytes);
+int ds4_gpu_tp_big_gate_wait(uint64_t seq);
 
 /* Metal multi-session tapes reuse slab slots and therefore require event
  * arrival. Single-session flag gates may flush in layer order. */
