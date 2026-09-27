@@ -41062,15 +41062,45 @@ static bool ds41_sum_partial(ds41_gpu_graph *g, ds4_gpu_tensor *x,
                                (uint64_t)DS4_N_EMBD * 4u) != 0;
 }
 
-/* Attention-output gate.  World 2 splits the output projection across the pair
- * and sums it here.  World>2 replicates the attention core on every rank, so the
- * local value is already complete: the gate is still exchanged to keep the
- * transport's gate-slot order identical, but its result is discarded. */
+static bool ds41_sum_partial_batch(ds41_gpu_graph *g, ds4_gpu_tensor *x,
+                                   uint32_t il, uint32_t count);
+
+/* Attention layout for world>2.  Replicated (the default): every rank runs the
+ * whole attention core and the ATTN gate is a pure barrier -- this is the
+ * fastest measured layout, because the split's cross-rank output sum costs more
+ * than the attention compute it saves.  Split: each rank computes N_HEAD/world
+ * query heads plus the matching output-projection group slice and the partials
+ * are summed (opt in with DS4_V41_TP_ATTN_SPLIT=1). */
+static bool ds41_attn_split(const ds41_gpu_graph *g) {
+    if (!g || g->tp_world <= 1) return false;
+    if (g->tp_world == 2) return true;
+    return getenv("DS4_V41_TP_ATTN_SPLIT") != NULL;
+}
+
+/* Attention-output gate.  Split layouts exchange the per-rank output-projection
+ * partial and sum it here.  A replicated layout already holds the complete row,
+ * so the gate is still exchanged (to keep the transport's gate-slot order
+ * identical) but its result is discarded.
+ *
+ * At world>2 the sum rides the small gate's combined slot, which is cheap (it
+ * piggybacks on the per-layer gate machinery); the ATTN gate is still the first
+ * small gate of the session, so the transport arms every link's receive window
+ * before posting any send. */
 static bool ds41_attention_gate(ds41_gpu_graph *g, uint32_t il) {
     if (g->tp_world <= 1) return true;
+    const uint32_t slot = il * DS4_TP_GATES_PER_LAYER + DS4_TP_GATE_ATTN;
+    if (!ds41_attn_split(g)) {
+        return ds4_gpu_tensor_copy(g->tp_out[slot], 0, g->block, 0,
+                                   (uint64_t)DS4_N_EMBD * 4u) != 0 &&
+               ds4_gpu_tp_gate_encode(il, DS4_TP_GATE_ATTN) != 0;
+    }
     if (g->tp_world == 2)
         return ds41_sum_partial(g, g->block, il, DS4_TP_GATE_ATTN);
-    const uint32_t slot = il * DS4_TP_GATES_PER_LAYER + DS4_TP_GATE_ATTN;
+    /* Split layout at world>2: the small gate's combined slot is not reliably
+     * visible on the very first (ATTN) gate of a session, so the output sum
+     * rides the bulk big gate and the small ATTN gate stays a barrier to keep
+     * the per-layer slot order unchanged. */
+    if (!ds41_sum_partial_batch(g, g->block, il, 1u)) return false;
     return ds4_gpu_tensor_copy(g->tp_out[slot], 0, g->block, 0,
                                (uint64_t)DS4_N_EMBD * 4u) != 0 &&
            ds4_gpu_tp_gate_encode(il, DS4_TP_GATE_ATTN) != 0;
@@ -41171,9 +41201,9 @@ static bool ds41_hc_mix(ds41_gpu_graph *g, const ds4_model *m,
 
 static bool ds41_attention_low(ds41_gpu_graph *g, const ds4_model *m,
                                const ds4_layer_weights *l) {
-    /* The attention core is replicated for world>2 (every rank computes all
-     * heads), so only world 2 slices the output groups across ranks. */
-    const bool group_split = g->tp_world == 2;
+    /* A split layout gives every rank its own output-projection groups; a
+     * replicated layout keeps the full group range on each rank. */
+    const bool group_split = ds41_attn_split(g);
     const uint32_t groups = group_split ? DS4_N_OUT_GROUP / g->tp_world : DS4_N_OUT_GROUP;
     const uint32_t group0 = group_split ? g->tp_rank * groups : 0u;
     uint64_t output_row;
@@ -41187,9 +41217,9 @@ static bool ds41_attention_output(ds41_gpu_graph *g, const ds4_model *m,
                                   const ds4_layer_weights *l) {
     const uint32_t groups = DS4_N_OUT_GROUP / g->tp_world;
     if (!ds41_attention_low(g, m, l)) return false;
-    /* World 2 k-slices the output projection in half across the pair; every
-     * other topology computes it whole (the cross-rank gate is a no-op). */
-    return g->tp_world == 2 ?
+    /* A split layout k-slices the output projection to this rank's groups; a
+     * replicated layout multiplies the whole low vector on every rank. */
+    return ds41_attn_split(g) ?
         metal_graph_matmul_dense_quant_kslice(g->block, m, l->attn_output_b,
             8192, (uint64_t)g->tp_rank * groups * 1024u,
             (uint64_t)groups * 1024u, DS4_N_EMBD, g->low, 0) :
@@ -41279,9 +41309,9 @@ static bool ds41_attention_select(ds41_gpu_graph *g, const ds4_model *m,
 static bool ds41_attention_project(ds41_gpu_graph *g, const ds4_model *m,
                                     const ds4_layer_weights *l) {
     const uint32_t q_dim = DS4_N_HEAD / g->tp_world * DS4_N_HEAD_DIM;
-    /* World 2 splits the query heads across the pair; every other topology
-     * replicates the attention core, so the full head range is projected. */
-    const bool head_split = g->tp_world == 2;
+    /* A split layout gives every rank its own slice of the query heads; a
+     * replicated layout projects the full head range on every rank. */
+    const bool head_split = ds41_attn_split(g);
     return ds41_matmul(g->qr, m, l->attn_q_a, g->norm, true) &&
         ds41_norm(g->qr, g->qr, m, l->attn_q_a_norm) &&
         ds41_matmul_rows(g->q, m, l->attn_q_b, g->qr,
@@ -41296,7 +41326,7 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
     const uint32_t pos = g->pos, ratio = ds4_layer_compress_ratio(il);
     const uint32_t owner = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
     const uint32_t n_comp = ratio ? (pos + 1u) / ratio : 0u;
-    const bool head_split = g->tp_world == 2;
+    const bool head_split = ds41_attn_split(g);
     const uint32_t heads = head_split ? DS4_N_HEAD / g->tp_world : DS4_N_HEAD;
     const uint32_t head0 = head_split ? g->tp_rank * heads : 0u;
     if (!projected && !ds41_attention_project(g, m, l)) return false;
@@ -41516,7 +41546,7 @@ static bool ds41_attention_project_batch(ds41_gpu_graph *g, const ds4_model *m,
                                          const ds4_layer_weights *l, uint32_t count) {
     ds41_prefill_row *b = &g->batch;
     const uint32_t q_dim = DS4_N_HEAD / g->tp_world * DS4_N_HEAD_DIM;
-    const bool head_split = g->tp_world == 2;
+    const bool head_split = ds41_attn_split(g);
     return ds41_matmul_batch(b->qr, m, l->attn_q_a, b->norm, count, true) &&
         ds4_gpu_rms_norm_weight_rows_tensor(b->qr, b->qr, m->map, m->size,
             l->attn_q_a_norm->abs_offset, DS4_N_LORA_Q, count, DS4_RMS_EPS) &&
@@ -41649,7 +41679,7 @@ static bool ds41_attention_batch(ds41_gpu_graph *g, const ds4_model *m,
     const uint32_t first = previous < 128u - raw_start ? previous : 128u - raw_start;
     const uint32_t n_raw = previous + count;
     const uint64_t row_bytes = DS4_N_HEAD_DIM * sizeof(float);
-    const bool head_split = g->tp_world == 2;
+    const bool head_split = ds41_attn_split(g);
     const uint32_t heads = head_split ? DS4_N_HEAD / g->tp_world : DS4_N_HEAD;
     const uint64_t sinks = l->attn_sinks->abs_offset +
         (head_split ? (uint64_t)g->tp_rank * heads * sizeof(float) : 0u);
@@ -42465,12 +42495,14 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                     ok = ds41_attention(&row, m, l, il, true);
                 }
                 DS41_STAGE("attention core/index");
-                if (ok && g->tp_world == 2) {
+                if (ok && ds41_attn_split(g)) {
                     ok = ds4_gpu_dsv41_attention_output_tp_batch(g->batch.block, g->batch.low,
                         m->map, m->size, l->attn_output_a->abs_offset, l->attn_output_b->abs_offset,
                         g->batch.heads, count, g->tp_rank) &&
-                        ds41_sum_partial_batch(g, g->batch.block, il, count) &&
-                        ds4_gpu_dsv41_quantize(g->batch.block, DS4_N_EMBD, count, DS4_V41_BF16);
+                        ds41_sum_partial_batch(g, g->batch.block, il, count);
+                    ds41_tp_probe("attn_sum_b", g->batch.block,
+                                  (uint64_t)count * DS4_N_EMBD, il, g->tp_rank);
+                    if (ok) ok = ds4_gpu_dsv41_quantize(g->batch.block, DS4_N_EMBD, count, DS4_V41_BF16);
                 } else if (ok && l->attn_output_b->type == DS4_TENSOR_Q8_0) {
                     ok = ds4_gpu_dsv41_attention_output_batch(g->batch.block, g->batch.low,
                         m->map, m->size, l->attn_output_a->abs_offset, l->attn_output_b->abs_offset,
@@ -42695,8 +42727,10 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
                 ds41_attention_output(&row, model, l);
         }
         if (ok && g->tp_world > 1) {
-            if (g->tp_world == 2) {
+            if (ds41_attn_split(g)) {
                 ok = ds41_sum_partial_batch(g, active.block, il, rows);
+                ds41_tp_probe("attn_sum_b", active.block, (uint64_t)rows * DS4_N_EMBD,
+                              il, g->tp_rank);
             } else {
                 /* Replicated attention needs no sum; exchange anyway to keep
                  * every rank's big-gate sequence aligned, then keep the value. */
