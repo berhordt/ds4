@@ -846,12 +846,20 @@ static float *dequant_fp8_weight(const st_value *w, const st_value *scale, int64
     if (w->n_dims != 2 || scale->n_dims != 2) die("FP8 tensor must be 2D");
     const int64_t out_dim = w->shape[0];
     const int64_t in_dim = w->shape[1];
-    const int64_t block_out = 128;
-    const int64_t block_in = 128;
-    if (out_dim % block_out || in_dim % block_in) die("FP8 dims are not divisible by 128");
-    const int64_t scale_rows = out_dim / block_out;
-    const int64_t scale_cols = in_dim / block_in;
-    if (scale->shape[0] != scale_rows || scale->shape[1] != scale_cols) die("FP8 scale shape mismatch");
+    /* The FP8 block size is a property of the checkpoint, not a constant:
+     * DeepSeek V4 Flash stores one e8m0 scale per 128x128 weight block, while
+     * V4.1 Flash stores one per 32x32 (inference/model.py: fp8_block_size = 32,
+     * "one fp8 scale per 32x32 weight block"). Derive it from the scale shape
+     * so both convert, and reject any scale that does not tile the weight. */
+    const int64_t scale_rows = scale->shape[0];
+    const int64_t scale_cols = scale->shape[1];
+    if (scale_rows <= 0 || scale_cols <= 0 ||
+        out_dim % scale_rows != 0 || in_dim % scale_cols != 0) {
+        die("FP8 scale shape does not tile the weight");
+    }
+    const int64_t block_out = out_dim / scale_rows;
+    const int64_t block_in = in_dim / scale_cols;
+    if (block_out != block_in) die("FP8 blocks are not square");
     /* shape and data_offsets are independent header fields; cross-check that the
      * on-disk buffers (sized from data_offsets by db_read) are actually large
      * enough for the shape-driven indexing below. Without this, a weight that
