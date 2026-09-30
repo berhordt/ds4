@@ -11543,7 +11543,7 @@ static int ds4_gpu_signal_batch_and_wait_event(const char *label) {
     }
 }
 
-int ds4_gpu_end_commands(void) {
+int ds4_gpu_end_commands_label(const char *label) {
     if (!g_batch_cb) {
         ds4_gpu_parallel_ffn_reset_state(YES);
         return 0;
@@ -11555,7 +11555,11 @@ int ds4_gpu_end_commands(void) {
     g_batch_has_work = NO;
     g_stream_expert_cache_owned_seq = g_stream_expert_cache_batch_seq;
     g_stream_expert_cache_batch_seq = 0;
-    return ds4_gpu_finish_command_buffer(cb, 1, "command batch");
+    return ds4_gpu_finish_command_buffer(cb, 1, label ? label : "command batch");
+}
+
+int ds4_gpu_end_commands(void) {
+    return ds4_gpu_end_commands_label("command batch");
 }
 
 static int ds4_gpu_flash_attn_stage_profile_boundary(

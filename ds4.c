@@ -41618,6 +41618,17 @@ static bool ds41_index_batch(ds41_gpu_graph *g, const ds4_model *m,
     const uint32_t n_comp = (start + count) / ratio;
     ds41_prefill_row *b = &g->batch;
     if (!n_comp) return true;
+    /* WS6.2 step probe: DS4_INDEX_STAGE_PROBE=1 inserts a labelled command
+     * buffer boundary between the indexer's discrete steps so DS4_METAL_CB_TIMES
+     * reports GPU time per step. Off by default: the boundaries add GPU round
+     * trips and would perturb the very thing being measured. */
+    const bool idx_probe = getenv("DS4_INDEX_STAGE_PROBE") != NULL;
+#define IDX_FLUSH(label) do { \
+        if (idx_probe) { \
+            if (!ds4_gpu_end_commands_label(label)) return false; \
+            if (!ds4_gpu_begin_commands()) return false; \
+        } \
+    } while (0)
     if (getenv("DS4_METAL_DISABLE_V41_BATCH_INDEX_PROJ")) {
         for (uint32_t t = 0; t < count; t++) {
             ds41_prefill_row *r = &g->rows_view[t];
@@ -41626,13 +41637,21 @@ static bool ds41_index_batch(ds41_gpu_graph *g, const ds4_model *m,
                 !ds4_gpu_dsv41_quantize(r->index_q, 128, DS4_N_INDEXER_HEAD, DS4_V41_FP4_E8M0) ||
                 !ds41_matmul(r->index_weights, m, l->indexer_proj, r->norm, true)) return false;
         }
-    } else if (!ds41_project_rows(b->index_q, m, l->indexer_attn_q_b, b->qr, count, true) ||
-               !ds4_gpu_dsv41_rope(b->index_q, DS4_N_INDEXER_HEAD_DIM, DS4_N_INDEXER_HEAD,
-                                   count, start, true, false) ||
-               !ds4_gpu_dsv41_quantize(b->index_q, DS4_N_INDEXER_HEAD_DIM,
-                   count * DS4_N_INDEXER_HEAD, DS4_V41_FP4_E8M0) ||
-               !ds41_project_rows(b->index_weights, m, l->indexer_proj, b->norm, count, true))
-        return false;
+        IDX_FLUSH("idx: all (per-row proj)");
+    } else {
+        if (!ds41_project_rows(b->index_q, m, l->indexer_attn_q_b, b->qr, count, true))
+            return false;
+        IDX_FLUSH("idx:1 q-proj");
+        if (!ds4_gpu_dsv41_rope(b->index_q, DS4_N_INDEXER_HEAD_DIM, DS4_N_INDEXER_HEAD,
+                                count, start, true, false)) return false;
+        IDX_FLUSH("idx:2 rope");
+        if (!ds4_gpu_dsv41_quantize(b->index_q, DS4_N_INDEXER_HEAD_DIM,
+                count * DS4_N_INDEXER_HEAD, DS4_V41_FP4_E8M0)) return false;
+        IDX_FLUSH("idx:3 quant-fp4");
+        if (!ds41_project_rows(b->index_weights, m, l->indexer_proj, b->norm, count, true))
+            return false;
+        IDX_FLUSH("idx:4 w-proj");
+    }
     ds41_gpu_graph row = *g;
     /* Only 32 score rows are live. Batched sorting retains the original
      * per-row causal width, including padding and tie order. */
@@ -41640,6 +41659,7 @@ static bool ds41_index_batch(ds41_gpu_graph *g, const ds4_model *m,
         !getenv("DS4_METAL_DISABLE_V41_PACKED_INDEX");
     if (packed && !ds4_gpu_dsv41_indexer_pack(g->index_packed, b->index_q,
         g->index_cache[owner], n_comp, count)) return false;
+    IDX_FLUSH("idx:5 pack");
     for (uint32_t off = 0; off < count; off += DS41_INDEX_BATCH) {
         const uint32_t rows = count - off < DS41_INDEX_BATCH ? count - off : DS41_INDEX_BATCH;
         const uint64_t q_bytes = DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM * sizeof(float);
@@ -41674,6 +41694,8 @@ static bool ds41_index_batch(ds41_gpu_graph *g, const ds4_model *m,
         }
         if (!ok) return false;
     }
+    IDX_FLUSH("idx:6 scores+topk");
+#undef IDX_FLUSH
     return true;
 }
 

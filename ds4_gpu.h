@@ -176,6 +176,9 @@ int ds4_gpu_tensor_read_after_selected_event(const ds4_gpu_tensor *tensor,
                                              const char *label);
 #endif
 int ds4_gpu_end_commands(void);
+/* Same as ds4_gpu_end_commands(), but tags the finished command buffer so the
+ * DS4_METAL_CB_TIMES log identifies it. Used by env-gated step profiling. */
+int ds4_gpu_end_commands_label(const char *label);
 int ds4_gpu_synchronize(void);
 
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
