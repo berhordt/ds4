@@ -7,6 +7,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 static int check_prefix(ds4_engine *engine, int prefix) {
     ds4_session *spec = NULL, *ref = NULL;
@@ -70,8 +71,11 @@ done:
 }
 
 int main(int argc, char **argv) {
-    if (argc != 6) {
-        fprintf(stderr, "usage: %s MODEL SUPPORT LISTEN_HOST PORT RDMA_DEVICE\n", argv[0]);
+    if (argc != 6 && argc != 7 && argc != 8) {
+        fprintf(stderr, "usage: %s MODEL SUPPORT LISTEN_HOST PORT RDMA_DEVICE [TOPOLOGY [RANK]]\n", argv[0]);
+        fprintf(stderr, "  with TOPOLOGY, LISTEN_HOST/PORT are ignored (the file carries the\n");
+        fprintf(stderr, "  per-link listen addresses) and RDMA_DEVICE may be '-' to let the\n");
+        fprintf(stderr, "  topology pick a device per link, as the production launch does\n");
         return 2;
     }
     char *end = NULL;
@@ -80,6 +84,22 @@ int main(int argc, char **argv) {
         fprintf(stderr, "invalid port: %s\n", argv[4]);
         return 2;
     }
+    /* Without a topology this is the original world-2 oracle: it holds one half
+     * of the routed experts and one peer holds the other.  With a topology it
+     * runs at whatever world that file declares, which is the only way to test
+     * the 4-rank configuration the plan targets -- V4.1 cannot fit at world 2
+     * (each rank would need ~152 GiB of the 128 GiB nodes) and --ssd-streaming
+     * is rejected outright under tensor parallelism. */
+    const char *topology = argc >= 7 ? argv[6] : NULL;
+    int rank = 0;
+    if (topology && argc == 8) {
+        const long r = strtol(argv[7], &end, 10);
+        if (end == argv[7] || *end || r < 0 || r >= 8) {
+            fprintf(stderr, "invalid rank: %s\n", argv[7]);
+            return 2;
+        }
+        rank = (int)r;
+    }
     ds4_engine_options opt = {
         .model_path = argv[1], .mtp_path = argv[2], .dspark = true,
         .backend = DS4_BACKEND_METAL, .n_threads = 1, .context_size = 8192,
@@ -87,6 +107,19 @@ int main(int argc, char **argv) {
                .listen_port = (int)port, .transport = DS4_TP_TRANSPORT_RDMA,
                .rdma_device = argv[5], .rdma_gid_index = 1, .rdma_gid_index_set = true},
     };
+    if (topology) {
+        opt.tp.topology_path = topology;
+        opt.tp.rank = rank;
+        opt.tp.rank_set = true;
+        /* Let the topology drive the device and GID choice.  ds4_tp.c matches
+         * each link's local IPv4 to a device's IPv4-mapped GID so that every
+         * link rides its own Thunderbolt cable; pinning the world-2 device name
+         * or GID index would force all three links through one of them. */
+        if (strcmp(argv[5], "-") == 0) opt.tp.rdma_device = NULL;
+        opt.tp.rdma_gid_index = 0;
+        opt.tp.rdma_gid_index_set = false;
+        fprintf(stderr, "tp oracle: topology %s rank %d\n", topology, rank);
+    }
     ds4_engine *engine = NULL;
     ds4_tp *tp = NULL;
     char err[256] = "";
