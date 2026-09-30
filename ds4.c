@@ -36128,46 +36128,60 @@ static bool dspark_final_head_ready(
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t draft = dw->block_size;
     const uint64_t vocab_dim = base_weights->output->dim[1];
+    /* V4.1's draft head carries no hc_head_* at all: DSparkBlock.forward_head
+     * collapses the HC copies with the last block's FFN pre-mix (hc_pre(x,
+     * pre_mix)), so the checkpoint never stores those three tensors.  Require
+     * them only when the draft actually has them. */
+    const bool has_hc_head = final->hc_head_base && final->hc_head_fn && final->hc_head_scale;
     if (!final->norm ||
-        !final->hc_head_base ||
-        !final->hc_head_fn ||
-        !final->hc_head_scale ||
         final->norm->type != DS4_TENSOR_F32 ||
-        final->hc_head_base->type != DS4_TENSOR_F32 ||
-        !dspark_tensor_type_matches(final->hc_head_fn->type,
-                                    DS4_DSPARK_LAYOUT_PLAIN) ||
-        final->hc_head_scale->type != DS4_TENSOR_F32 ||
         !tensor_type_is_dense_quant(base_weights->output->type)) {
         return false;
     }
+    if (has_hc_head &&
+        (final->hc_head_base->type != DS4_TENSOR_F32 ||
+         !dspark_tensor_type_matches(final->hc_head_fn->type,
+                                     DS4_DSPARK_LAYOUT_PLAIN) ||
+         final->hc_head_scale->type != DS4_TENSOR_F32)) {
+        return false;
+    }
 
-    return final->norm->ndim == 1 &&
-           final->norm->dim[0] == DS4_N_EMBD &&
-           final->hc_head_base->ndim == 1 &&
+    const uint64_t mix_hc = 2u * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
+    if (final->norm->ndim != 1 ||
+        final->norm->dim[0] != DS4_N_EMBD ||
+        base_weights->output->ndim != 2 ||
+        base_weights->output->dim[0] != DS4_N_EMBD ||
+        vocab_dim != DS4_N_VOCAB ||
+        ds4_gpu_tensor_bytes(
+                metal_graph_dspark_final_output_hc(g)) <
+            draft * hc_dim * sizeof(float) ||
+        ds4_gpu_tensor_bytes(metal_graph_batch_ffn_cur(g)) <
+            draft * DS4_N_EMBD * sizeof(float) ||
+        ds4_gpu_tensor_bytes(metal_graph_batch_ffn_norm(g)) <
+            draft * DS4_N_EMBD * sizeof(float) ||
+        ds4_gpu_tensor_bytes(g->spec_logits) <
+            draft * vocab_dim * sizeof(float)) {
+        return false;
+    }
+    if (!has_hc_head) {
+        /* The no-hc_head head reads the whole [pre|post|comb] split, not just
+         * the n_hc-wide pre part. */
+        return ds4_gpu_tensor_bytes(metal_graph_batch_hc_split(g)) >=
+               draft * mix_hc * sizeof(float);
+    }
+    return final->hc_head_base->ndim == 1 &&
            final->hc_head_base->dim[0] == DS4_N_HC &&
            final->hc_head_fn->ndim == 2 &&
            final->hc_head_fn->dim[0] == hc_dim &&
            final->hc_head_fn->dim[1] == DS4_N_HC &&
            final->hc_head_scale->ndim == 1 &&
            final->hc_head_scale->dim[0] == 1 &&
-           base_weights->output->ndim == 2 &&
-           base_weights->output->dim[0] == DS4_N_EMBD &&
-           vocab_dim == DS4_N_VOCAB &&
-           ds4_gpu_tensor_bytes(
-                   metal_graph_dspark_final_output_hc(g)) >=
-               draft * hc_dim * sizeof(float) &&
            ds4_gpu_tensor_bytes(metal_graph_batch_flat_hc(g)) >=
                draft * hc_dim * sizeof(float) &&
            ds4_gpu_tensor_bytes(metal_graph_batch_hc_mix(g)) >=
                draft * DS4_N_HC * sizeof(float) &&
            ds4_gpu_tensor_bytes(metal_graph_batch_hc_split(g)) >=
-               draft * DS4_N_HC * sizeof(float) &&
-           ds4_gpu_tensor_bytes(metal_graph_batch_ffn_cur(g)) >=
-               draft * DS4_N_EMBD * sizeof(float) &&
-           ds4_gpu_tensor_bytes(metal_graph_batch_ffn_norm(g)) >=
-               draft * DS4_N_EMBD * sizeof(float) &&
-           ds4_gpu_tensor_bytes(g->spec_logits) >=
-               draft * vocab_dim * sizeof(float);
+               draft * DS4_N_HC * sizeof(float);
 }
 
 static bool metal_graph_eval_dspark_base_logits(
@@ -36188,6 +36202,8 @@ static bool metal_graph_eval_dspark_base_logits(
         draft_cap != 0 && draft_cap < dw->block_size ?
             draft_cap : dw->block_size;
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    /* [pre | post | comb] row width of the HC mix/split buffers. */
+    const uint64_t mix_hc = 2u * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
     const uint64_t vocab_dim = base_weights->output->dim[1];
     ds4_gpu_tensor *stage_output_hc = metal_graph_dspark_final_output_hc(g);
     ds4_gpu_tensor *output_pre =
@@ -36211,34 +36227,56 @@ static bool metal_graph_eval_dspark_base_logits(
                             0,
                             (uint64_t)draft * vocab_dim * sizeof(float));
 
-    bool ok = stage_output_hc && output_pre && output_weights && output_embd &&
+    bool ok = stage_output_hc && output_embd &&
               output_norm && logits;
+    if (ok && final->hc_head_fn) ok = output_pre && output_weights;
     if (ok) ok = ds4_gpu_begin_commands() != 0;
-    if (ok) ok = ds4_gpu_rms_norm_plain_rows_tensor(metal_graph_batch_flat_hc(g),
+    if (ok && final->hc_head_fn) {
+        /* V4 draft: a dedicated hc_head_* MLP projects the output HC weights. */
+        if (ok) ok = ds4_gpu_rms_norm_plain_rows_tensor(metal_graph_batch_flat_hc(g),
+                                                         stage_output_hc,
+                                                         (uint32_t)hc_dim,
+                                                         draft,
+                                                         DS4_RMS_EPS) != 0;
+        if (ok) ok = metal_graph_matmul_plain_tensor(output_pre,
+                                                     dspark_model,
+                                                     final->hc_head_fn,
+                                                     hc_dim,
+                                                     DS4_N_HC,
+                                                     metal_graph_batch_flat_hc(g),
+                                                     draft);
+        if (ok) ok = ds4_gpu_output_hc_weights_tensor(output_weights,
+                                                       output_pre,
+                                                       dspark_model->map,
+                                                       dspark_model->size,
+                                                       final->hc_head_scale->abs_offset,
+                                                       final->hc_head_base->abs_offset,
+                                                       DS4_N_HC,
+                                                       DS4_HC_EPS) != 0;
+        if (ok) ok = ds4_gpu_hc_weighted_sum_tensor(output_embd,
                                                      stage_output_hc,
-                                                     (uint32_t)hc_dim,
-                                                     draft,
-                                                     DS4_RMS_EPS) != 0;
-    if (ok) ok = metal_graph_matmul_plain_tensor(output_pre,
-                                                 dspark_model,
-                                                 final->hc_head_fn,
-                                                 hc_dim,
-                                                 DS4_N_HC,
-                                                 metal_graph_batch_flat_hc(g),
-                                                 draft);
-    if (ok) ok = ds4_gpu_output_hc_weights_tensor(output_weights,
-                                                   output_pre,
-                                                   dspark_model->map,
-                                                   dspark_model->size,
-                                                   final->hc_head_scale->abs_offset,
-                                                   final->hc_head_base->abs_offset,
-                                                   DS4_N_HC,
-                                                   DS4_HC_EPS) != 0;
-    if (ok) ok = ds4_gpu_hc_weighted_sum_tensor(output_embd,
-                                                 stage_output_hc,
-                                                 output_weights,
-                                                 DS4_N_EMBD,
-                                                 DS4_N_HC) != 0;
+                                                     output_weights,
+                                                     DS4_N_EMBD,
+                                                     DS4_N_HC) != 0;
+    } else if (ok) {
+        /* V4.1 draft: no hc_head_* exists.  DSparkBlock.forward_head collapses the
+         * HC copies with the pre-mix the last block returned --
+         * hc_pre(x, pre_mix) = sum(pre_mix * x, dim=hc) -- and
+         * metal_graph_encode_layer_ffn_batch() has already left exactly that
+         * pre-mix in batch_hc_split at offset 0, as [pre|post|comb] with a mix_hc
+         * row stride.  Read it instead of projecting a fresh one. */
+        ds4_gpu_tensor *final_split =
+            ds4_gpu_tensor_view(metal_graph_batch_hc_split(g),
+                                0,
+                                (uint64_t)draft * mix_hc * sizeof(float));
+        ok = final_split &&
+             ds4_gpu_hc_weighted_sum_split_tensor(output_embd,
+                                                   stage_output_hc,
+                                                   final_split,
+                                                   DS4_N_EMBD,
+                                                   DS4_N_HC) != 0;
+        ds4_gpu_tensor_free(final_split);
+    }
     if (ok) ok = ds4_gpu_rms_norm_weight_rows_tensor(output_norm,
                                                       output_embd,
                                                       dspark_model->map,
