@@ -2114,12 +2114,23 @@ static void print_plan(const gguf_file *tmpl, const output_context *out_ctx) {
 #define DSPARK_DEFAULT_BLOCK_SIZE 5u
 #define DSPARK_DEFAULT_MARKOV_RANK 256u
 #define DSPARK_DEFAULT_NOISE_TOKEN_ID 128799u
+#define DSPARK_DEFAULT_N_EXPERT_USED 6u
 #define DSPARK_MAX_TARGET_LAYERS 8
 
 typedef struct {
     uint32_t block_size;
     uint32_t markov_rank;
     uint32_t noise_token_id;
+    /* How many experts the draft routes each token to.  The draft's own expert
+     * *count* is carried by its weight shapes, but the top-k is not, so it has
+     * to travel in metadata.  The default is 6, matching V4 Flash's draft and
+     * therefore preserving every existing conversion; V4.1's draft routes 3
+     * over a 128-expert pool and must pass --dspark-n-expert-used 3. */
+
+    uint32_t n_expert_used;
+    /* Overrides general.name.  The default names a V4 Flash draft, which is
+     * wrong for any other checkpoint; V4.1 conversions should pass their own. */
+    const char *name;
     uint32_t target_layers[DSPARK_MAX_TARGET_LAYERS];
     uint32_t target_layer_count;
 } dspark_support_options;
@@ -2129,6 +2140,8 @@ static void dspark_support_defaults(dspark_support_options *o) {
     o->block_size = DSPARK_DEFAULT_BLOCK_SIZE;
     o->markov_rank = DSPARK_DEFAULT_MARKOV_RANK;
     o->noise_token_id = DSPARK_DEFAULT_NOISE_TOKEN_ID;
+    o->n_expert_used = DSPARK_DEFAULT_N_EXPERT_USED;
+    o->name = NULL;
     o->target_layers[0] = 40;
     o->target_layers[1] = 41;
     o->target_layers[2] = 42;
@@ -2644,7 +2657,7 @@ static void dspark_plan_finalize(dspark_support_plan *plan,
     const char *name = metadata->vision_exp ?
         "DeepSeek V4 Flash Vision Experimental DSpark support" :
         "DeepSeek V4 Flash DSpark support";
-    plan->n_kv = 9 + (metadata->vision_exp ? 3 : 0);
+    plan->n_kv = 10 + (metadata->vision_exp ? 3 : 0);
     plan->kv_bytes =
         gguf_kv_size_string("general.architecture", "deepseek4-dspark") +
         gguf_kv_size_string("general.name", name) +
@@ -2652,6 +2665,7 @@ static void dspark_plan_finalize(dspark_support_plan *plan,
         gguf_kv_size_u32("dspark.block_size") +
         gguf_kv_size_u32("dspark.markov_rank") +
         gguf_kv_size_u32("dspark.noise_token_id") +
+        gguf_kv_size_u32("dspark.n_expert_used") +
         gguf_kv_size_u32_array("dspark.target_layer_ids", opt->target_layer_count) +
         gguf_kv_size_u32("dspark.stage_count") +
         gguf_kv_size_u32("dspark.n_layers");
@@ -2738,6 +2752,28 @@ static dspark_support_plan build_dspark_support_plan(st_db *db,
             }
         }
     }
+
+    /* The draft's top-k cannot be read off the weights, so it is the one
+     * number here that can be wrong without any shape disagreeing.  Catch the
+     * case where it is impossible rather than merely unexpected: a draft whose
+     * expert pool is smaller than its top-k is a conversion mistake, and the
+     * mistake this check exists for is passing the V4 Flash default (6) for a
+     * V4.1 draft, which routes 3 over 128 experts. */
+    if (opt->n_expert_used == 0) {
+        die("DSpark n_expert_used must be non-zero");
+    }
+    for (int i = 0; i < plan.len; i++) {
+        const dspark_tensor_plan *tp = &plan.tensors[i];
+        if (tp->kind != DSPARK_PLAN_EXPERT || tp->role != DSPARK_ROLE_ROUTED) continue;
+        if ((int)opt->n_expert_used > tp->n_experts) {
+            fprintf(stderr,
+                    "error: --dspark-n-expert-used %u exceeds the %d experts of %s\n",
+                    opt->n_expert_used,
+                    tp->n_experts,
+                    tp->meta.name);
+            exit(1);
+        }
+    }
     dspark_plan_finalize(&plan, opt, metadata);
     return plan;
 }
@@ -2751,11 +2787,12 @@ static void print_dspark_support_plan(const dspark_support_plan *plan,
         if (type >= 0 && type < DS4Q_TYPE_COUNT) type_counts[type]++;
         if (plan->tensors[i].kind == DSPARK_PLAN_EXPERT) expert_tensors++;
     }
-    printf("dspark_support: stages=%d block=%u markov_rank=%u noise_token=%u target_layers=",
+    printf("dspark_support: stages=%d block=%u markov_rank=%u noise_token=%u n_expert_used=%u target_layers=",
            plan->stages,
            opt->block_size,
            opt->markov_rank,
-           opt->noise_token_id);
+           opt->noise_token_id,
+           opt->n_expert_used);
     for (uint32_t i = 0; i < opt->target_layer_count; i++) {
         printf("%s%u", i == 0 ? "" : ",", opt->target_layers[i]);
     }
@@ -2808,13 +2845,15 @@ static void write_dspark_support_gguf(st_db *db,
     write_gguf_kv_string(fp, "general.architecture", "deepseek4-dspark");
     write_gguf_kv_string(
         fp, "general.name",
-        metadata->vision_exp ?
+        opt->name ? opt->name :
+        (metadata->vision_exp ?
             "DeepSeek V4 Flash Vision Experimental DSpark support" :
-            "DeepSeek V4 Flash DSpark support");
+            "DeepSeek V4 Flash DSpark support"));
     write_gguf_kv_u32(fp, "general.alignment", (uint32_t)plan->alignment);
     write_gguf_kv_u32(fp, "dspark.block_size", opt->block_size);
     write_gguf_kv_u32(fp, "dspark.markov_rank", opt->markov_rank);
     write_gguf_kv_u32(fp, "dspark.noise_token_id", opt->noise_token_id);
+    write_gguf_kv_u32(fp, "dspark.n_expert_used", opt->n_expert_used);
     write_gguf_kv_u32_array(fp, "dspark.target_layer_ids", opt->target_layers, opt->target_layer_count);
     write_gguf_kv_u32(fp, "dspark.stage_count", (uint32_t)plan->stages);
     write_gguf_kv_u32(fp, "dspark.n_layers", (uint32_t)plan->stages);
@@ -2890,6 +2929,8 @@ static void usage(const char *argv0) {
     printf("  --dspark-block-size N  DSpark draft block size metadata, default 5\n");
     printf("  --dspark-markov-rank N DSpark Markov rank metadata, default 256\n");
     printf("  --dspark-noise-token-id N  DSpark noise token id metadata, default 128799\n");
+    printf("  --dspark-n-expert-used N  experts routed per token in the draft, default 6; V4.1 drafts use 3\n");
+    printf("  --dspark-name STR       general.name for the support GGUF; default names a V4 Flash draft\n");
     printf("  --dspark-target-layers CSV DSpark target layer ids metadata, default 40,41,42\n");
     printf("  --imatrix FILE         legacy .dat imatrix from ds4 --imatrix-out\n");
     printf("  --imatrix-strict       fail if a quantized tensor has no matching imatrix vector\n");
@@ -3000,6 +3041,10 @@ static params parse_args(int argc, char **argv) {
             p.dspark.markov_rank = parse_u32_arg(need_value(argc, argv, &i, arg), arg);
         } else if (strcmp(arg, "--dspark-noise-token-id") == 0) {
             p.dspark.noise_token_id = parse_u32_arg(need_value(argc, argv, &i, arg), arg);
+        } else if (strcmp(arg, "--dspark-n-expert-used") == 0) {
+            p.dspark.n_expert_used = parse_u32_arg(need_value(argc, argv, &i, arg), arg);
+        } else if (strcmp(arg, "--dspark-name") == 0) {
+            p.dspark.name = need_value(argc, argv, &i, arg);
         } else if (strcmp(arg, "--dspark-target-layers") == 0) {
             parse_dspark_target_layers_arg(&p.dspark, need_value(argc, argv, &i, arg), arg);
         } else if (strcmp(arg, "--imatrix") == 0) {

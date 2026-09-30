@@ -2942,6 +2942,10 @@ typedef struct {
     uint32_t block_size;
     uint32_t markov_rank;
     uint32_t noise_token_id;
+    /* How many experts the draft routes each token to.  The draft's expert
+     * *count* is carried by its weight shapes and is read back from them; the
+     * top-k is not visible in any shape, so it travels in metadata. */
+    uint32_t n_expert_used;
     uint32_t target_layer_count;
     uint32_t target_layers[DS4_DSPARK_MAX_TARGET_LAYERS];
     bool has_metadata;
@@ -2953,6 +2957,7 @@ typedef struct {
     bool has_block_size;
     bool has_markov_rank;
     bool has_noise_token_id;
+    bool has_n_expert_used;
     bool has_target_layers;
 } ds4_dspark_summary;
 
@@ -3034,6 +3039,11 @@ static ds4_dspark_summary model_dspark_summary(const ds4_model *m) {
         "deepseek4.dspark_target_layer_ids",
         "dspark.target_layer_ids",
     };
+    static const char *const n_expert_used_keys[] = {
+        "deepseek4.dspark.n_expert_used",
+        "deepseek4.dspark_n_expert_used",
+        "dspark.n_expert_used",
+    };
 
     ds4_dspark_summary s = {0};
     if (model_get_u32_any(m, block_keys, sizeof(block_keys) / sizeof(block_keys[0]),
@@ -3050,6 +3060,13 @@ static ds4_dspark_summary model_dspark_summary(const ds4_model *m) {
                           &s.noise_token_id)) {
         s.has_metadata = true;
         s.has_noise_token_id = true;
+    }
+    if (model_get_u32_any(m,
+                          n_expert_used_keys,
+                          sizeof(n_expert_used_keys) / sizeof(n_expert_used_keys[0]),
+                          &s.n_expert_used)) {
+        s.has_metadata = true;
+        s.has_n_expert_used = true;
     }
     if (model_get_u32_array_any(m,
                                 target_keys,
@@ -3091,6 +3108,7 @@ static void model_print_dspark_summary(const ds4_model *m) {
     if (s.block_size) printf(" block=%u", s.block_size);
     if (s.markov_rank) printf(" markov_rank=%u", s.markov_rank);
     if (s.noise_token_id) printf(" noise_token=%u", s.noise_token_id);
+    if (s.has_n_expert_used) printf(" n_expert_used=%u", s.n_expert_used);
     if (s.target_layer_count) {
         printf(" target_layers=");
         for (uint32_t i = 0; i < s.target_layer_count; i++) {
@@ -4757,6 +4775,12 @@ typedef struct {
     uint32_t target_layer_count;
     uint32_t target_layers[DS4_DSPARK_MAX_TARGET_LAYERS];
     uint32_t present_tensors;
+    /* The draft's own routed-expert geometry.  n_expert is read back from the
+     * bound ffn_gate_inp shape; n_expert_used falls back to the backbone's
+     * top-k when the support GGUF carries no metadata, which keeps every
+     * pre-existing V4 draft working exactly as before. */
+    uint32_t n_expert;
+    uint32_t n_expert_used;
     uint32_t missing_tensors;
     uint32_t invalid_tensors;
     uint32_t metadata_errors;
@@ -6206,6 +6230,21 @@ static void dspark_weights_validate_block_layout(
     const uint64_t hc_mix_dim = 2u * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
     const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
     const uint64_t out_low_dim = (uint64_t)DS4_N_OUT_GROUP * DS4_N_LORA_O;
+    /* The draft routes over its own expert pool, which need not be the
+     * backbone's.  Dimensions below are checked against the draft's geometry so
+     * that a support model whose expert count disagrees with what we are about
+     * to run it with is rejected here rather than producing quiet nonsense. */
+    const uint64_t n_expert = dw->n_expert;
+    if (n_expert == 0 || dw->n_expert_used == 0 ||
+        dw->n_expert_used > n_expert) {
+        fprintf(stderr,
+                "ds4: DSpark draft expert geometry is invalid "
+                "(n_expert=%u n_expert_used=%u)\n",
+                dw->n_expert,
+                dw->n_expert_used);
+        dw->invalid_tensors++;
+        return;
+    }
 
     dspark_validate_tensor_layout(dw, l->hc_attn_fn, "hc_attn_fn",
                                   DS4_DSPARK_LAYOUT_PLAIN, 2,
@@ -6257,19 +6296,19 @@ static void dspark_weights_validate_block_layout(
                                   DS4_N_EMBD, 0, 0);
     dspark_validate_tensor_layout(dw, l->ffn_gate_inp, "ffn_gate_inp",
                                   DS4_DSPARK_LAYOUT_DENSE, 2,
-                                  DS4_N_EMBD, DS4_N_EXPERT, 0);
+                                  DS4_N_EMBD, n_expert, 0);
     dspark_validate_tensor_layout(dw, l->ffn_exp_probs_b, "exp_probs_b",
                                   DS4_DSPARK_LAYOUT_F32, 1,
-                                  DS4_N_EXPERT, 0, 0);
+                                  n_expert, 0, 0);
     dspark_validate_tensor_layout(dw, l->ffn_gate_exps, "ffn_gate_exps",
                                   DS4_DSPARK_LAYOUT_ROUTED, 3,
-                                  DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
+                                  DS4_N_EMBD, DS4_N_FF_EXP, n_expert);
     dspark_validate_tensor_layout(dw, l->ffn_up_exps, "ffn_up_exps",
                                   DS4_DSPARK_LAYOUT_ROUTED, 3,
-                                  DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
+                                  DS4_N_EMBD, DS4_N_FF_EXP, n_expert);
     dspark_validate_tensor_layout(dw, l->ffn_down_exps, "ffn_down_exps",
                                   DS4_DSPARK_LAYOUT_ROUTED, 3,
-                                  DS4_N_FF_EXP, DS4_N_EMBD, DS4_N_EXPERT);
+                                  DS4_N_FF_EXP, DS4_N_EMBD, n_expert);
     if (l->ffn_gate_exps &&
         l->ffn_up_exps &&
         l->ffn_gate_exps->type != l->ffn_up_exps->type) {
@@ -8853,6 +8892,8 @@ static void dspark_weights_bind_optional(
     dw->has_markov_rank = summary->has_markov_rank;
     dw->has_noise_token_id = summary->has_noise_token_id;
     dw->has_target_layers = summary->has_target_layers;
+    dw->n_expert_used = summary->has_n_expert_used ?
+                        summary->n_expert_used : DS4_N_EXPERT_USED;
     memcpy(dw->target_layers,
            summary->target_layers,
            (size_t)dw->target_layer_count * sizeof(dw->target_layers[0]));
@@ -8888,6 +8929,20 @@ static void dspark_weights_bind_optional(
             dspark_bind_tensor(dw, m, final_stage, "markov_head.markov_w2.weight", true);
         sw->confidence_proj =
             dspark_bind_tensor(dw, m, final_stage, "confidence_head.proj.weight", true);
+    }
+
+    /* The draft's expert count is a property of its own weights, not of the
+     * backbone, so read it back from the router rather than assuming the
+     * backbone's.  V4 Flash's draft happens to match its backbone (384/top-6);
+     * V4.1's routes top-3 over a 128-expert pool.  Every stage shares one
+     * geometry, and the first stage is the one dspark_weights_validate_block_layout()
+     * checks, so take it from there. */
+    if (dw->n_stages != 0 && dw->stage[0].block.ffn_gate_inp &&
+        dw->stage[0].block.ffn_gate_inp->ndim == 2 &&
+        dw->stage[0].block.ffn_gate_inp->dim[1] <= UINT32_MAX) {
+        dw->n_expert = (uint32_t)dw->stage[0].block.ffn_gate_inp->dim[1];
+    } else {
+        dw->n_expert = DS4_N_EXPERT;
     }
 
     dspark_weights_validate_layout(dw);
@@ -33069,12 +33124,22 @@ static bool metal_graph_encode_layer_ffn_batch(
         ds4_gpu_graph  *g,
         const ds4_model        *model,
         const ds4_layer_weights *layer,
+        uint32_t                n_expert,
+        uint32_t                n_expert_used,
         uint32_t                il,
         uint32_t                pos0,
         uint32_t                n_tokens,
         ds4_decode_item         *decode_items,
         int                     decode_count) {
     if (n_tokens == 0 || n_tokens > g->prefill_cap) return false;
+    /* Expert geometry of the layer being run.  This is a parameter rather than a
+     * read of the global model shape because a DSpark draft routes over its own
+     * pool -- V4.1's draft has 128 experts and top-3 where its backbone has 384
+     * and top-6 -- and the draft runs through this same shared encoder.  The
+     * kernels below take these counts as arguments, and the graph's router
+     * buffers are sized for the backbone, so a draft's smaller geometry only
+     * ever touches a prefix of them. */
+    if (n_expert == 0 || n_expert_used == 0) return false;
 
     int64_t tp_hc_embd0 = 0, tp_hc_embd_n = DS4_N_EMBD;
     metal_graph_hc_slice_params(g, DS4_N_EMBD, &tp_hc_embd0, &tp_hc_embd_n);
@@ -33209,7 +33274,7 @@ static bool metal_graph_encode_layer_ffn_batch(
                                                  model,
                                                  layer->ffn_gate_inp,
                                                  DS4_N_EMBD,
-                                                 DS4_N_EXPERT,
+                                                 n_expert,
                                                  metal_graph_batch_ffn_norm(g),
                                                  n_tokens);
 
@@ -33238,8 +33303,8 @@ static bool metal_graph_encode_layer_ffn_batch(
                     metal_graph_batch_router_logits(g),
                     router_tokens,
                     DS4_N_VOCAB,
-                    DS4_N_EXPERT,
-                    DS4_N_EXPERT_USED,
+                    n_expert,
+                    n_expert_used,
                     DS4_EXPERT_WEIGHT_SCALE,
                     n_tokens) != 0;
     } else if (ok) {
@@ -33258,21 +33323,21 @@ static bool metal_graph_encode_layer_ffn_batch(
                     layer->ffn_gate_tid2eid != NULL,
                     metal_graph_batch_router_logits(g),
                     router_tokens,
-                    DS4_N_EXPERT,
-                    DS4_N_EXPERT_USED,
+                    n_expert,
+                    n_expert_used,
                     DS4_EXPERT_WEIGHT_SCALE,
                     n_tokens) != 0;
     }
     ds4_gpu_tensor_free(router_tokens);
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_logits", metal_graph_batch_router_logits(g),
-                                      (uint64_t)n_tokens * DS4_N_EXPERT, il, pos0);
+                                      (uint64_t)n_tokens * n_expert, il, pos0);
         metal_graph_debug_dump_tensor("ffn_moe_probs", metal_graph_batch_router_probs(g),
-                                      (uint64_t)n_tokens * DS4_N_EXPERT, il, pos0);
+                                      (uint64_t)n_tokens * n_expert, il, pos0);
         metal_graph_debug_dump_i32_tensor("ffn_moe_topk", metal_graph_batch_router_selected(g),
-                                          (uint64_t)n_tokens * DS4_N_EXPERT_USED, il, pos0);
+                                          (uint64_t)n_tokens * n_expert_used, il, pos0);
         metal_graph_debug_dump_tensor("ffn_moe_weights_scaled", metal_graph_batch_router_weights(g),
-                                      (uint64_t)n_tokens * DS4_N_EXPERT_USED, il, pos0);
+                                      (uint64_t)n_tokens * n_expert_used, il, pos0);
     }
     DS4_METAL_PROFILE_FFN_STAGE("router");
 
@@ -33294,7 +33359,7 @@ static bool metal_graph_encode_layer_ffn_batch(
         g->ssd_streaming &&
         !g->quality &&
         n_tokens > 1 &&
-        DS4_N_EXPERT_USED == 6 &&
+        n_expert_used == 6 &&
         !rocm_graph_stream_prefill_full_layer_enabled(g, layer, il, n_tokens) &&
         layer->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
         layer->ffn_up_exps->type == DS4_TENSOR_IQ2_XXS &&
@@ -33528,12 +33593,12 @@ static bool metal_graph_encode_layer_ffn_batch(
                     metal_graph_batch_ffn_norm(g), (uint64_t)r * vec_bytes, vec_bytes);
             ds4_gpu_tensor *sel_row = ds4_gpu_tensor_view(
                     metal_graph_batch_router_selected(g),
-                    (uint64_t)r * DS4_N_EXPERT_USED * sizeof(int32_t),
-                    (uint64_t)DS4_N_EXPERT_USED * sizeof(int32_t));
+                    (uint64_t)r * n_expert_used * sizeof(int32_t),
+                    (uint64_t)n_expert_used * sizeof(int32_t));
             ds4_gpu_tensor *w_row = ds4_gpu_tensor_view(
                     metal_graph_batch_router_weights(g),
-                    (uint64_t)r * DS4_N_EXPERT_USED * sizeof(float),
-                    (uint64_t)DS4_N_EXPERT_USED * sizeof(float));
+                    (uint64_t)r * n_expert_used * sizeof(float),
+                    (uint64_t)n_expert_used * sizeof(float));
             ok = out_row && x_row && sel_row && w_row &&
                  ds4_gpu_routed_moe_one_tensor(out_row,
                                                metal_graph_routed_gate(g),
@@ -33554,8 +33619,8 @@ static bool metal_graph_encode_layer_ffn_batch(
                                                (uint32_t)down_in_dim,
                                                (uint32_t)routed_out_dim,
                                                sel_row, w_row,
-                                               DS4_N_EXPERT,
-                                               DS4_N_EXPERT_USED,
+                                               n_expert,
+                                               n_expert_used,
                                                DS4_SWIGLU_CLAMP_EXP,
                                                x_row,
                                                NULL,
@@ -33604,8 +33669,8 @@ static bool metal_graph_encode_layer_ffn_batch(
                                                (uint32_t)routed_out_dim,
                                                metal_graph_batch_router_selected(g),
                                                metal_graph_batch_router_weights(g),
-                                               DS4_N_EXPERT,
-                                               DS4_N_EXPERT_USED,
+                                               n_expert,
+                                               n_expert_used,
                                                DS4_SWIGLU_CLAMP_EXP,
                                                metal_graph_batch_ffn_norm(g),
                                                il,
@@ -33624,12 +33689,12 @@ static bool metal_graph_encode_layer_ffn_batch(
     }
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_gate_clamped", metal_graph_batch_routed_gate(g),
-                                      (uint64_t)n_tokens * DS4_N_EXPERT_USED * down_in_dim, il, pos0);
+                                      (uint64_t)n_tokens * n_expert_used * down_in_dim, il, pos0);
         metal_graph_debug_dump_tensor("ffn_moe_up_clamped", metal_graph_batch_routed_up(g),
-                                      (uint64_t)n_tokens * DS4_N_EXPERT_USED * down_in_dim, il, pos0);
+                                      (uint64_t)n_tokens * n_expert_used * down_in_dim, il, pos0);
     }
     if (ok) {
-        const uint64_t routed_mid_elems = (uint64_t)n_tokens * DS4_N_EXPERT_USED * down_in_dim;
+        const uint64_t routed_mid_elems = (uint64_t)n_tokens * n_expert_used * down_in_dim;
         if (g->batch_routed_mid_is_f16) {
             metal_graph_debug_dump_f16_tensor("ffn_moe_weighted_swiglu", metal_graph_batch_routed_mid(g),
                                               routed_mid_elems, il, pos0);
@@ -33640,7 +33705,7 @@ static bool metal_graph_encode_layer_ffn_batch(
     }
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_down", metal_graph_batch_routed_down(g),
-                                      (uint64_t)n_tokens * DS4_N_EXPERT_USED * DS4_N_EMBD, il, pos0);
+                                      (uint64_t)n_tokens * n_expert_used * DS4_N_EMBD, il, pos0);
     }
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_out", metal_graph_batch_routed_out(g),
@@ -33798,7 +33863,10 @@ static bool metal_graph_encode_layer_batch(
         fprintf(stderr, "ds4: gpu layer %u attention batch encode failed\n", il);
     }
     if (ok) {
-        ok = metal_graph_encode_layer_ffn_batch(g, model, layer, il, pos0,
+        ok = metal_graph_encode_layer_ffn_batch(g, model, layer,
+                                                 DS4_N_EXPERT,
+                                                 DS4_N_EXPERT_USED,
+                                                 il, pos0,
                                                  n_tokens, NULL, 0);
         if (!ok) {
             fprintf(stderr, "ds4: gpu layer %u ffn batch encode failed\n", il);
@@ -35846,6 +35914,8 @@ static bool metal_graph_eval_dspark_stage_block(
     if (ok) ok = metal_graph_encode_layer_ffn_batch(g,
                                                      dspark_model,
                                                      block,
+                                                     dw->n_expert,
+                                                     dw->n_expert_used,
                                                      stage,
                                                      pos,
                                                      draft,
@@ -38400,6 +38470,8 @@ static bool metal_graph_prefill_layer_major(
             if (ok) ok = metal_graph_encode_layer_ffn_batch(g,
                                                             model,
                                                             &weights->layer[il],
+                                                            DS4_N_EXPERT,
+                                                            DS4_N_EXPERT_USED,
                                                             il,
                                                             start,
                                                             n_tokens,
@@ -84649,7 +84721,8 @@ static bool metal_graph_eval_mixed_prefill_decode(
         }
         if (ok) {
             ok = metal_graph_encode_layer_ffn_batch(
-                    g, model, layer, il, start, prefill_rows, NULL, 0);
+                    g, model, layer, DS4_N_EXPERT, DS4_N_EXPERT_USED,
+                    il, start, prefill_rows, NULL, 0);
         }
         if (ok) {
             ok = metal_graph_encode_routed_session_batch(
