@@ -30518,14 +30518,16 @@ static bool metal_graph_encode_token_raw_swa(
             pos,
             second_split_after_layers,
             allow_split_flush);
-#if defined(__APPLE__)
-    const bool tp_split_flush_safe =
-        g->tp_world == 2 &&
-        ds4_gpu_tp_decode_split_flush_safe() != 0 &&
-        getenv("DS4_METAL_DISABLE_TP_DECODE_SPLIT_FLUSH") == NULL;
-#else
-    const bool tp_split_flush_safe = false;
-#endif
+    /* NOTE (consolidation): an earlier revision computed a "tp_split_flush_safe"
+     * predicate here -- g->tp_world == 2 && ds4_gpu_tp_decode_split_flush_safe()
+     * && !DS4_METAL_DISABLE_TP_DECODE_SPLIT_FLUSH -- but never consumed it, so
+     * the decode split flush stayed gated on the stricter tp_world <= 1 test
+     * below.  Consequences: ds4_gpu_tp_decode_split_flush_safe() is unreachable
+     * and the DS4_METAL_DISABLE_TP_DECODE_SPLIT_FLUSH switch is inert; the
+     * world-2 permission path was never wired.  Removed rather than left as a
+     * no-op that reads like a live guard.  Enabling it is a behaviour change
+     * (it would allow the split flush at world 2) and is deliberately not done
+     * as part of a cleanup. */
 
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
 #if defined(__APPLE__)
