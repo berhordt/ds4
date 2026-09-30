@@ -2253,6 +2253,10 @@ static const dspark_name_rule dspark_stage_rules[] = {
     {"main_proj.scale", "main_proj.weight", "consume_scale"},
     {"main_norm.weight", "main_norm.weight", "emit"},
     {"norm.weight", "norm.weight", "emit"},
+    /* DeepSeek-V4.1 names this pair markov_head.{embed,head}; ds4 binds them as
+     * markov_w1/markov_w2 (markov_rank x vocab). Same tensors, renamed. */
+    {"markov_head.embed.weight", "markov_head.markov_w1.weight", "emit"},
+    {"markov_head.head.weight", "markov_head.markov_w2.weight", "emit"},
     {"markov_head.markov_w1.weight", "markov_head.markov_w1.weight", "emit"},
     {"markov_head.markov_w2.weight", "markov_head.markov_w2.weight", "emit"},
     {"confidence_head.proj.weight", "confidence_head.proj.weight", "emit"},
