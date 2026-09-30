@@ -2654,9 +2654,12 @@ static void dspark_plan_finalize(dspark_support_plan *plan,
                                  const hf_model_metadata *metadata) {
     qsort(plan->tensors, (size_t)plan->len, sizeof(plan->tensors[0]), dspark_plan_cmp);
     plan->alignment = DS4_GGUF_DEFAULT_ALIGNMENT;
-    const char *name = metadata->vision_exp ?
-        "DeepSeek V4 Flash Vision Experimental DSpark support" :
-        "DeepSeek V4 Flash DSpark support";
+    /* --dspark-name overrides general.name, so the planned size has to be taken
+     * from the name we will actually write, not from the default. */
+    const char *name = opt->name ? opt->name :
+        (metadata->vision_exp ?
+            "DeepSeek V4 Flash Vision Experimental DSpark support" :
+            "DeepSeek V4 Flash DSpark support");
     plan->n_kv = 10 + (metadata->vision_exp ? 3 : 0);
     plan->kv_bytes =
         gguf_kv_size_string("general.architecture", "deepseek4-dspark") +
