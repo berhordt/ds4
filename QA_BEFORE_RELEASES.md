@@ -461,7 +461,8 @@ substitute for this matrix.
   with `--tp-topology mesh.txt --tp-rank N` over both TCP and RDMA. Verify the
   per-link bring-up, the all-reduce decode gates, vocab-chunk logits merge, and
   DSpark verify fan-out produce byte-identical output across ranks. A GLM GGUF
-  must be rejected for world > 2.- With explicit permission for the current QA pass, run one resident GLM Q2
+  must be rejected for world > 2.
+- With explicit permission for the current QA pass, run one resident GLM Q2
   prompt, a long-context prompt, integrated GLM MTP, and concurrent server
   requests on the eight-GPU CUDA host. Use ordinary eight-GPU layer placement
   for GLM; do not pass the Flash-specific

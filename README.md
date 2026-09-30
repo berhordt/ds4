@@ -219,6 +219,7 @@ existing KV cache. See [steering documentation](dir-steering/README.md).
 `--prefix-file FILE` preloads complete `USER:` / `ASSISTANT:` pairs before
 the live conversation. A turn marker must start a line, roles must alternate,
 and the last turn must be `ASSISTANT:`.
+
 ## Capability Evaluation
 
 `ds4-eval` runs embedded capability regression tests against a real GGUF.

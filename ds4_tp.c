@@ -225,7 +225,7 @@ struct ds4_tp {
     uint64_t gpu_flags_off;     /* GPU-written gate-ready flags (u32/slot) */
     uint64_t batch_out_off;     /* [layer][row] verify-block local partials */
     uint64_t batch_in_off;      /* [layer][row] verify-block peer partials */
-    uint64_t batch_combined_off;/* canonical batch sum for world>2 */
+    uint64_t batch_combined_off; /* canonical batch sum for world>2 */
     uint64_t bulk_stage_off;    /* per-peer bulk RDMA staging (send+recv) */
     uint64_t bulk_stage_bytes;  /* one peer's staging size (BULK_SLOTS x MAX_MSG) */
     uint64_t timeout_sec;

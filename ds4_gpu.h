@@ -426,7 +426,8 @@ int ds4_gpu_stream_expert_cache_seed_experts_gpu_copy(
 #endif
 void ds4_gpu_print_memory_report(const char *label);
 
-#include "ds4_gpu_tp.h"/* Skip the whole-file model residency set (TP sharding: only the
+#include "ds4_gpu_tp.h"
+/* Skip the whole-file model residency set (TP sharding: only the
  * owned ranges are warmed; the rest must never be paged in). Call before
  * the model is mapped. */
 void ds4_gpu_model_residency_skip(int skip);
