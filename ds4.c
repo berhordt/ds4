@@ -8871,12 +8871,17 @@ static void dspark_weights_bind_optional(
         const uint32_t final_stage = dw->n_stages - 1u;
         ds4_dspark_stage_weights *sw = &dw->stage[final_stage];
         sw->norm = dspark_bind_tensor(dw, m, final_stage, "norm.weight", true);
+        /* DeepSeek-V4.1's draft has no head-HC tensors: DSparkBlock.forward_head
+         * collapses the HC copies with the last block's FFN pre-mix instead of
+         * projecting a dedicated hc_head_* MLP, so the checkpoint never stores
+         * them.  Optional, not required -- dspark_final_head_ready() then selects
+         * the matching head path on presence. */
         sw->hc_head_base =
-            dspark_bind_tensor(dw, m, final_stage, "hc_head_base.weight", true);
+            dspark_bind_tensor(dw, m, final_stage, "hc_head_base.weight", false);
         sw->hc_head_fn =
-            dspark_bind_tensor(dw, m, final_stage, "hc_head_fn.weight", true);
+            dspark_bind_tensor(dw, m, final_stage, "hc_head_fn.weight", false);
         sw->hc_head_scale =
-            dspark_bind_tensor(dw, m, final_stage, "hc_head_scale.weight", true);
+            dspark_bind_tensor(dw, m, final_stage, "hc_head_scale.weight", false);
         sw->markov_w1 =
             dspark_bind_tensor(dw, m, final_stage, "markov_head.markov_w1.weight", true);
         sw->markov_w2 =
