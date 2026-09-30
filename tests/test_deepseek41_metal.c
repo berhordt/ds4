@@ -932,6 +932,32 @@ static int check_index_projection(void) {
             fprintf(stderr, "V4.1 exact F16 projection width=%u output=%u rows=%u RMS=%.9g %.3f ms\n",
                 width, output, rows, relative, seconds * 1000);
             CHECK(memcmp(y, expected, (size_t)rows * output * sizeof(float)) == 0);
+            /* WS6.3 A/B. The batched (non-exact) path is what exact_rows
+             * prevents the model from reaching. Measure how much faster it is
+             * and how far it drifts from the per-row reference, including the
+             * count of bit-differing outputs -- that count is the price of
+             * losing sweep-size independence. */
+            if (rows > 1) {
+                const double bstart = monotonic_seconds();
+                CHECK(ds4_gpu_matmul_f16_tensor(out, model, weight_bytes, 0, width,
+                                               output, in, rows));
+                CHECK(ds4_gpu_synchronize());
+                const double bseconds = monotonic_seconds() - bstart;
+                double berror = 0, bnorm = 0;
+                size_t bitdiff = 0;
+                for (size_t i = 0; i < (size_t)rows * output; i++) {
+                    const double d = (double)y[i] - expected[i];
+                    berror += d * d; bnorm += (double)expected[i] * expected[i];
+                    if (memcmp(&y[i], &expected[i], sizeof(float)) != 0) bitdiff++;
+                }
+                fprintf(stderr,
+                    "V4.1 batched F16 projection width=%u output=%u rows=%u "
+                    "RMS=%.9g %.3f ms bitdiff=%zu/%zu speedup=%.2fx\n",
+                    width, output, rows,
+                    sqrt(berror / fmax(bnorm, 1e-30)), bseconds * 1000.0,
+                    bitdiff, (size_t)rows * output,
+                    bseconds > 0 ? seconds / bseconds : 0.0);
+            }
             for (uint32_t j = 0; j < 8; j++) {
                 const uint32_t o = j * (output / 8), t = rows - 1;
                 double sum = 0, magnitude = 0;

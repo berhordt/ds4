@@ -41629,6 +41629,12 @@ static bool ds41_index_batch(ds41_gpu_graph *g, const ds4_model *m,
             if (!ds4_gpu_begin_commands()) return false; \
         } \
     } while (0)
+    /* Baseline boundary. ds41_attention_batch() enqueues the q-RoPE, the
+     * raw-prefill copies and (on kv_source layers) the whole publish path
+     * BEFORE calling us, and none of it is flushed.  Without this boundary the
+     * first probed step absorbs all of that work and reports several times its
+     * true cost. */
+    IDX_FLUSH("idx:0 pre");
     if (getenv("DS4_METAL_DISABLE_V41_BATCH_INDEX_PROJ")) {
         for (uint32_t t = 0; t < count; t++) {
             ds41_prefill_row *r = &g->rows_view[t];
