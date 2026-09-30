@@ -2756,12 +2756,14 @@ static dspark_support_plan build_dspark_support_plan(st_db *db,
         }
     }
 
-    /* The draft's top-k cannot be read off the weights, so it is the one
-     * number here that can be wrong without any shape disagreeing.  Catch the
-     * case where it is impossible rather than merely unexpected: a draft whose
-     * expert pool is smaller than its top-k is a conversion mistake, and the
-     * mistake this check exists for is passing the V4 Flash default (6) for a
-     * V4.1 draft, which routes 3 over 128 experts. */
+    /* The draft's top-k cannot be read off the weights, so it is the one number
+     * here that no shape check would catch.  This rejects only the impossible
+     * case -- a top-k larger than the draft's expert pool.  It does NOT catch a
+     * plausible-but-wrong top-k: writing 6 for a draft that routes 3 over 128
+     * experts is geometrically fine and is accepted here, and the draft then
+     * mixes twice as many experts as it was trained to.  Nothing downstream can
+     * detect that either, so the top-k has to come from the checkpoint config
+     * (V4.1: dspark_n_activated_experts = 3). */
     if (opt->n_expert_used == 0) {
         die("DSpark n_expert_used must be non-zero");
     }
