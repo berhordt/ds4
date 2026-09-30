@@ -71439,6 +71439,13 @@ static int ds4_engine_open_internal(ds4_engine **out,
         }
     }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 && !opt->inspect_only) {
+        /* The V4.1 DSpark path is being brought up.  Its hard parts are in place
+         * -- the draft converts (V4.1's head layout and its own 128-expert/top-3
+         * routed geometry) and it binds with missing=0 invalid=0 -- but none of
+         * it has run end to end yet, so it stays opt-in.  The default rejection
+         * below is unchanged, as is every other term of this guard: steering,
+         * legacy diagnostics and the context ceiling are still hard limits. */
+        const bool dspark_bringup = getenv("DS4_V41_ALLOW_DSPARK") != NULL;
         const bool supported = (e->backend == DS4_BACKEND_METAL ||
 #if defined(DS4_HAS_DEEPSEEK41_GPU) && !defined(__APPLE__)
                 (e->backend == DS4_BACKEND_CUDA && !opt->cuda_tensor_parallel &&
@@ -71446,9 +71453,11 @@ static int ds4_engine_open_internal(ds4_engine **out,
 #endif
                  false) &&
             opt->distributed.role == DS4_DISTRIBUTED_NONE &&
-            !load_slice && !opt->dspark && !opt->glm_mtp &&
+            !load_slice &&
+            (dspark_bringup || !opt->dspark) &&
+            !opt->glm_mtp &&
             !opt->first_token_test && !opt->metal_graph_test &&
-            (!opt->mtp_path || !opt->mtp_path[0]) &&
+            (dspark_bringup || !opt->mtp_path || !opt->mtp_path[0]) &&
             (!opt->directional_steering_file || !opt->directional_steering_file[0]) &&
             e->power_percent == 100 && opt->context_size <= 1048576;
         if (!supported) {
