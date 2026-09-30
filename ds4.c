@@ -8198,9 +8198,17 @@ static void model_map_span_vec_include_layer_decode_static(ds4_model_map_span_ve
     DS4_INCLUDE_TENSOR(l->ffn_down);
     DS4_INCLUDE_TENSOR(l->ffn_gate_inp);
     DS4_INCLUDE_TENSOR(l->ffn_exp_probs_b);
+    /* V4.1 visual router bias. It lives in the *language* GGUF (not in the
+     * vision encoder) and is replicated, so like ffn_exp_probs_b it must be
+     * mapped by every rank. Omitting it made every image-bearing prefill fail
+     * at layer 0 with "Metal model range ... is not covered by mapped model
+     * views" from the visual-bias lookup in ds4_gpu_router_select_batch_tensor.
+     * Present at 0aaea5a; lost in the N-node transport merge. */
+    DS4_INCLUDE_TENSOR(l->ffn_exp_probs_vl);
     /* The shared expert is replicated under tensor parallelism (every rank
      * needs it); it is appended as isolated spans in the sharded builder so
-     * the exact tensor range is always mapped. */    DS4_INCLUDE_TENSOR(l->nextn_eh_proj);
+     * the exact tensor range is always mapped. */
+    DS4_INCLUDE_TENSOR(l->nextn_eh_proj);
     DS4_INCLUDE_TENSOR(l->nextn_enorm);
     DS4_INCLUDE_TENSOR(l->nextn_hnorm);
     DS4_INCLUDE_TENSOR(l->nextn_shared_head_norm);
