@@ -138,7 +138,14 @@ int main(int argc, char **argv) {
         ok = ds4_tp_create(&tp, &opt.tp, &id, err, sizeof(err)) &&
              ds4_engine_tp_bind(engine, tp, err, sizeof(err));
     }
-    if (ok) ok = check_prefix(engine, 127) && check_prefix(engine, 4095);
+    if (ok) {
+        /* The prefix list short-circuits on the first failure, so a diagnostic
+         * mode that cannot satisfy the short prefix would never reach the long
+         * one.  DS41_SPEC_PREFIX_ONLY=<n> runs just that prefix. */
+        const char *only = getenv("DS41_SPEC_PREFIX_ONLY");
+        ok = (only && only[0]) ? check_prefix(engine, atoi(only))
+                               : check_prefix(engine, 127) && check_prefix(engine, 4095);
+    }
     if (tp) (void)ds4_tp_send_stop(tp);
     ds4_engine_close(engine);
     ds4_tp_free(tp);
