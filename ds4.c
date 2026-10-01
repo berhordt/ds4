@@ -43117,8 +43117,18 @@ static DS4_MAYBE_UNUSED bool ds41_verify_suffix_tops(
              ds41_bf16(r->x, DS4_N_EMBD) &&
              ds41_norm(r->norm, r->x, m, w->output_norm);
     }
-    if (ok) ok = ds41_output_projection(g, g->spec_logits, m, w,
-                                        g->rows_view[0].norm, n_tokens);
+    /* rows_view[i].* are one-row views, so a projection over n_tokens rows needs
+     * its own view of g->batch.norm -- passing rows_view[0].norm would present a
+     * one-row buffer to a multi-row matmul and fail the bounds check, leaving
+     * spec_logits stale and therefore row_tops meaningless. */
+    ds4_gpu_tensor *head_norm = NULL;
+    if (ok) {
+        head_norm = ds4_gpu_tensor_view(g->batch.norm, 0,
+                                        (uint64_t)n_tokens * DS4_N_EMBD * sizeof(float));
+        ok = head_norm != NULL;
+    }
+    if (ok) ok = ds41_output_projection(g, g->spec_logits, m, w, head_norm, n_tokens);
+    ds4_gpu_tensor_free(head_norm);
     /* Row i's greedy token is the target's own next token after row i, which is
      * what the draft proposes for row i+1.  Only rows 0..n-2 are needed. */
     if (ok && n_tokens == 2u) {
