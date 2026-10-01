@@ -20,8 +20,9 @@
  * something materially different has a large margin at least one way.  The
  * harness's existing gap only measures the reference's margin, which cannot
  * tell those apart.  Off unless DS4_DSP41_LOGIT_DIFF is set. */
-static int   g_ld_rows, g_ld_agree, g_ld_dis;
+static int   g_ld_rows, g_ld_agree, g_ld_dis, g_ld_shown;
 static float g_ld_dis_lo = -1.0f, g_ld_dis_hi = 0.0f;
+static float g_ld_dlogit = 0.0f, g_ld_dlogprob = 0.0f;
 
 static void logit_diff_probe(ds4_session *spec, ds4_session *ref, int tok) {
     ds4_token_score ra[4], sa[4], r1, s1;
@@ -32,9 +33,17 @@ static void logit_diff_probe(ds4_session *spec, ds4_session *ref, int tok) {
     const float refm = ra[0].logit - r1.logit;   /* ref's lead over spec's pick */
     const float specm = sa[0].logit - s1.logit;  /* spec's lead over ref's pick */
     const int agree = ra[0].id == sa[0].id;
+    /* Same token, two forward passes.  The raw logit difference says whether the
+     * two passes agree at all; the logprob difference says whether they agree
+     * after normalising, which is the part that decides probabilities.  A pure
+     * additive offset moves the first and leaves the second alone. */
+    const float dlogit = fabsf(ra[0].logit - sa[0].logit);
+    const float dlogprob = fabsf(ra[0].logprob - sa[0].logprob);
     g_ld_rows++;
     if (agree) {
         g_ld_agree++;
+        if (dlogit > g_ld_dlogit) g_ld_dlogit = dlogit;
+        if (dlogprob > g_ld_dlogprob) g_ld_dlogprob = dlogprob;
     } else {
         const float lo = refm < specm ? refm : specm;
         const float hi = refm < specm ? specm : refm;
@@ -42,10 +51,23 @@ static void logit_diff_probe(ds4_session *spec, ds4_session *ref, int tok) {
         if (g_ld_dis_lo < 0.0f || lo < g_ld_dis_lo) g_ld_dis_lo = lo;
         if (hi > g_ld_dis_hi) g_ld_dis_hi = hi;
     }
-    if (g_ld_rows <= 48)
-        fprintf(stderr, "LOGITS tok=%d agree=%d ref1=%d(%.3f) spec1=%d(%.3f) "
-                "refm=%.4f specm=%.4f\n", tok, agree, ra[0].id, ra[0].logit,
-                sa[0].id, sa[0].logit, refm, specm);
+    /* Disagreements are the whole point, so always show them; show the first few
+     * agreements as a drift baseline. */
+    if (!agree || g_ld_shown < 16) {
+        g_ld_shown++;
+        fprintf(stderr, "LOGITS tok=%d agree=%d id=%d/%d logit=%.3f/%.3f "
+                "lp=%.5f/%.5f dlogit=%.4f dlp=%.6f refm=%.4f specm=%.4f\n",
+                tok, agree, ra[0].id, sa[0].id, ra[0].logit, sa[0].logit,
+                ra[0].logprob, sa[0].logprob, dlogit, dlogprob, refm, specm);
+    }
+}
+
+static void logit_diff_summary(void) {
+    if (!getenv("DS4_DSP41_LOGIT_DIFF") || !g_ld_rows) return;
+    fprintf(stderr, "LOGITSUM rows=%d agree=%d disagree=%d max_dlogit=%.4f "
+            "max_dlogprob=%.6f dis_lo_margin=%.4f dis_hi_margin=%.4f\n",
+            g_ld_rows, g_ld_agree, g_ld_dis, g_ld_dlogit, g_ld_dlogprob,
+            g_ld_dis_lo, g_ld_dis_hi);
 }
 
 static int check_prefix(ds4_engine *engine, int prefix) {
@@ -118,12 +140,10 @@ static int check_prefix(ds4_engine *engine, int prefix) {
             generated += count;
         }
     }
-    if (getenv("DS4_DSP41_LOGIT_DIFF") && g_ld_rows)
-        fprintf(stderr, "LOGITSUM rows=%d agree=%d disagree=%d "
-                "dis_lo_margin=%.4f dis_hi_margin=%.4f\n",
-                g_ld_rows, g_ld_agree, g_ld_dis, g_ld_dis_lo, g_ld_dis_hi);
     ok = max_chunk > 1;
 done:
+    /* Out here, not in the fall-through path: the gap check does a goto done. */
+    logit_diff_summary();
     fprintf(stderr, "TP DSpark prefix=%d generated=%d max_chunk=%d worst_gap=%g: %s %s\n",
             prefix, generated, max_chunk, worst_gap, ok ? "PASS" : "FAIL", err);
     ds4_session_free(ref);
