@@ -81903,6 +81903,19 @@ static int ds4_session_eval_dspark_speculative_argmax(
             if (row_tops[i - 1] != drafts[i]) break;
             commit_drafts++;
         }
+        /* Diagnostic split for the divergence hunt.  "none" keeps the verify and
+         * the rollback but never commits anything, isolating the verifier's
+         * effect on session state across cycles.  "full" additionally commits the
+         * end-of-block state after an all-match block, isolating whether the
+         * sweep's state is itself safe to adopt.  A partial block is dropped in
+         * both modes, so the replay path is what is left when they differ. */
+        const char *accept_mode = getenv("DS4_DSPARK_ACCEPT_MODE");
+        if (accept_mode && strcmp(accept_mode, "none") == 0) {
+            commit_drafts = 0;
+        } else if (accept_mode && strcmp(accept_mode, "full") == 0 &&
+                   commit_drafts < draft_n) {
+            commit_drafts = 0;
+        }
     }
 
     /* The batched verifier and ordinary one-token decode execute the same
