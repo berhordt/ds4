@@ -12,6 +12,42 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Batched-versus-serial logit comparison.  At the top of each block both
+ * sessions sit at the same position with the same token history, so their
+ * distributions are directly comparable.  The margin measured *under each one*
+ * separates the two explanations for a top-1 disagreement: an ordinary
+ * near-tie has a tiny margin both ways, while a forward pass that computes
+ * something materially different has a large margin at least one way.  The
+ * harness's existing gap only measures the reference's margin, which cannot
+ * tell those apart.  Off unless DS4_DSP41_LOGIT_DIFF is set. */
+static int   g_ld_rows, g_ld_agree, g_ld_dis;
+static float g_ld_dis_lo = -1.0f, g_ld_dis_hi = 0.0f;
+
+static void logit_diff_probe(ds4_session *spec, ds4_session *ref, int tok) {
+    ds4_token_score ra[4], sa[4], r1, s1;
+    if (ds4_session_top_logprobs(ref, ra, 4) != 4 ||
+        ds4_session_top_logprobs(spec, sa, 4) != 4 ||
+        !ds4_session_token_logprob(ref, sa[0].id, &r1) ||
+        !ds4_session_token_logprob(spec, ra[0].id, &s1)) return;
+    const float refm = ra[0].logit - r1.logit;   /* ref's lead over spec's pick */
+    const float specm = sa[0].logit - s1.logit;  /* spec's lead over ref's pick */
+    const int agree = ra[0].id == sa[0].id;
+    g_ld_rows++;
+    if (agree) {
+        g_ld_agree++;
+    } else {
+        const float lo = refm < specm ? refm : specm;
+        const float hi = refm < specm ? specm : refm;
+        g_ld_dis++;
+        if (g_ld_dis_lo < 0.0f || lo < g_ld_dis_lo) g_ld_dis_lo = lo;
+        if (hi > g_ld_dis_hi) g_ld_dis_hi = hi;
+    }
+    if (g_ld_rows <= 48)
+        fprintf(stderr, "LOGITS tok=%d agree=%d ref1=%d(%.3f) spec1=%d(%.3f) "
+                "refm=%.4f specm=%.4f\n", tok, agree, ra[0].id, ra[0].logit,
+                sa[0].id, sa[0].logit, refm, specm);
+}
+
 static int check_prefix(ds4_engine *engine, int prefix) {
     ds4_session *spec = NULL, *ref = NULL;
     ds4_tokens prompt = {0}, text = {0}, filler = {0};
@@ -38,6 +74,7 @@ static int check_prefix(ds4_engine *engine, int prefix) {
             ds4_session_sync(ref, &prompt, err, sizeof(err))) goto done;
         int n = 0;
         while (n < 128) {
+            if (getenv("DS4_DSP41_LOGIT_DIFF")) logit_diff_probe(spec, ref, n);
             int accepted[16];
             const int count = ds4_session_eval_speculative_argmax_ignoring_eos(
                 spec, ds4_session_argmax(spec), 128 - n, ds4_token_eos(engine),
@@ -81,6 +118,10 @@ static int check_prefix(ds4_engine *engine, int prefix) {
             generated += count;
         }
     }
+    if (getenv("DS4_DSP41_LOGIT_DIFF") && g_ld_rows)
+        fprintf(stderr, "LOGITSUM rows=%d agree=%d disagree=%d "
+                "dis_lo_margin=%.4f dis_hi_margin=%.4f\n",
+                g_ld_rows, g_ld_agree, g_ld_dis, g_ld_dis_lo, g_ld_dis_hi);
     ok = max_chunk > 1;
 done:
     fprintf(stderr, "TP DSpark prefix=%d generated=%d max_chunk=%d worst_gap=%g: %s %s\n",
