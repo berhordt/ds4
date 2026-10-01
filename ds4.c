@@ -73762,6 +73762,59 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             }
         }
         s->prefill_cap = s->ds41_graph.prefill_cap;
+        /* DSpark needs a session graph of its own.  V4.1 executes on ds41_graph,
+         * which carries no DSpark machinery at all, while the entire draft
+         * pipeline -- staging, the draft block's attention and MoE, the final
+         * head -- lives on the generic graph.  Allocate a deliberately small one
+         * rather than the full session footprint: the draft only ever runs
+         * block_size+1 rows, and V4.1's sliding window is 128, so raw_cap lands
+         * at 256 and the whole arena costs tens of megabytes.  The per-layer raw
+         * caches it also creates are unused by the draft, which has its own
+         * dspark_raw_cache, but at this size they are not worth special-casing.
+         * enable_mtp mirrors what the generic path already passes for a DSpark
+         * session (need_spec_verifier) and is what allocates g->spec_logits,
+         * which the draft's head writes its logits into. */
+        if (e->support_kind == DS4_SUPPORT_DSPARK && e->dspark &&
+            e->dspark_weights.block_size != 0) {
+            const uint32_t draft_rows = e->dspark_weights.block_size + 1u;
+            const uint32_t draft_ctx = 256u;
+            const uint32_t draft_raw =
+                metal_graph_raw_cap_for_context((int)draft_ctx, draft_rows);
+            const ds4_layer_weights *draft_shape =
+                weights_first_bound_layer(&e->weights);
+            if (!draft_shape ||
+                !metal_graph_alloc_raw_cap(&s->graph, &e->weights, draft_shape,
+                                           draft_raw, draft_ctx, draft_rows,
+                                           true, NULL, false, NULL)) {
+                fprintf(stderr,
+                        "ds4: failed to allocate the DSpark draft arena "
+                        "(rows=%u ctx=%u raw=%u)\n",
+                        draft_rows, draft_ctx, draft_raw);
+                metal_graph_free(&s->graph);
+                ds41_graph_free(&s->ds41_graph);
+                free(s);
+                return 1;
+            }
+            if (!metal_graph_configure_dspark_capture(&s->graph,
+                                                      &e->dspark_weights)) {
+                fprintf(stderr,
+                        "ds4: failed to configure DSpark target-hidden capture\n");
+                metal_graph_free(&s->graph);
+                ds41_graph_free(&s->ds41_graph);
+                free(s);
+                return 1;
+            }
+            fprintf(stderr,
+                    "ds4: DSpark draft arena: rows=%u ctx=%u raw=%u "
+                    "capture=%s layers=",
+                    draft_rows, draft_ctx, draft_raw,
+                    s->graph.dspark_capture_enabled ? "on" : "OFF");
+            for (uint32_t i = 0; i < s->graph.dspark_target_layer_count; i++) {
+                fprintf(stderr, "%s%u", i == 0 ? "" : ",",
+                        s->graph.dspark_target_layers[i]);
+            }
+            fprintf(stderr, "\n");
+        }
         s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
         s->sample_probs = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
         e->ds41_session_bytes += s->ds41_graph.allocation_bytes;
