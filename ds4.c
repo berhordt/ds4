@@ -35993,6 +35993,10 @@ static bool metal_graph_seed_dspark_target_cache_step(
         ok = metal_graph_seed_dspark_stage_target_cache(g, dspark_model, dw,
                                                        stage, pos, 1, false);
     }
+    /* The stores above write the rows; this is what makes the window admit them.
+     * merge_target_range keeps at most DS4_N_SWA rows, which is the draft's real
+     * attention window. */
+    if (ok) ok = metal_graph_dspark_cache_merge_target_range(g, pos, 1);
     return ok;
 }
 
@@ -78127,17 +78131,6 @@ static bool ds4_session_prepare_dspark_draft_impl(ds4_session *s,
                                                           pos);
             }
         }
-        /* Give the draft this position's slice of the target's context before
-         * the chain runs, so its attention has something to attend over.  The
-         * seeder returns true when there is nothing to do, so a false here means
-         * a real GPU failure and the draft is better skipped for this cycle. */
-        if (stage_input_ok) {
-            stage_input_ok =
-                metal_graph_seed_dspark_target_cache_step(&s->graph,
-                                                          &s->engine->mtp_model,
-                                                          dw,
-                                                          feature_pos);
-        }
         DS4_DSPARK_PROP_ADD(propose_setup_ms, setup_t0);
         const bool draft_cache_ready =
             dspark_stage_cache_ready(&s->graph, dw);
@@ -78183,6 +78176,29 @@ static bool ds4_session_prepare_dspark_draft_impl(ds4_session *s,
             }
         }
         DS4_DSPARK_PROP_ADD(propose_cache_ms, cache_t0);
+        /* V4.1 only, and only now that the cache window is established.  The
+         * generic path fills this cache from a captured prefill batch, which a
+         * ds41 session never produces, so the draft attended over no keys at all
+         * (cache_len = 0).  Seeding one row per position builds the same window
+         * incrementally.  Best effort: a seed failure must not cost the whole
+         * proposal, or the draft goes silent exactly as it did while
+         * final_hidden refused V4.1. */
+        if (ds4_session_is_ds41(s) && draft_cache_ready) {
+            if (!metal_graph_seed_dspark_target_cache_step(&s->graph,
+                                                           &s->engine->mtp_model,
+                                                           dw,
+                                                           feature_pos)) {
+                static int seed_warned = 0;
+                if (!seed_warned) {
+                    seed_warned = 1;
+                    fprintf(stderr,
+                            "ds4: DSpark target-cache seed failed (pos=%u "
+                            "cache_len=%u cap=%u prefill_cap=%u)\n",
+                            feature_pos, s->graph.dspark_cache_len,
+                            s->graph.dspark_cache_cap, s->graph.prefill_cap);
+                }
+            }
+        }
         const bool noncausal_attn_ready =
             probe_log &&
             stage_input_ok &&
