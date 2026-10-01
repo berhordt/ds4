@@ -71928,21 +71928,41 @@ static int ds4_engine_open_internal(ds4_engine **out,
          * below is unchanged, as is every other term of this guard: steering,
          * legacy diagnostics and the context ceiling are still hard limits. */
         const bool dspark_bringup = getenv("DS4_V41_ALLOW_DSPARK") != NULL;
-        const bool supported = (e->backend == DS4_BACKEND_METAL ||
+        /* Named terms, so a rejection can say which one failed.  Without this the
+         * only signal is the generic message below, which names six unrelated
+         * features and cannot distinguish them. */
+        const bool metal_ok = e->backend == DS4_BACKEND_METAL;
 #if defined(DS4_HAS_DEEPSEEK41_GPU) && !defined(__APPLE__)
-                (e->backend == DS4_BACKEND_CUDA && !opt->cuda_tensor_parallel &&
-                 (!gpu_cfg || gpu_cfg->n_gpus <= 1)) ||
+        const bool cuda_ok = e->backend == DS4_BACKEND_CUDA && !opt->cuda_tensor_parallel &&
+            (!gpu_cfg || gpu_cfg->n_gpus <= 1);
+#else
+        const bool cuda_ok = false;
 #endif
-                 false) &&
-            opt->distributed.role == DS4_DISTRIBUTED_NONE &&
-            !load_slice &&
-            (dspark_bringup || !opt->dspark) &&
-            !opt->glm_mtp &&
-            !opt->first_token_test && !opt->metal_graph_test &&
-            (dspark_bringup || !opt->mtp_path || !opt->mtp_path[0]) &&
-            (!opt->directional_steering_file || !opt->directional_steering_file[0]) &&
-            e->power_percent == 100 && opt->context_size <= 1048576;
+        const bool role_ok = opt->distributed.role == DS4_DISTRIBUTED_NONE;
+        const bool slice_ok = !load_slice;
+        const bool dspark_ok = dspark_bringup || !opt->dspark;
+        const bool glm_ok = !opt->glm_mtp;
+        const bool tests_ok = !opt->first_token_test && !opt->metal_graph_test;
+        const bool mtp_ok = dspark_bringup || !opt->mtp_path || !opt->mtp_path[0];
+        const bool steer_ok =
+            !opt->directional_steering_file || !opt->directional_steering_file[0];
+        const bool power_ok = e->power_percent == 100;
+        const bool ctx_ok = opt->context_size <= 1048576;
+        const bool supported = (metal_ok || cuda_ok) && role_ok && slice_ok && dspark_ok &&
+            glm_ok && tests_ok && mtp_ok && steer_ok && power_ok && ctx_ok;
         if (!supported) {
+            if (dspark_bringup) {
+                fprintf(stderr,
+                        "ds4: V4.1 guard: metal=%d cuda=%d role=%d(distributed.role=%d) slice=%d "
+                        "dspark=%d(opt=%d) glm=%d tests=%d mtp=%d(path=%s) steer=%d "
+                        "power=%d(%u) ctx=%d(%d)\n",
+                        (int)metal_ok, (int)cuda_ok, (int)role_ok,
+                        (int)opt->distributed.role, (int)slice_ok, (int)dspark_ok,
+                        (int)opt->dspark, (int)glm_ok, (int)tests_ok, (int)mtp_ok,
+                        (opt->mtp_path && opt->mtp_path[0]) ? opt->mtp_path : "-",
+                        (int)steer_ok, (int)power_ok, e->power_percent, (int)ctx_ok,
+                        opt->context_size);
+            }
             fprintf(stderr, "ds4: V4.1 requires Metal or single-GPU CUDA per rank (optional network tensor parallelism); "
                             "DSpark, steering and legacy diagnostics are not supported (maximum context 1048576)\n");
             ds4_engine_close(e);
