@@ -40821,6 +40821,23 @@ typedef struct {
     ds4_gpu_tensor *window[40];
     ds4_gpu_tensor *compressed[4], *index_cache[4];
     ds4_gpu_tensor *previous_kv[4], *previous_score[4];
+    /* Speculative rollback for the verify block.  Much smaller than the generic
+     * session frontier, because almost nothing here is stored state: n_comp is
+     * derived as (pos+1)/ratio at each use, so the compressed and indexer caches
+     * need no counter -- rows past a rewound position are stale garbage the next
+     * pass overwrites, which is what the generic frontier relies on too.
+     *
+     * What does need rewinding is per *row*, not per block: the ratio-2 pooling
+     * carry (previous_kv/previous_score are one row of 512, not an accumulator)
+     * and the Engram n-gram tail.  Accepting part of a block has to land on the
+     * state belonging to the *accepted* prefix, which is neither the pre-verify
+     * state nor the post-block one, so slot r holds the state entering row r and
+     * there are rows+1 slots. */
+    ds4_gpu_tensor *spec_previous_kv[4], *spec_previous_score[4];
+    ds4_engram_history spec_row_history[DS4_DSPARK_MAX_BLOCK_SIZE + 2u];
+    uint32_t spec_pos;
+    uint32_t spec_rows;
+    bool spec_valid;
     ds4_gpu_tensor *engram_q_norm[2], *engram_k_norm[2];
     ds41_prefill_row batch, *rows_view;
     ds41_prefill_row carry;
@@ -40992,13 +41009,20 @@ static DS4_MAYBE_UNUSED bool ds41_graph_alloc(ds41_gpu_graph *g, const ds4_model
         g->window[i] = ds4_gpu_tensor_alloc(128u * 512u * sizeof(float));
         if (!g->window[i]) goto fail;
     }
+    const uint32_t spec_slots = DS4_DSPARK_MAX_BLOCK_SIZE + 2u;
     for (uint32_t i = 0; i < 4; i++) {
         const uint64_t cap = ctx / (i < 3 ? 2u : 1u) + 1u;
         g->compressed[i] = ds4_gpu_tensor_alloc(cap * 512u * sizeof(float));
         g->index_cache[i] = ds4_gpu_tensor_alloc(cap * 128u * sizeof(float));
         g->previous_kv[i] = ds4_gpu_tensor_alloc(512u * sizeof(float));
         g->previous_score[i] = ds4_gpu_tensor_alloc(512u * sizeof(float));
-        if (!g->compressed[i] || !g->index_cache[i] || !g->previous_kv[i] || !g->previous_score[i]) goto fail;
+        g->spec_previous_kv[i] =
+            ds4_gpu_tensor_alloc((uint64_t)spec_slots * 512u * sizeof(float));
+        g->spec_previous_score[i] =
+            ds4_gpu_tensor_alloc((uint64_t)spec_slots * 512u * sizeof(float));
+        if (!g->compressed[i] || !g->index_cache[i] || !g->previous_kv[i] ||
+            !g->previous_score[i] || !g->spec_previous_kv[i] ||
+            !g->spec_previous_score[i]) goto fail;
     }
 #define DS41_ALLOC(name, count) \
     if (!(g->name = (!strcmp(#name, "engram_prefetch") || !strcmp(#name, "image_text_mask") ? \
@@ -42042,6 +42066,63 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
         (!shared_owner || g->tp_rank != (il & 1u) ||
             ds4_gpu_add_tensor(b->routed, b->routed, b->shared, count * DS4_N_EMBD)) &&
         ds41_sum_partial_batch(g, b->routed, il, count);
+}
+
+/* Speculative rollback for the V4.1 verify block.
+ *
+ * Slot r holds the state *entering* verify row r, so restoring to an accepted
+ * prefix of `a` rows is a copy of slot `a`.  Only the ratio-2 pooling carry and
+ * the Engram n-gram tail are captured; see the note on the struct for why the
+ * compressed and indexer caches need no rewind at all. */
+static DS4_MAYBE_UNUSED bool ds41_spec_frontier_note_row(ds41_gpu_graph *g);
+
+static DS4_MAYBE_UNUSED bool ds41_spec_frontier_snapshot(ds41_gpu_graph *g) {
+    if (!g || !g->valid || g->spec_rows != 0) return false;
+    g->spec_pos = g->pos;
+    g->spec_valid = false;
+    bool ok = ds41_spec_frontier_note_row(g);
+    g->spec_valid = ok;
+    return ok;
+}
+
+/* Capture the carry state entering the next verify row. */
+static DS4_MAYBE_UNUSED bool ds41_spec_frontier_note_row(ds41_gpu_graph *g) {
+    const uint32_t slot = g->spec_rows;
+    if (!g || slot > DS4_DSPARK_MAX_BLOCK_SIZE + 1u) return false;
+    g->spec_row_history[slot] = g->history;
+    const uint64_t off = (uint64_t)slot * 512u * sizeof(float);
+    bool ok = ds4_gpu_begin_commands() != 0;
+    for (uint32_t i = 0; ok && i < 4; i++) {
+        ok = ds4_gpu_tensor_copy(g->spec_previous_kv[i], off,
+                                 g->previous_kv[i], 0, 512u * sizeof(float)) != 0 &&
+             ds4_gpu_tensor_copy(g->spec_previous_score[i], off,
+                                 g->previous_score[i], 0, 512u * sizeof(float)) != 0;
+    }
+    if (ok) ok = ds4_gpu_end_commands() != 0;
+    else (void)ds4_gpu_synchronize();
+    if (ok) g->spec_rows = slot + 1u;
+    return ok;
+}
+
+static DS4_MAYBE_UNUSED bool ds41_spec_frontier_restore(ds41_gpu_graph *g, uint32_t accepted) {
+    if (!g || !g->spec_valid || accepted > g->spec_rows) return false;
+    const uint64_t off = (uint64_t)accepted * 512u * sizeof(float);
+    bool ok = ds4_gpu_begin_commands() != 0;
+    for (uint32_t i = 0; ok && i < 4; i++) {
+        ok = ds4_gpu_tensor_copy(g->previous_kv[i], 0,
+                                 g->spec_previous_kv[i], off, 512u * sizeof(float)) != 0 &&
+             ds4_gpu_tensor_copy(g->previous_score[i], 0,
+                                 g->spec_previous_score[i], off, 512u * sizeof(float)) != 0;
+    }
+    if (ok) ok = ds4_gpu_end_commands() != 0;
+    else (void)ds4_gpu_synchronize();
+    if (!ok) return false;
+    g->pos = g->spec_pos + accepted;
+    g->history = g->spec_row_history[accepted];
+    /* The block is consumed; a later verify takes a fresh snapshot. */
+    g->spec_rows = 0;
+    g->spec_valid = false;
+    return true;
 }
 
 static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model *m,
