@@ -40825,6 +40825,13 @@ typedef struct {
     ds41_prefill_row batch, *rows_view;
     ds41_prefill_row carry;
     ds4_gpu_tensor *prefill_tokens;
+    /* DSpark capture target.  V4.1 executes here, but the draft pipeline lives
+     * on the generic graph, so the session hands this one the arena the
+     * target-layer hidden states must be written into.  NULL when the session
+     * has no DSpark arena.  The capture itself reuses the generic
+     * metal_graph_dspark_capture_hc(), so the slot bookkeeping that decides
+     * whether the capture is usable stays in one place. */
+    ds4_gpu_graph *dspark_arena;
 #define DS41_FIELD(name, count) ds4_gpu_tensor *name;
     DS41_SCRATCH(DS41_FIELD)
 #undef DS41_FIELD
@@ -42075,6 +42082,18 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
 #else
             ok = ds41_graph_layer(g, m, l, il, token);
 #endif
+        }
+        /* DSpark capture.  The draft proposes from the target's own post-FFN
+         * hidden state at its target layers, which is exactly what
+         * g->residual holds at this point -- ds41_graph_after_moe() has already
+         * combined the FFN output with the post-attention HC block.  Encoded
+         * here, inside the layer's open command buffer, so it rides the same
+         * submission as the layer that produced it. */
+        if (ok && g->dspark_arena) {
+            const int slot = metal_graph_dspark_target_slot(g->dspark_arena, il);
+            if (slot >= 0)
+                ok = metal_graph_dspark_capture_hc(g->dspark_arena, g->residual,
+                                                   (uint32_t)slot);
         }
         /* TP gates already submit ordered, bounded command buffers. Drain
          * before overwriting the first Engram table's shared input at layer
@@ -73804,6 +73823,9 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                 free(s);
                 return 1;
             }
+            /* Let the V4.1 layer loop write the captured hidden states into
+             * this arena as it runs. */
+            s->ds41_graph.dspark_arena = &s->graph;
             fprintf(stderr,
                     "ds4: DSpark draft arena: rows=%u ctx=%u raw=%u "
                     "capture=%s layers=",
@@ -78294,6 +78316,14 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
         }
         token_vec_push(&s->checkpoint, token);
         s->checkpoint_valid = true;
+        /* Mirror the generic decode path's tail exactly: record the checkpoint
+         * against the capture, then let the support model propose from it.  The
+         * capture itself was encoded during the layer loop above. */
+        ds4_session_dspark_capture_note_checkpoint(s);
+        ds4_session_prepare_support_draft(s, token,
+                                          (uint32_t)(s->checkpoint.len - 1),
+                                          probe_mtp,
+                                          getenv("DS4_MTP_PROBE") != NULL);
         return 0;
     }
 #endif
