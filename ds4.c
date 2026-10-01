@@ -82502,14 +82502,23 @@ int ds4_session_tp_spec_cycle(ds4_session *s, const int *drafts, int draft_n,
     }
     ds4_spec_frontier frontier;
     memset(&frontier, 0, sizeof(frontier));
+    /* Same split as the leader's accept path: V4.1 verifies on ds41_graph,
+     * everything else on the generic graph.  The worker keeps no capture (it
+     * runs no draft model), so only the state rewind matters here. */
+    const bool ds41_spec = ds4_session_is_ds41(s);
     const int start = s->checkpoint.len;
-    if (!spec_frontier_snapshot(&frontier, s)) {
+    if (!(ds41_spec ? ds41_spec_frontier_snapshot(&s->ds41_graph)
+                    : spec_frontier_snapshot(&frontier, s))) {
         snprintf(err, errlen, "tp: frontier snapshot failed");
         return 1;
     }
     for (int i = 0; i < draft_n; i++) token_vec_push(&s->checkpoint, drafts[i]);
     int row_tops[DS4_DSPARK_MAX_BLOCK_SIZE];
-    bool ok = metal_graph_verify_suffix_tops(&s->graph,
+    bool ok = ds41_spec
+        ? ds41_verify_suffix_tops(&s->ds41_graph, &e->model, &e->weights,
+                                  s->checkpoint.v + start, (uint32_t)draft_n,
+                                  draft_n > 1 ? row_tops : NULL)
+        : metal_graph_verify_suffix_tops(&s->graph,
                                              &e->model,
                                              &e->weights,
                                              &s->checkpoint,
@@ -82554,8 +82563,9 @@ int ds4_session_tp_spec_cycle(ds4_session *s, const int *drafts, int draft_n,
          * to preserve, so a plain prefix restore is the whole commit here
          * (with DS4_DSPARK_SEED_BATCH set, the capture commit would fail). */
         ds4_session_dspark_capture_invalidate(s);
-        bool prefix_ok = spec_frontier_commit_prefix(
-                s, (uint32_t)token_count);
+        bool prefix_ok = ds41_spec
+            ? ds41_spec_frontier_restore(&s->ds41_graph, (uint32_t)token_count)
+            : spec_frontier_commit_prefix(s, (uint32_t)token_count);
         if (!prefix_ok) {
             spec_frontier_free(&frontier);
             snprintf(err, errlen, "tp: verifier prefix restore failed");
@@ -82578,7 +82588,8 @@ int ds4_session_tp_spec_cycle(ds4_session *s, const int *drafts, int draft_n,
         return 1;
     }
     s->checkpoint.len = start;
-    if (!spec_frontier_restore(&frontier, s)) {
+    if (!(ds41_spec ? ds41_spec_frontier_restore(&s->ds41_graph, 0)
+                    : spec_frontier_restore(&frontier, s))) {
         spec_frontier_free(&frontier);
         snprintf(err, errlen, "tp: verify rollback failed");
         s->checkpoint_valid = false;
@@ -82599,12 +82610,15 @@ int ds4_session_tp_spec_cycle(ds4_session *s, const int *drafts, int draft_n,
         logits = scratch;
     }
     for (int i = 0; i < replay_n; i++) {
-        if (!metal_graph_eval_token_raw_swa(&s->graph,
+        if (!(ds41_spec
+                  ? ds41_graph_step(&s->ds41_graph, &e->model, &e->weights,
+                                    drafts[i], logits)
+                  : metal_graph_eval_token_raw_swa(&s->graph,
                                             &e->model,
                                             &e->weights,
                                             drafts[i],
                                             (uint32_t)s->checkpoint.len,
-                                            logits)) {
+                                            logits))) {
             free(scratch);
             snprintf(err, errlen, "tp: replay decode failed");
             s->checkpoint_valid = false;
