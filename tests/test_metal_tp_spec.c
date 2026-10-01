@@ -107,6 +107,14 @@ int main(int argc, char **argv) {
                .listen_port = (int)port, .transport = DS4_TP_TRANSPORT_RDMA,
                .rdma_device = argv[5], .rdma_gid_index = 1, .rdma_gid_index_set = true},
     };
+    /* DS41_SPEC_NO_DRAFT=1 runs both sessions as ordinary serial decode, with no
+     * draft and therefore no verify sweep.  The gap the check reports then
+     * measures the session path alone, which is the only way to tell a verifier
+     * leaking state past its rollback from a bug in long-context decode. */
+    if (getenv("DS41_SPEC_NO_DRAFT")) {
+        opt.dspark = false;
+        opt.mtp_path = NULL;
+    }
     if (topology) {
         opt.tp.topology_path = topology;
         opt.tp.rank = rank;
