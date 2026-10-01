@@ -35333,6 +35333,7 @@ static bool metal_graph_seed_dspark_stage_target_cache(
         uint32_t                  pos0,
         uint32_t                  n_tokens,
         bool                      commands_open) {
+    int seed_step = 0;
     if (!g || !dspark_model || !dw ||
         !dspark_stage_target_cache_seed_ready(g, dw, stage, n_tokens) ||
         n_tokens > g->dspark_cache_cap) {
@@ -35373,12 +35374,15 @@ static bool metal_graph_seed_dspark_stage_target_cache(
     const float ext_factor = 0.0f;
     const float attn_factor = 1.0f;
 
+    if (ok) seed_step = 1;
     if (ok && !commands_open) ok = ds4_gpu_begin_commands() != 0;
+    if (ok) seed_step = 2;
     if (ok && !direct_target_kv) ok = ds4_gpu_rms_norm_plain_rows_tensor(metal_graph_batch_flat_hc(g),
                                                       metal_graph_batch_cur_hc(g),
                                                       (uint32_t)hc_dim,
                                                       n_tokens,
                                                       DS4_RMS_EPS) != 0;
+    if (ok) seed_step = 3;
     if (ok && !direct_target_kv) ok = metal_graph_matmul_plain_tensor(hc_mix_view,
                                                  dspark_model,
                                                  block->hc_attn_fn,
@@ -35387,6 +35391,7 @@ static bool metal_graph_seed_dspark_stage_target_cache(
                                                  metal_graph_batch_flat_hc(g),
                                                  n_tokens);
     if (!direct_target_kv && fuse_hc_norm) {
+        if (ok) seed_step = 4;
         if (ok) ok = ds4_gpu_hc_split_weighted_sum_norm_tensor(attn_cur_view,
                                                                  metal_graph_batch_attn_norm(g),
                                                                  hc_split_view,
@@ -35403,6 +35408,7 @@ static bool metal_graph_seed_dspark_stage_target_cache(
                                                                  DS4_HC_EPS,
                                                                  DS4_RMS_EPS) != 0;
     } else if (!direct_target_kv) {
+        if (ok) seed_step = 5;
         if (ok) ok = ds4_gpu_hc_split_weighted_sum_tensor(attn_cur_view,
                                                             hc_split_view,
                                                             hc_mix_view,
@@ -35417,6 +35423,7 @@ static bool metal_graph_seed_dspark_stage_target_cache(
                                                             DS4_HC_EPS,
                                                             0,
                                                             DS4_N_EMBD) != 0;
+        if (ok) seed_step = 6;
         if (ok) ok = ds4_gpu_rms_norm_weight_rows_tensor(metal_graph_batch_attn_norm(g),
                                                           metal_graph_batch_attn_cur(g),
                                                           dspark_model->map,
@@ -35427,6 +35434,7 @@ static bool metal_graph_seed_dspark_stage_target_cache(
                                                           DS4_RMS_EPS) != 0;
     }
     /* DSpark target features already have stage-0 main_proj/main_norm. The reference applies wkv directly; support HC/attn_norm is for drafts. */
+    if (ok) seed_step = 7;
     if (ok) ok = metal_graph_matmul_plain_tensor(metal_graph_batch_kv_raw(g),
                                                  dspark_model,
                                                  block->attn_kv,
@@ -35436,6 +35444,7 @@ static bool metal_graph_seed_dspark_stage_target_cache(
                                                      metal_graph_batch_ffn_norm(g) :
                                                      metal_graph_batch_attn_norm(g),
                                                  n_tokens);
+    if (ok) seed_step = 8;
     if (ok) ok = ds4_gpu_rms_norm_weight_rows_tensor(metal_graph_batch_kv(g),
                                                       metal_graph_batch_kv_raw(g),
                                                       dspark_model->map,
@@ -35444,6 +35453,7 @@ static bool metal_graph_seed_dspark_stage_target_cache(
                                                       DS4_N_HEAD_DIM,
                                                       n_tokens,
                                                       DS4_RMS_EPS) != 0;
+    if (ok) seed_step = 9;
     if (ok) ok = ds4_gpu_rope_tail_tensor(metal_graph_batch_kv(g),
                                            n_tokens,
                                            1,
@@ -35458,22 +35468,33 @@ static bool metal_graph_seed_dspark_stage_target_cache(
                                            attn_factor,
                                            DS4_ROPE_YARN_BETA_FAST,
                                            DS4_ROPE_YARN_BETA_SLOW) != 0;
+    if (ok) seed_step = 10;
     if (ok) ok = ds4_gpu_dsv4_fp8_kv_quantize_tensor(metal_graph_batch_kv(g),
                                                        n_tokens,
                                                        DS4_N_HEAD_DIM,
                                                        DS4_N_ROT) != 0;
+    if (ok) seed_step = 11;
     if (ok) ok = ds4_gpu_store_raw_kv_batch_tensor(g->dspark_raw_cache[stage],
                                                     metal_graph_batch_kv(g),
                                                     g->dspark_cache_cap,
                                                     pos0,
                                                     n_tokens,
                                                     DS4_N_HEAD_DIM) != 0;
+    if (ok) seed_step = 12;
     if (ok && !commands_open) ok = ds4_gpu_end_commands() != 0;
 
     ds4_gpu_tensor_free(attn_cur_view);
     ds4_gpu_tensor_free(hc_split_view);
     ds4_gpu_tensor_free(hc_mix_view);
-    if (!ok && !commands_open) (void)ds4_gpu_synchronize();
+    if (!ok) {
+        static int seed_step_warned = 0;
+        if (!seed_step_warned) {
+            seed_step_warned = 1;
+            fprintf(stderr, "ds4: DSpark stage-cache seed failed at step %d\n",
+                    seed_step);
+        }
+        if (!commands_open) (void)ds4_gpu_synchronize();
+    }
     return ok;
 }
 
