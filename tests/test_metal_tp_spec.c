@@ -1,6 +1,9 @@
 /* Physical two-rank DSpark oracle; the peer runs the ordinary ./ds4 worker.
  * Check committed tokens against serial target logits, then append to the
  * live speculative cache and repeat across compression boundaries. */
+/* The DS4_TEST_HOOKS-gated declarations in ds4.h are what this oracle needs for
+ * the state digest; the test targets that use them define it themselves. */
+#define DS4_TEST_HOOKS
 #include "ds4.h"
 #include "ds4_tp.h"
 
@@ -53,6 +56,13 @@ static int check_prefix(ds4_engine *engine, int prefix) {
                 if (gap > worst_gap) worst_gap = gap;
                 if (ds4_session_eval(ref, accepted[i], err, sizeof(err))) goto done;
                 ds4_tokens_push(&prompt, accepted[i]);
+                /* Both sessions now sit at the same position, so their persistent
+                 * state is directly comparable.  The check above only says the
+                 * token streams disagree; this says which state span drifted. */
+                if (getenv("DS4_DSP41_STATE_DIGEST")) {
+                    (void)ds4_test_ds41_state_digest(spec, "spec");
+                    (void)ds4_test_ds41_state_digest(ref, "ref");
+                }
             }
             n += count;
             generated += count;

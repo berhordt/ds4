@@ -532,6 +532,10 @@ int ds4_test_argmax_excluding_logits(const float *logits, uint32_t n_vocab,
                                      int excluded_id);
 uint64_t ds4_test_mixed_native_count(void);
 uint64_t ds4_test_ds41_batch_count(void);
+/* Hash the V4.1 graph's persistent state into the file named by
+ * DS4_DSP41_STATE_DIGEST, tagged by session, for diffing a speculative session
+ * against its serial reference at equal positions.  Diagnostic only. */
+int ds4_test_ds41_state_digest(ds4_session *s, const char *tag);
 #endif
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k);
 int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out);

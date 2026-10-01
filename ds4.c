@@ -63624,6 +63624,60 @@ static uint32_t ds41_state_spans(ds41_gpu_graph *g, uint32_t pos,
     return n;
 }
 
+/* Diagnostic for the divergence hunt: hash every span ds41_state_spans() calls
+ * persistent, so one run can compare the speculative session against its own
+ * serial reference at the same position.  Nothing else in the tree does this --
+ * the oracle only reports that two token streams disagree, not which state
+ * field was allowed to drift.  Off unless DS4_DSP41_STATE_DIGEST=<path>.
+ *
+ * Reads are 1 MiB at a time; a full state at a 4K position is about 37 MiB, so
+ * this is cheap enough to call once per token. */
+static uint64_t ds41_bytes_hash(const void *p, size_t n) {
+    const uint8_t *b = p;
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < n; i++) { h ^= b[i]; h *= 1099511628211ull; }
+    return h;
+}
+
+static uint64_t ds41_tensor_hash(ds4_gpu_tensor *t, uint64_t bytes) {
+    static uint8_t *buf = NULL;
+    if (!buf) buf = malloc(1u << 20);
+    if (!buf || !t) return 0;
+    uint64_t h = 1469598103934665603ull;
+    for (uint64_t off = 0; off < bytes; ) {
+        const uint64_t n = bytes - off < (1u << 20) ? bytes - off : (1u << 20);
+        if (!ds4_gpu_tensor_read(t, off, buf, n)) return 0;
+        for (uint64_t i = 0; i < n; i++) { h ^= buf[i]; h *= 1099511628211ull; }
+        off += n;
+    }
+    return h;
+}
+
+int ds4_test_ds41_state_digest(ds4_session *s, const char *tag) {
+    const char *path = getenv("DS4_DSP41_STATE_DIGEST");
+    if (!s || !path || !s->ds41_graph_ready || !tag) return -1;
+    ds41_gpu_graph *g = &s->ds41_graph;
+    if (!g->valid || !ds4_gpu_synchronize()) return -1;
+    FILE *f = fopen(path, "a");
+    if (!f) return -1;
+    ds41_state_span spans[54];
+    const uint32_t n = ds41_state_spans(g, g->pos, spans);
+    fprintf(f, "STATE %s pos=%u nspans=%u hist=%016llx\n", tag, g->pos, n,
+            (unsigned long long)ds41_bytes_hash(&g->history, sizeof(g->history)));
+    for (uint32_t i = 0; i < n; i++)
+        fprintf(f, "SPAN %s pos=%u i=%u bytes=%llu h=%016llx\n", tag, g->pos, i,
+                (unsigned long long)spans[i].bytes,
+                (unsigned long long)ds41_tensor_hash(spans[i].tensor, spans[i].bytes));
+    /* The carries are inside the span list only while a compression pair is
+     * unfinished, but they are one row each and worth watching every token. */
+    for (uint32_t i = 0; i < 4; i++)
+        fprintf(f, "CARRY %s pos=%u i=%u kv=%016llx sc=%016llx\n", tag, g->pos, i,
+                (unsigned long long)ds41_tensor_hash(g->previous_kv[i], 512u * 4u),
+                (unsigned long long)ds41_tensor_hash(g->previous_score[i], 512u * 4u));
+    fclose(f);
+    return 0;
+}
+
 static uint64_t ds41_payload_body_bytes(ds41_gpu_graph *g, uint32_t pos) {
     ds41_state_span spans[54];
     const uint32_t n = ds41_state_spans(g, pos, spans);
