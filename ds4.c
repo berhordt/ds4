@@ -40842,6 +40842,16 @@ typedef struct {
     ds4_gpu_tensor *spec_logits;
     ds4_gpu_tensor *spec_row_tops;
     uint32_t spec_logit_rows;
+    /* DSpark verify capture: the target's post-FFN hidden state for every row of
+     * a verify block, so a partial commit can select the exact row it committed.
+     * Index j means position capture_start + j - 1, the same indexing the generic
+     * batch capture uses, which is why selecting row `committed` is correct.
+     * Row 0 is never needed: the first draft token is pre-checked against the
+     * target's own argmax before the verify, so at least one row always commits.
+     * Sized for the compile-time maximum of target layers to keep the graph
+     * allocation independent of when the arena is configured. */
+    ds4_gpu_tensor *dspark_row_hc;
+    uint32_t dspark_verify_rows;
     uint32_t spec_pos;
     uint32_t spec_rows;
     bool spec_valid;
@@ -40904,6 +40914,7 @@ static void ds41_graph_free(ds41_gpu_graph *g) {
     }
     ds4_gpu_tensor_free(g->spec_logits);
     ds4_gpu_tensor_free(g->spec_row_tops);
+    ds4_gpu_tensor_free(g->dspark_row_hc);
 #define DS41_FREE(name, count) ds4_gpu_tensor_free(g->name);
     DS41_SCRATCH(DS41_FREE)
 #undef DS41_FREE
@@ -40940,8 +40951,11 @@ static uint64_t ds41_graph_bytes(uint32_t ctx) {
     floats += (uint64_t)g->prefill_cap * 512u;
     if (g->carry_cap > g->prefill_cap)
         floats += (uint64_t)(g->carry_cap - g->prefill_cap) * 2u * DS4_ENGRAM_COLS;
-    /* Verify-block logits and their per-row greedy ids. */
+    /* Verify-block logits, their per-row greedy ids, and the per-row target
+     * hidden states a partial commit selects from. */
     floats += (uint64_t)(DS4_DSPARK_MAX_BLOCK_SIZE + 2u) * DS4_N_VOCAB;
+    floats += (uint64_t)(DS4_DSPARK_MAX_BLOCK_SIZE + 2u) *
+              DS4_DSPARK_MAX_TARGET_LAYERS * DS4_N_EMBD;
     /* Expert-major matrix kernels use one bounded packed activation buffer. */
     const uint64_t packed = g->prefill_cap >= 512 ?
         (g->prefill_cap > 4096u ? UINT64_C(512) : UINT64_C(256)) * 1024 * 1024 : 0;
@@ -41044,7 +41058,10 @@ static DS4_MAYBE_UNUSED bool ds41_graph_alloc(ds41_gpu_graph *g, const ds4_model
 #undef DS41_ALLOC
     g->spec_logits = ds4_gpu_tensor_alloc((uint64_t)spec_slots * DS4_N_VOCAB * sizeof(float));
     g->spec_row_tops = ds4_gpu_tensor_alloc((uint64_t)spec_slots * sizeof(int32_t));
-    if (!g->spec_logits || !g->spec_row_tops) goto fail;
+    g->dspark_row_hc =
+        ds4_gpu_tensor_alloc((uint64_t)spec_slots * DS4_DSPARK_MAX_TARGET_LAYERS *
+                             DS4_N_EMBD * sizeof(float));
+    if (!g->spec_logits || !g->spec_row_tops || !g->dspark_row_hc) goto fail;
 #define DS41_BATCH_ALLOC(name, count) \
     if (!(g->batch.name = (!strcmp(#name, "engram_rows") || !strcmp(#name, "selected_comp") ? \
             ds4_gpu_tensor_alloc_managed : ds4_gpu_tensor_alloc)( \
@@ -42549,6 +42566,10 @@ static uint32_t ds41_encoder_chunk_cap(const ds41_gpu_graph *g, uint32_t count) 
  * travel down the stack with their token, while only source layers append KV.
  * A failed partial chunk cannot be snapshotted: its layers have different
  * frontiers, so the caller must rebuild from its retained token history. */
+/* Defined with the verifier, below the sweep that calls it. */
+static DS4_MAYBE_UNUSED bool ds41_dspark_capture_row(
+        ds41_gpu_graph *g, const ds4_gpu_tensor *hc, uint32_t il, uint32_t row);
+
 static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                               const ds4_weights *w, const int *tokens, uint32_t total_count,
                               ds4_session_progress_fn progress, void *progress_ud,
@@ -42796,6 +42817,8 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                     ok = ds41_graph_after_attention(&row, m, l);
                     if (ok && !batch_moe) ok = ds41_moe(&row, m, l, il, (uint32_t)tokens[off + t]) &&
                         ds41_graph_after_moe(&row);
+                    if (ok && g->dspark_verify_rows)
+                        ok = ds41_dspark_capture_row(g, row.residual, il, 1u + off + t);
                 }
             }
             if (ok && batch_moe) {
@@ -42807,6 +42830,10 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                         ds4_gpu_hc_expand_split_tensor(active.residual, active.block, active.after_attn,
                             active.ffn_split, DS4_N_EMBD, DS4_N_HC, 0, DS4_N_EMBD) &&
                         ds4_gpu_dsv41_quantize(active.residual, DS4_N_EMBD * DS4_N_HC, count, DS4_V41_BF16);
+                    /* active.residual is row-aligned with rows_view, so the
+                     * draft capture can pick each row's state straight out. */
+                    for (uint32_t t = 0; ok && g->dspark_verify_rows && t < count; t++)
+                        ok = ds41_dspark_capture_row(g, g->rows_view[t].residual, il, 1u + off + t);
                 }
                 for (uint32_t t = 0; ok && !batch_hc && t < count; t++) {
 #define DS41_USE_MOE_ROW(name, width) row.name = g->rows_view[t].name;
@@ -42814,6 +42841,8 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
 #undef DS41_USE_MOE_ROW
                     ok = ds4_gpu_add_tensor(row.block, row.routed, row.shared, DS4_N_EMBD) &&
                         ds41_bf16(row.block, DS4_N_EMBD) && ds41_graph_after_moe(&row);
+                    if (ok && g->dspark_verify_rows)
+                        ok = ds41_dspark_capture_row(g, row.residual, il, 1u + off + t);
                 }
             }
             DS41_STAGE("hc expand");
@@ -42889,6 +42918,64 @@ static bool ds41_graph_prefill(ds41_gpu_graph *g, const ds4_model *m,
  * Leaves g->pos advanced by n_tokens and the per-row carries recorded;
  * the caller rewinds to the accepted prefix with ds41_spec_frontier_restore().
  * For n_tokens = 1 this is just a decode step and no row_tops are produced. */
+/* Capture one row's post-FFN hidden state for the draft.
+ *
+ * The ds41 twin of metal_graph_dspark_capture_verified_suffix_layer(): same
+ * quantity and same mean-over-HC reduction, but reading the state out of the
+ * ds41 graph, which is where V4.1's layers actually run.  Rows are stored
+ * individually rather than only the last one so that a partial commit can pick
+ * the row it committed -- the same reason the ds41 frontier keeps per-row
+ * carries.  Row 0 is never written or read. */
+static DS4_MAYBE_UNUSED bool ds41_dspark_capture_row(
+        ds41_gpu_graph *g, const ds4_gpu_tensor *hc, uint32_t il, uint32_t row) {
+    ds4_gpu_graph *a = g ? g->dspark_arena : NULL;
+    if (!a || !hc || !g->dspark_row_hc || row == 0 ||
+        row > g->dspark_verify_rows) return true;
+    const int slot = metal_graph_dspark_target_slot(a, il);
+    if (slot < 0) return true;
+    const uint64_t embd_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
+    ds4_gpu_tensor *dst = ds4_gpu_tensor_view(
+        g->dspark_row_hc,
+        (((uint64_t)row * DS4_DSPARK_MAX_TARGET_LAYERS) + (uint64_t)slot) *
+            (uint64_t)DS4_N_EMBD * sizeof(float),
+        embd_bytes);
+    if (!dst) return false;
+    const bool ok = ds4_gpu_hc_weighted_sum_tensor(dst, hc, a->dspark_hc_mean_weights,
+                                                   DS4_N_EMBD, DS4_N_HC) != 0;
+    ds4_gpu_tensor_free(dst);
+    return ok;
+}
+
+/* Install the captured state of the row that was committed, so the next draft
+ * proposes from the position the session actually sits at. */
+static DS4_MAYBE_UNUSED bool ds41_dspark_select_committed_row(
+        ds41_gpu_graph *g, uint32_t committed) {
+    ds4_gpu_graph *a = g ? g->dspark_arena : NULL;
+    if (!a || !g->dspark_row_hc || committed == 0 ||
+        committed > g->dspark_verify_rows) return true;
+    const uint64_t embd_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
+    bool ok = ds4_gpu_begin_commands() != 0;
+    for (uint32_t slot = 0; ok && slot < a->dspark_target_layer_count; slot++) {
+        ds4_gpu_tensor *src = ds4_gpu_tensor_view(
+            g->dspark_row_hc,
+            (((uint64_t)committed * DS4_DSPARK_MAX_TARGET_LAYERS) + slot) *
+                (uint64_t)DS4_N_EMBD * sizeof(float),
+            embd_bytes);
+        ds4_gpu_tensor *dst = ds4_gpu_tensor_view(a->dspark_target_hidden,
+                                                 (uint64_t)slot * embd_bytes,
+                                                 embd_bytes);
+        ok = src && dst &&
+             ds4_gpu_tensor_copy(dst, 0, src, 0, embd_bytes) != 0;
+        ds4_gpu_tensor_free(src);
+        ds4_gpu_tensor_free(dst);
+        if (ok) metal_graph_dspark_capture_note_slot(a, slot);
+    }
+    if (ok) ok = ds4_gpu_end_commands() != 0;
+    else (void)ds4_gpu_synchronize();
+    if (!ok) metal_graph_dspark_capture_invalidate(a);
+    return ok;
+}
+
 static DS4_MAYBE_UNUSED bool ds41_verify_suffix_tops(
         ds41_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
         const int *tokens, uint32_t n_tokens, int *row_tops) {
@@ -42898,10 +42985,13 @@ static DS4_MAYBE_UNUSED bool ds41_verify_suffix_tops(
     if (n_tokens > g->prefill_cap || n_tokens > g->ctx - g->pos) return false;
     if (n_tokens > 1 && !row_tops) return false;
     if (!ds41_spec_frontier_snapshot(g)) return false;
-    if (!ds41_graph_prefill_sweep(g, m, w, tokens, n_tokens, NULL, NULL, 0,
-                                  NULL, NULL, false, false)) {
-        return false;
-    }
+    /* Ask the sweep to capture each row's target-layer hidden state as it goes;
+     * the accept path selects the committed row out of it afterwards. */
+    g->dspark_verify_rows = n_tokens;
+    const bool sweep_ok = ds41_graph_prefill_sweep(g, m, w, tokens, n_tokens, NULL, NULL, 0,
+                                                   NULL, NULL, false, false);
+    g->dspark_verify_rows = 0;
+    if (!sweep_ok) return false;
     /* rows_view[i].norm still holds row i's FFN norm.  Rebuild the output
      * head's norm from the row's HC residual and pre-mix, then project every
      * row in one batched matmul -- the same shape as the session-batch tail. */
@@ -73991,6 +74081,27 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             /* Let the V4.1 layer loop write the captured hidden states into
              * this arena as it runs. */
             s->ds41_graph.dspark_arena = &s->graph;
+            /* Session-side verifier state.  The generic path allocates these at
+             * the end of session create, which the ds41 branch returns before;
+             * without them the accept path's row_logits gate is false and the
+             * verifier is never reached.  Mirrors need_spec_verifier plus the
+             * markov/confidence feature buffers. */
+            s->spec_row_logits =
+                xmalloc((size_t)DS4_N_VOCAB * sizeof(s->spec_row_logits[0]));
+            s->dspark_markov_bias =
+                xmalloc((size_t)DS4_N_VOCAB * sizeof(s->dspark_markov_bias[0]));
+            const uint64_t dspark_features =
+                (uint64_t)DS4_N_EMBD + (uint64_t)e->dspark_weights.markov_rank;
+            if (dspark_features > (uint64_t)SIZE_MAX / sizeof(float)) {
+                fprintf(stderr, "ds4: DSpark feature count overflow\n");
+                metal_graph_free(&s->graph);
+                ds41_graph_free(&s->ds41_graph);
+                free(s);
+                return 1;
+            }
+            s->dspark_conf_features =
+                xmalloc((size_t)dspark_features * sizeof(s->dspark_conf_features[0]));
+            s->dspark_conf_features_cap = (size_t)dspark_features;
             fprintf(stderr,
                     "ds4: DSpark draft arena: rows=%u ctx=%u raw=%u "
                     "capture=%s layers=",
@@ -81656,6 +81767,12 @@ static int ds4_session_eval_dspark_speculative_argmax(
         }
         memcpy(s->logits, row_logits,
                (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+        /* Install the committed row's captured target state so the next draft
+         * proposes from where the session now sits. */
+        if (ds41_spec) {
+            (void)ds41_dspark_select_committed_row(&s->ds41_graph,
+                                                   (uint32_t)commit_drafts);
+        }
         int emitted_drafts = 0;
         for (int i = 0; i < draft_n && n_accept < accepted_cap; i++) {
             accepted[n_accept++] = drafts[i];
@@ -81710,6 +81827,10 @@ static int ds4_session_eval_dspark_speculative_argmax(
             prefix_ok = ds41_spec
                 ? ds41_spec_frontier_restore(&s->ds41_graph, (uint32_t)commit_drafts)
                 : spec_frontier_commit_prefix(s, (uint32_t)commit_drafts);
+        }
+        if (prefix_ok && ds41_spec) {
+            (void)ds41_dspark_select_committed_row(&s->ds41_graph,
+                                                   (uint32_t)commit_drafts);
         }
         if (prefix_ok && preserve_seed_capture) {
             prefix_ok = metal_graph_dspark_capture_commit_prefix(
