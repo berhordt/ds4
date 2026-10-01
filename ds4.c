@@ -40835,6 +40835,13 @@ typedef struct {
      * there are rows+1 slots. */
     ds4_gpu_tensor *spec_previous_kv[4], *spec_previous_score[4];
     ds4_engram_history spec_row_history[DS4_DSPARK_MAX_BLOCK_SIZE + 2u];
+    /* Verify-block output: one vocab row of target logits per row of the draft
+     * block, plus the per-row greedy token the accept test compares against.
+     * The greedy ids are computed on the GPU the same way the generic verifier
+     * does it, so only a handful of ints crosses back per block. */
+    ds4_gpu_tensor *spec_logits;
+    ds4_gpu_tensor *spec_row_tops;
+    uint32_t spec_logit_rows;
     uint32_t spec_pos;
     uint32_t spec_rows;
     bool spec_valid;
@@ -40892,7 +40899,11 @@ static void ds41_graph_free(ds41_gpu_graph *g) {
         ds4_gpu_tensor_free(g->index_cache[i]);
         ds4_gpu_tensor_free(g->previous_kv[i]);
         ds4_gpu_tensor_free(g->previous_score[i]);
+        ds4_gpu_tensor_free(g->spec_previous_kv[i]);
+        ds4_gpu_tensor_free(g->spec_previous_score[i]);
     }
+    ds4_gpu_tensor_free(g->spec_logits);
+    ds4_gpu_tensor_free(g->spec_row_tops);
 #define DS41_FREE(name, count) ds4_gpu_tensor_free(g->name);
     DS41_SCRATCH(DS41_FREE)
 #undef DS41_FREE
@@ -40929,6 +40940,8 @@ static uint64_t ds41_graph_bytes(uint32_t ctx) {
     floats += (uint64_t)g->prefill_cap * 512u;
     if (g->carry_cap > g->prefill_cap)
         floats += (uint64_t)(g->carry_cap - g->prefill_cap) * 2u * DS4_ENGRAM_COLS;
+    /* Verify-block logits and their per-row greedy ids. */
+    floats += (uint64_t)(DS4_DSPARK_MAX_BLOCK_SIZE + 2u) * DS4_N_VOCAB;
     /* Expert-major matrix kernels use one bounded packed activation buffer. */
     const uint64_t packed = g->prefill_cap >= 512 ?
         (g->prefill_cap > 4096u ? UINT64_C(512) : UINT64_C(256)) * 1024 * 1024 : 0;
@@ -41019,8 +41032,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_alloc(ds41_gpu_graph *g, const ds4_model
         g->spec_previous_kv[i] =
             ds4_gpu_tensor_alloc((uint64_t)spec_slots * 512u * sizeof(float));
         g->spec_previous_score[i] =
-            ds4_gpu_tensor_alloc((uint64_t)spec_slots * 512u * sizeof(float));
-        if (!g->compressed[i] || !g->index_cache[i] || !g->previous_kv[i] ||
+            ds4_gpu_tensor_alloc((uint64_t)spec_slots * 512u * sizeof(float));        if (!g->compressed[i] || !g->index_cache[i] || !g->previous_kv[i] ||
             !g->previous_score[i] || !g->spec_previous_kv[i] ||
             !g->spec_previous_score[i]) goto fail;
     }
@@ -41030,6 +41042,9 @@ static DS4_MAYBE_UNUSED bool ds41_graph_alloc(ds41_gpu_graph *g, const ds4_model
                 (uint64_t)((count) != 0 ? (count) : 1u) * sizeof(float)))) goto fail;
     DS41_SCRATCH(DS41_ALLOC)
 #undef DS41_ALLOC
+    g->spec_logits = ds4_gpu_tensor_alloc((uint64_t)spec_slots * DS4_N_VOCAB * sizeof(float));
+    g->spec_row_tops = ds4_gpu_tensor_alloc((uint64_t)spec_slots * sizeof(int32_t));
+    if (!g->spec_logits || !g->spec_row_tops) goto fail;
 #define DS41_BATCH_ALLOC(name, count) \
     if (!(g->batch.name = (!strcmp(#name, "engram_rows") || !strcmp(#name, "selected_comp") ? \
             ds4_gpu_tensor_alloc_managed : ds4_gpu_tensor_alloc)( \
@@ -42860,6 +42875,75 @@ static bool ds41_graph_prefill(ds41_gpu_graph *g, const ds4_model *m,
                               int total, ds4_session_cancel_fn cancel, void *cancel_ud) {
     return ds41_graph_prefill_sweep(g, m, w, tokens, count, progress, progress_ud,
                                    total, cancel, cancel_ud, false, false);
+}
+
+/* Score a draft block through the target's own V4.1 forward.
+ *
+ * This is the verifier's whole job: append the block's rows, produce the
+ * target's greedy token at each row, and let the caller decide how much of the
+ * block to keep.  It runs the ordinary prefill sweep instead of a bespoke
+ * N-row path, so the block sees exactly the layer semantics, Engram lookups and
+ * TP gate sequence that normal prefill uses -- which is precisely what the
+ * generic verifier cannot do, its batch encoder having no V4.1 layers at all.
+ *
+ * Leaves g->pos advanced by n_tokens and the per-row carries recorded;
+ * the caller rewinds to the accepted prefix with ds41_spec_frontier_restore().
+ * For n_tokens = 1 this is just a decode step and no row_tops are produced. */
+static DS4_MAYBE_UNUSED bool ds41_verify_suffix_tops(
+        ds41_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
+        const int *tokens, uint32_t n_tokens, int *row_tops) {
+    if (!g || !g->valid || !m || !w || !tokens || n_tokens == 0 ||
+        n_tokens > DS4_DSPARK_MAX_BLOCK_SIZE + 1u || !g->spec_logits ||
+        !g->spec_row_tops) return false;
+    if (n_tokens > g->prefill_cap || n_tokens > g->ctx - g->pos) return false;
+    if (n_tokens > 1 && !row_tops) return false;
+    if (!ds41_spec_frontier_snapshot(g)) return false;
+    if (!ds41_graph_prefill_sweep(g, m, w, tokens, n_tokens, NULL, NULL, 0,
+                                  NULL, NULL, false, false)) {
+        return false;
+    }
+    /* rows_view[i].norm still holds row i's FFN norm.  Rebuild the output
+     * head's norm from the row's HC residual and pre-mix, then project every
+     * row in one batched matmul -- the same shape as the session-batch tail. */
+    bool ok = ds4_gpu_begin_commands() != 0;
+    for (uint32_t i = 0; ok && i < n_tokens; i++) {
+        ds41_prefill_row *r = &g->rows_view[i];
+        ok = ds4_gpu_hc_weighted_sum_tensor(r->x, r->residual, r->ffn_split,
+                                            DS4_N_EMBD, DS4_N_HC) != 0 &&
+             ds41_bf16(r->x, DS4_N_EMBD) &&
+             ds41_norm(r->norm, r->x, m, w->output_norm);
+    }
+    if (ok) ok = ds41_output_projection(g, g->spec_logits, m, w,
+                                        g->rows_view[0].norm, n_tokens);
+    /* Row i's greedy token is the target's own next token after row i, which is
+     * what the draft proposes for row i+1.  Only rows 0..n-2 are needed. */
+    if (ok && n_tokens == 2u) {
+        /* Mirror the generic verifier's single-row special case. */
+        ok = ds4_gpu_argmax_tensor(g->spec_row_tops, g->spec_logits,
+                                   DS4_N_VOCAB) != 0;
+    } else if (ok && n_tokens > 2u) {
+        ok = ds4_gpu_indexer_topk_tensor(g->spec_row_tops, g->spec_logits,
+                                         DS4_N_VOCAB, n_tokens - 1u, 1) != 0;
+    }
+    if (ok) ok = ds4_gpu_end_commands() != 0;
+    else (void)ds4_gpu_synchronize();
+    if (!ok) return false;
+    g->spec_logit_rows = n_tokens;
+    if (n_tokens > 1) {
+        ok = ds4_gpu_tensor_read(g->spec_row_tops, 0, row_tops,
+                                 (uint64_t)(n_tokens - 1u) * sizeof(int32_t)) != 0;
+    }
+    return ok;
+}
+
+/* Copy one row of the block's target logits out to the caller, mirroring
+ * metal_graph_read_spec_logits_row() on the generic side. */
+static DS4_MAYBE_UNUSED bool ds41_verify_read_row_logits(
+        ds41_gpu_graph *g, uint32_t row, float *out) {
+    if (!g || !out || !g->spec_logits || row >= g->spec_logit_rows) return false;
+    return ds4_gpu_tensor_read(g->spec_logits,
+                               (uint64_t)row * DS4_N_VOCAB * sizeof(float),
+                               out, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
 }
 static ds41_gpu_graph *ds41_batch_workspace(ds41_gpu_graph *const *graphs, int count) {
     if (!graphs || count < 2 || count > DS4_TP_BATCH_MAX_ROWS) return NULL;
