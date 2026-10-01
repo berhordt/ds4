@@ -35954,6 +35954,48 @@ static bool metal_graph_eval_dspark_stage_block(
     return ok;
 }
 
+/* Seed the draft's attention cache from the target features at this position.
+ *
+ * The draft attends over the *target's* context projected through its own
+ * attn_kv weights at the original positions.  Nothing else fills
+ * dspark_raw_cache except the draft's own steps, and the generic pipeline's only
+ * feeder is metal_graph_seed_dspark_initial_cache_from_prefill(), which needs a
+ * captured prefill batch that a ds41 session never produces.  So the cache
+ * stayed empty (cache_len = 0) and the draft attended over no keys at all.
+ *
+ * Seeding one row per step builds it incrementally instead, which is also what a
+ * long context needs: a prefill seed could only ever cover the last chunk,
+ * whereas this keeps pace with the position.
+ *
+ * dspark_target_hc is main_x repeated across the HC copies -- exactly the
+ * batch_cur_hc block seed_dspark_stage_target_cache() expects -- and a
+ * single-row seed fits the current arena, so no resize is involved.
+ */
+static bool metal_graph_seed_dspark_target_cache_step(
+        ds4_gpu_graph            *g,
+        const ds4_model          *dspark_model,
+        const ds4_dspark_weights *dw,
+        uint32_t                  pos) {
+    if (!g || !dspark_model || !dw || !g->dspark_target_hc ||
+        dw->n_stages == 0) {
+        return true;
+    }
+    const uint64_t hc_bytes = (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float);
+    ds4_gpu_tensor *cur_hc = metal_graph_batch_cur_hc(g);
+    if (!cur_hc ||
+        ds4_gpu_tensor_bytes(g->dspark_target_hc) < hc_bytes ||
+        ds4_gpu_tensor_bytes(cur_hc) < hc_bytes) {
+        return true;
+    }
+    bool ok = ds4_gpu_tensor_copy(cur_hc, 0, g->dspark_target_hc, 0,
+                                  hc_bytes) != 0;
+    for (uint32_t stage = 0; ok && stage < dw->n_stages; stage++) {
+        ok = metal_graph_seed_dspark_stage_target_cache(g, dspark_model, dw,
+                                                       stage, pos, 1, false);
+    }
+    return ok;
+}
+
 static bool metal_graph_eval_dspark_final_hidden(
         ds4_gpu_graph            *g,
         const ds4_model          *dspark_model,
@@ -78084,6 +78126,14 @@ static bool ds4_session_prepare_dspark_draft_impl(ds4_session *s,
                                                           token,
                                                           pos);
             }
+        }
+        /* Give the draft this position's slice of the target's context before
+         * the chain runs, so its attention has something to attend over. */
+        if (stage_input_ok) {
+            ok = metal_graph_seed_dspark_target_cache_step(&s->graph,
+                                                           &s->engine->mtp_model,
+                                                           dw,
+                                                           feature_pos);
         }
         DS4_DSPARK_PROP_ADD(propose_setup_ms, setup_t0);
         const bool draft_cache_ready =
