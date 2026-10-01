@@ -43127,13 +43127,22 @@ static DS4_MAYBE_UNUSED bool ds41_verify_suffix_tops(
                                                    NULL, NULL, false, false);
     g->dspark_verify_rows = 0;
     if (!sweep_ok) return false;
-    /* rows_view[i].norm still holds row i's FFN norm.  Rebuild the output
-     * head's norm from the row's HC residual and pre-mix, then project every
-     * row in one batched matmul -- the same shape as the session-batch tail. */
+    /* rows_view[i].norm still holds row i's FFN norm, but the output head needs
+     * the head norm.  Rebuild it per row from that row's HC residual, then
+     * project every row in one batched matmul, the same shape as the
+     * session-batch tail. */
     bool ok = ds4_gpu_begin_commands() != 0;
+    /* Rebuild each row's output-head input exactly as the ordinary decode head
+     * does in ds41_graph_logits(): collapse the HC residual with the row's `pre`
+     * weights, narrow to bf16, then the output norm.  `pre` is the plain-sum
+     * operand; `ffn_split` belongs to ds4_gpu_hc_weighted_sum_split_tensor(),
+     * which is the intermediate per-layer collapse, not the head.  Passing the
+     * wrong one of those two silent, same-sized buffers is what produced logits
+     * that matched the draft often enough to look plausible while occasionally
+     * committing a token the target would never emit. */
     for (uint32_t i = 0; ok && i < n_tokens; i++) {
         ds41_prefill_row *r = &g->rows_view[i];
-        ok = ds4_gpu_hc_weighted_sum_tensor(r->x, r->residual, r->ffn_split,
+        ok = ds4_gpu_hc_weighted_sum_tensor(r->x, r->residual, r->pre,
                                             DS4_N_EMBD, DS4_N_HC) != 0 &&
              ds41_bf16(r->x, DS4_N_EMBD) &&
              ds41_norm(r->norm, r->x, m, w->output_norm);
