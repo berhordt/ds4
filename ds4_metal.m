@@ -19397,7 +19397,14 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
         if (!xbuf || !outbuf ||
             ds4_gpu_tensor_bytes(x) < x_bytes ||
             ds4_gpu_tensor_bytes(out) < out_bytes) {
-            fprintf(stderr, "ds4: Metal Q8_0 tensor matmul received undersized activation buffers\n");
+            fprintf(stderr, "ds4: Metal Q8_0 tensor matmul received undersized activation buffers "
+                    "(in_dim=%llu out_dim=%llu n_tok=%llu x=%llu/%llu out=%llu/%llu)\n",
+                    (unsigned long long)in_dim, (unsigned long long)out_dim,
+                    (unsigned long long)n_tok,
+                    (unsigned long long)ds4_gpu_tensor_bytes(x),
+                    (unsigned long long)x_bytes,
+                    (unsigned long long)ds4_gpu_tensor_bytes(out),
+                    (unsigned long long)out_bytes);
             return 0;
         }
 
