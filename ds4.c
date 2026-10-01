@@ -81545,12 +81545,18 @@ static int ds4_session_eval_dspark_speculative_argmax(
     ds4_engine *e = s->engine;
     ds4_spec_frontier frontier;
     memset(&frontier, 0, sizeof(frontier));
+    /* V4.1 executes on ds41_graph, the only graph that implements its layers, so
+     * the whole verify/rewind sequence has to go through it.  Every site below
+     * that touches verifier state is branched; the accept scan, stats, scheduler
+     * notes and eos handling stay shared. */
+    const bool ds41_spec = ds4_session_is_ds41(s);
     int row_tops_buf[DS4_DSPARK_MAX_BLOCK_SIZE];
     int *row_tops = draft_n > 1 ? row_tops_buf : NULL;
     float *row_logits = s->spec_row_logits;
     const int start = s->checkpoint.len;
     const double snapshot_t0 = stats_enabled ? now_sec() : 0.0;
-    bool have_frontier = spec_frontier_snapshot(&frontier, s);
+    bool have_frontier = ds41_spec ? ds41_spec_frontier_snapshot(&s->ds41_graph)
+                                   : spec_frontier_snapshot(&frontier, s);
     if (stats_enabled) {
         s->dspark_stats.snapshot_ms += (now_sec() - snapshot_t0) * 1000.0;
     }
@@ -81573,8 +81579,13 @@ static int ds4_session_eval_dspark_speculative_argmax(
         for (int i = 0; i < draft_n; i++) token_vec_push(&s->checkpoint, drafts[i]);
         verifier_may_have_mutated = true;
         ds4_verify_suffix_timing verify_timing;
+        memset(&verify_timing, 0, sizeof(verify_timing));
         const double verify_t0 = stats_enabled ? now_sec() : 0.0;
-        ok = metal_graph_verify_suffix_tops(&s->graph,
+        ok = ds41_spec
+            ? ds41_verify_suffix_tops(&s->ds41_graph, &e->model, &e->weights,
+                                      s->checkpoint.v + start, (uint32_t)draft_n,
+                                      row_tops)
+            : metal_graph_verify_suffix_tops(&s->graph,
                                             &e->model,
                                             &e->weights,
                                             &s->checkpoint,
@@ -81624,8 +81635,9 @@ static int ds4_session_eval_dspark_speculative_argmax(
     bool final_logits_ok = false;
     if (ok && commit_drafts == draft_n) {
         const double read_t0 = stats_enabled ? now_sec() : 0.0;
-        final_logits_ok = metal_graph_read_spec_logits_row(
-                &s->graph, (uint32_t)(draft_n - 1), row_logits);
+        final_logits_ok = ds41_spec
+            ? ds41_verify_read_row_logits(&s->ds41_graph, (uint32_t)(draft_n - 1), row_logits)
+            : metal_graph_read_spec_logits_row(&s->graph, (uint32_t)(draft_n - 1), row_logits);
         if (stats_enabled) {
             s->dspark_stats.verify_read_ms +=
                 (now_sec() - read_t0) * 1000.0;
@@ -81681,8 +81693,9 @@ static int ds4_session_eval_dspark_speculative_argmax(
         commit_drafts > 0 && commit_drafts < draft_n &&
         commit_drafts <= (int)DS4_SPEC_PREFIX_SLOTS) {
         const double read_t0 = stats_enabled ? now_sec() : 0.0;
-        bool prefix_ok = metal_graph_read_spec_logits_row(
-                &s->graph, (uint32_t)(commit_drafts - 1), row_logits);
+        bool prefix_ok = ds41_spec
+            ? ds41_verify_read_row_logits(&s->ds41_graph, (uint32_t)(commit_drafts - 1), row_logits)
+            : metal_graph_read_spec_logits_row(&s->graph, (uint32_t)(commit_drafts - 1), row_logits);
         if (stats_enabled) {
             s->dspark_stats.verify_read_ms +=
                 (now_sec() - read_t0) * 1000.0;
@@ -81694,8 +81707,9 @@ static int ds4_session_eval_dspark_speculative_argmax(
             ds4_session_dspark_capture_invalidate(s);
         }
         if (prefix_ok) {
-            prefix_ok = spec_frontier_commit_prefix(
-                    s, (uint32_t)commit_drafts);
+            prefix_ok = ds41_spec
+                ? ds41_spec_frontier_restore(&s->ds41_graph, (uint32_t)commit_drafts)
+                : spec_frontier_commit_prefix(s, (uint32_t)commit_drafts);
         }
         if (prefix_ok && preserve_seed_capture) {
             prefix_ok = metal_graph_dspark_capture_commit_prefix(
@@ -81756,7 +81770,7 @@ static int ds4_session_eval_dspark_speculative_argmax(
     /* Larger support blocks can outgrow the retained prefixes. If just one
      * accepted token lacks a capture, replay it after the last saved prefix
      * instead of replaying the whole accepted block. */
-    if (ok && !tp_verify_sent &&
+    if (ok && !tp_verify_sent && !ds41_spec &&
         commit_drafts == (int)DS4_SPEC_PREFIX_SLOTS + 1 &&
         commit_drafts < draft_n) {
         const double replay_t0 = stats_enabled ? now_sec() : 0.0;
@@ -81818,7 +81832,9 @@ static int ds4_session_eval_dspark_speculative_argmax(
     if (verifier_may_have_mutated) {
         s->checkpoint.len = start;
         ds4_session_dspark_capture_invalidate(s);
-        if (!have_frontier || !spec_frontier_restore(&frontier, s)) {
+        if (!have_frontier ||
+            !(ds41_spec ? ds41_spec_frontier_restore(&s->ds41_graph, 0)
+                        : spec_frontier_restore(&frontier, s))) {
             if (tp_verify_sent)
                 (void)ds4_tp_send_verify_commit(
                         e->tp.ctx, DS4_TP_VERIFY_ROLLBACK_REPLAY, 0);
@@ -81884,7 +81900,10 @@ static int ds4_session_eval_dspark_speculative_argmax(
         s->dspark_stats.replay_fallbacks++;
     }
     for (int i = 0; i < replay_budget; i++) {
-        ok = metal_graph_eval_token_raw_swa(&s->graph,
+        ok = ds41_spec
+            ? ds41_graph_step(&s->ds41_graph, &e->model, &e->weights,
+                              drafts[i], row_logits)
+            : metal_graph_eval_token_raw_swa(&s->graph,
                                             &e->model,
                                             &e->weights,
                                             drafts[i],
