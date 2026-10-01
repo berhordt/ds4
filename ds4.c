@@ -42109,12 +42109,24 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
 static DS4_MAYBE_UNUSED bool ds41_spec_frontier_note_row(ds41_gpu_graph *g);
 
 static DS4_MAYBE_UNUSED bool ds41_spec_frontier_snapshot(ds41_gpu_graph *g) {
-    if (!g || !g->valid || g->spec_rows != 0) return false;
-    g->spec_pos = g->pos;
+    if (!g || !g->valid) return false;
+    /* A previous cycle may have left a snapshot behind (a full accept needs no
+     * rewind, so nothing consumed it).  Drop it rather than refuse: wedging on a
+     * stale snapshot would silently disable the verifier for the whole run. */
+    g->spec_rows = 0;
     g->spec_valid = false;
-    bool ok = ds41_spec_frontier_note_row(g);
+    g->spec_pos = g->pos;
+    const bool ok = ds41_spec_frontier_note_row(g);
     g->spec_valid = ok;
     return ok;
+}
+
+/* Drop a snapshot with no rewind: correct after a full accept, where the state
+ * already sits past the whole block. */
+static DS4_MAYBE_UNUSED void ds41_spec_frontier_clear(ds41_gpu_graph *g) {
+    if (!g) return;
+    g->spec_rows = 0;
+    g->spec_valid = false;
 }
 
 /* Capture the carry state entering the next verify row. */
@@ -42138,6 +42150,14 @@ static DS4_MAYBE_UNUSED bool ds41_spec_frontier_note_row(ds41_gpu_graph *g) {
 
 static DS4_MAYBE_UNUSED bool ds41_spec_frontier_restore(ds41_gpu_graph *g, uint32_t accepted) {
     if (!g || !g->spec_valid || accepted > g->spec_rows) return false;
+    /* Only the pre-block slot and the end-of-block state are captured today:
+     * slot 0 comes from the snapshot and the state past the last row needs no
+     * rewind at all.  Intermediate prefixes would need the ratio-2 pooling
+     * carry and the n-gram tail captured per verify row, which means hooking
+     * inside the sweep's row loop.  Refuse them rather than rewind to the wrong
+     * state -- the caller then falls back to rollback-and-replay, which is
+     * correct, just slower. */
+    if (accepted != 0 && accepted != g->spec_rows - 1u) return false;
     const uint64_t off = (uint64_t)accepted * 512u * sizeof(float);
     bool ok = ds4_gpu_begin_commands() != 0;
     for (uint32_t i = 0; ok && i < 4; i++) {
@@ -81772,6 +81792,9 @@ static int ds4_session_eval_dspark_speculative_argmax(
         if (ds41_spec) {
             (void)ds41_dspark_select_committed_row(&s->ds41_graph,
                                                    (uint32_t)commit_drafts);
+            /* Full accept: the state already sits past the whole block, so the
+             * snapshot is consumed without a rewind. */
+            ds41_spec_frontier_clear(&s->ds41_graph);
         }
         int emitted_drafts = 0;
         for (int i = 0; i < draft_n && n_accept < accepted_cap; i++) {
