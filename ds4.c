@@ -35987,6 +35987,27 @@ static bool metal_graph_seed_dspark_target_cache_step(
         ds4_gpu_tensor_bytes(cur_hc) < hc_bytes) {
         return true;
     }
+    static int seed_probe = 0;
+    if (seed_probe == 0) {
+        seed_probe = 1;
+        fprintf(stderr,
+                "ds4: DSpark seed probe: ready(stage0)=%d target_hc=%llu cur_hc=%llu "
+                "flat_hc=%llu hc_mix=%llu hc_split=%llu attn_cur=%llu attn_norm=%llu "
+                "kv_raw=%llu kv=%llu cache_cap=%u raw_cache0=%llu prefill_cap=%u\n",
+                (int)dspark_stage_target_cache_seed_ready(g, dw, 0, 1),
+                (unsigned long long)ds4_gpu_tensor_bytes(g->dspark_target_hc),
+                (unsigned long long)ds4_gpu_tensor_bytes(cur_hc),
+                (unsigned long long)ds4_gpu_tensor_bytes(metal_graph_batch_flat_hc(g)),
+                (unsigned long long)ds4_gpu_tensor_bytes(metal_graph_batch_hc_mix(g)),
+                (unsigned long long)ds4_gpu_tensor_bytes(metal_graph_batch_hc_split(g)),
+                (unsigned long long)ds4_gpu_tensor_bytes(metal_graph_batch_attn_cur(g)),
+                (unsigned long long)ds4_gpu_tensor_bytes(metal_graph_batch_attn_norm(g)),
+                (unsigned long long)ds4_gpu_tensor_bytes(metal_graph_batch_kv_raw(g)),
+                (unsigned long long)ds4_gpu_tensor_bytes(metal_graph_batch_kv(g)),
+                g->dspark_cache_cap,
+                (unsigned long long)ds4_gpu_tensor_bytes(g->dspark_raw_cache[0]),
+                g->prefill_cap);
+    }
     bool ok = ds4_gpu_tensor_copy(cur_hc, 0, g->dspark_target_hc, 0,
                                   hc_bytes) != 0;
     for (uint32_t stage = 0; ok && stage < dw->n_stages; stage++) {
