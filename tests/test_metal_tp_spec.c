@@ -17,7 +17,7 @@ static int check_prefix(ds4_engine *engine, int prefix) {
     ds4_tokens prompt = {0}, text = {0}, filler = {0};
     char err[256] = "";
     float worst_gap = 0;
-    int max_chunk = 0, generated = 0, ok = 0;
+    int max_chunk = 0, generated = 0, ok = 0, gap_logged = 0;
     ds4_encode_chat_prompt(engine, NULL,
         "Write a complete C hash table implementation with string keys, insert, "
         "find, delete, and a test main. Output only C code.", DS4_THINK_NONE, &text);
@@ -52,6 +52,15 @@ static int check_prefix(ds4_engine *engine, int prefix) {
                 if (!isfinite(gap) || gap > 2.0f) {
                     fprintf(stderr, "FAIL prefix=%d phase=%d token=%d gap=%g\n", prefix, phase, n+i, gap);
                     goto done;
+                }
+                /* Rounding between the batched verify and serial decode shows up
+                 * as gaps well under 0.2; a real deviation is much larger.  The
+                 * first index past this threshold is the first token the two
+                 * paths disagreed on, which is the position worth instrumenting. */
+                if (gap > 0.5f && gap_logged < 40) {
+                    gap_logged++;
+                    fprintf(stderr, "GAP prefix=%d phase=%d token=%d gap=%g accepted=%d\n",
+                            prefix, phase, n + i, gap, accepted[i]);
                 }
                 if (gap > worst_gap) worst_gap = gap;
                 if (ds4_session_eval(ref, accepted[i], err, sizeof(err))) goto done;
