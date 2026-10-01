@@ -62,12 +62,83 @@ static void logit_diff_probe(ds4_session *spec, ds4_session *ref, int tok) {
     }
 }
 
+/* The two passes agree on the argmax almost always, but individual tokens'
+ * logits differ by up to ~18.  The *shape* of that difference says where it
+ * comes from: a constant offset has sd_d near zero, a scale difference has a
+ * slope near 1 against the reference's own logits, and anything else means a
+ * different hidden state.  Re-reading the same token at every position then
+ * separates a per-token term (a property of the output head) from a
+ * per-position one (a property of the state). */
+static float *g_ld_rb, *g_ld_sb;
+static int    g_ld_probe[8], g_ld_probe_n;
+static float  g_ld_pmin[8], g_ld_pmax[8];
+static int    g_ld_pn[8];
+static float  g_ld_maxsd, g_ld_max_mean, g_ld_maxmax;
+static int    g_ld_v;
+
+static void logit_vec_probe(ds4_session *spec, ds4_session *ref, int tok) {
+    if (!g_ld_rb) {
+        g_ld_rb = malloc(4u << 20);
+        g_ld_sb = malloc(4u << 20);
+    }
+    if (!g_ld_rb || !g_ld_sb) return;
+    const int v = ds4_session_copy_logits(ref, g_ld_rb, 1 << 20);
+    if (v <= 0 || ds4_session_copy_logits(spec, g_ld_sb, 1 << 20) != v) return;
+    g_ld_v = v;
+
+    double s_ref = 0, s_d = 0, s_dd = 0, s_rr = 0, s_dr = 0;
+    for (int i = 0; i < v; i++) {
+        s_ref += g_ld_rb[i];
+        s_d += (double)g_ld_sb[i] - g_ld_rb[i];
+    }
+    const double m_ref = s_ref / v, m_d = s_d / v;
+    float mx = 0;
+    int mx_id = 0;
+    for (int i = 0; i < v; i++) {
+        const double d = (double)g_ld_sb[i] - g_ld_rb[i] - m_d;
+        const double r = (double)g_ld_rb[i] - m_ref;
+        s_dd += d * d;
+        s_rr += r * r;
+        s_dr += d * r;
+        const float a = (float)fabs((double)g_ld_sb[i] - g_ld_rb[i]);
+        if (a > mx) { mx = a; mx_id = i; }
+    }
+    const double sd = sqrt(s_dd / v);
+    const double slope = s_rr > 0 ? s_dr / s_rr : 0.0;
+    if (sd > g_ld_maxsd) g_ld_maxsd = (float)sd;
+    if (fabs(m_d) > g_ld_max_mean) g_ld_max_mean = (float)fabs(m_d);
+    if (mx > g_ld_maxmax) g_ld_maxmax = mx;
+
+    if (g_ld_probe_n < 8) {   /* remember this position's argmax as a probe token */
+        int best = 0;
+        for (int i = 1; i < v; i++) if (g_ld_rb[i] > g_ld_rb[best]) best = i;
+        g_ld_probe[g_ld_probe_n++] = best;
+    }
+    fprintf(stderr, "LOGD tok=%d V=%d mean_d=%.4f sd_d=%.4f slope=%.5f max_d=%.4f at=%d",
+            tok, v, m_d, sd, slope, mx, mx_id);
+    for (int i = 0; i < g_ld_probe_n; i++) {
+        const int id = g_ld_probe[i];
+        const float d = g_ld_sb[id] - g_ld_rb[id];
+        if (!g_ld_pn[i]) { g_ld_pmin[i] = d; g_ld_pmax[i] = d; }
+        if (d < g_ld_pmin[i]) g_ld_pmin[i] = d;
+        if (d > g_ld_pmax[i]) g_ld_pmax[i] = d;
+        g_ld_pn[i]++;
+        fprintf(stderr, " p%d=%d:%.3f", i, id, d);
+    }
+    fprintf(stderr, "\n");
+}
+
 static void logit_diff_summary(void) {
     if (!getenv("DS4_DSP41_LOGIT_DIFF") || !g_ld_rows) return;
     fprintf(stderr, "LOGITSUM rows=%d agree=%d disagree=%d max_dlogit=%.4f "
             "max_dlogprob=%.6f dis_lo_margin=%.4f dis_hi_margin=%.4f\n",
             g_ld_rows, g_ld_agree, g_ld_dis, g_ld_dlogit, g_ld_dlogprob,
             g_ld_dis_lo, g_ld_dis_hi);
+    fprintf(stderr, "LOGDSUM rows=%d V=%d max_sd_d=%.4f max_abs_mean_d=%.4f "
+            "max_d=%.4f\n", g_ld_pn[0], g_ld_v, g_ld_maxsd, g_ld_max_mean, g_ld_maxmax);
+    for (int i = 0; i < g_ld_probe_n; i++)
+        fprintf(stderr, "LOGP i=%d id=%d n=%d delta=[%.3f,%.3f]\n",
+                i, g_ld_probe[i], g_ld_pn[i], g_ld_pmin[i], g_ld_pmax[i]);
 }
 
 static int check_prefix(ds4_engine *engine, int prefix) {
@@ -96,7 +167,10 @@ static int check_prefix(ds4_engine *engine, int prefix) {
             ds4_session_sync(ref, &prompt, err, sizeof(err))) goto done;
         int n = 0;
         while (n < 128) {
-            if (getenv("DS4_DSP41_LOGIT_DIFF")) logit_diff_probe(spec, ref, n);
+            if (getenv("DS4_DSP41_LOGIT_DIFF")) {
+                logit_diff_probe(spec, ref, n);
+                logit_vec_probe(spec, ref, n);
+            }
             int accepted[16];
             const int count = ds4_session_eval_speculative_argmax_ignoring_eos(
                 spec, ds4_session_argmax(spec), 128 - n, ds4_token_eos(engine),
