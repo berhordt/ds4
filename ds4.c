@@ -78128,12 +78128,15 @@ static bool ds4_session_prepare_dspark_draft_impl(ds4_session *s,
             }
         }
         /* Give the draft this position's slice of the target's context before
-         * the chain runs, so its attention has something to attend over. */
+         * the chain runs, so its attention has something to attend over.  The
+         * seeder returns true when there is nothing to do, so a false here means
+         * a real GPU failure and the draft is better skipped for this cycle. */
         if (stage_input_ok) {
-            ok = metal_graph_seed_dspark_target_cache_step(&s->graph,
-                                                           &s->engine->mtp_model,
-                                                           dw,
-                                                           feature_pos);
+            stage_input_ok =
+                metal_graph_seed_dspark_target_cache_step(&s->graph,
+                                                          &s->engine->mtp_model,
+                                                          dw,
+                                                          feature_pos);
         }
         DS4_DSPARK_PROP_ADD(propose_setup_ms, setup_t0);
         const bool draft_cache_ready =
