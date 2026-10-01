@@ -65,9 +65,13 @@ static int check_prefix(ds4_engine *engine, int prefix) {
                 if (gap > worst_gap) worst_gap = gap;
                 if (ds4_session_eval(ref, accepted[i], err, sizeof(err))) goto done;
                 ds4_tokens_push(&prompt, accepted[i]);
-                /* Both sessions now sit at the same position, so their persistent
-                 * state is directly comparable.  The check above only says the
-                 * token streams disagree; this says which state span drifted. */
+                /* spec has already committed the whole block, so it is at
+                 * P+count while ref is only at P+i.  Their persistent state is
+                 * therefore comparable *by position*, not line by line: for any
+                 * position both tags emit a line, and those two lines are the
+                 * comparison.  Pairing the k-th line of one tag against the
+                 * k-th line of the other compares different positions and
+                 * reports a difference for every block longer than one token. */
                 if (getenv("DS4_DSP41_STATE_DIGEST")) {
                     (void)ds4_test_ds41_state_digest(spec, "spec");
                     (void)ds4_test_ds41_state_digest(ref, "ref");
