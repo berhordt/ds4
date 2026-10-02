@@ -35265,64 +35265,92 @@ static bool dspark_stage_block_ready(
         ds4_gpu_tensor_bytes(g->dspark_stage_output_hc) >= draft * hc_dim * sizeof(float);
 }
 
+/* Name the term that refused.  This gate returns false for about twenty
+ * different reasons and used to say nothing at all, which is the most expensive
+ * kind of bug in this tree: the V4.1 draft was proposing with an empty target
+ * cache (cache_len = 0) and the only evidence anywhere in the output was a
+ * cache_len=0 inside a warning printed four call frames up.  Set *why to a
+ * literal and report it once, the same way the V4.1 family guard reports which
+ * of its terms rejected. */
+static bool dspark_seed_refuse(const char **why, const char *msg) {
+    if (why) *why = msg;
+    return false;
+}
+
 static bool dspark_stage_target_cache_seed_ready(
         const ds4_gpu_graph      *g,
         const ds4_dspark_weights *dw,
         uint32_t                  stage,
-        uint32_t                  n_tokens) {
-    if (!g || !dw ||
-        stage >= dw->n_stages ||
-        n_tokens == 0 ||
-        n_tokens > g->prefill_cap ||
-        !dspark_stage_cache_ready(g, dw) ||
-        !metal_graph_batch_cur_hc(g) ||
-        !metal_graph_batch_hc_mix(g) ||
-        !metal_graph_batch_hc_split(g) ||
-        !metal_graph_batch_flat_hc(g) ||
-        !metal_graph_batch_attn_cur(g) ||
-        !metal_graph_batch_attn_norm(g) ||
-        !metal_graph_batch_kv_raw(g) ||
-        !metal_graph_batch_kv(g)) {
-        return false;
-    }
+        uint32_t                  n_tokens,
+        const char              **why) {
+    if (!g || !dw) return dspark_seed_refuse(why, "no graph or no draft weights");
+    if (stage >= dw->n_stages) return dspark_seed_refuse(why, "stage out of range");
+    if (n_tokens == 0) return dspark_seed_refuse(why, "no rows to seed");
+    if (n_tokens > g->prefill_cap) return dspark_seed_refuse(why, "rows exceed prefill_cap");
+    if (n_tokens > g->dspark_cache_cap) return dspark_seed_refuse(why, "rows exceed dspark_cache_cap");
+    if (!dspark_stage_cache_ready(g, dw)) return dspark_seed_refuse(why, "stage cache buffers not ready");
+    if (!metal_graph_batch_cur_hc(g)) return dspark_seed_refuse(why, "batch cur_hc missing");
+    if (!metal_graph_batch_hc_mix(g)) return dspark_seed_refuse(why, "batch hc_mix missing");
+    if (!metal_graph_batch_hc_split(g)) return dspark_seed_refuse(why, "batch hc_split missing");
+    if (!metal_graph_batch_flat_hc(g)) return dspark_seed_refuse(why, "batch flat_hc missing");
+    if (!metal_graph_batch_attn_cur(g)) return dspark_seed_refuse(why, "batch attn_cur missing");
+    if (!metal_graph_batch_attn_norm(g)) return dspark_seed_refuse(why, "batch attn_norm missing");
+    if (!metal_graph_batch_kv_raw(g)) return dspark_seed_refuse(why, "batch kv_raw missing");
+    if (!metal_graph_batch_kv(g)) return dspark_seed_refuse(why, "batch kv missing");
 
     const ds4_layer_weights *l = &dw->stage[stage].block;
-    if (!l->hc_attn_fn || !l->hc_attn_scale || !l->hc_attn_base ||
-        !l->attn_norm || !l->attn_kv || !l->attn_kv_a_norm) {
-        return false;
-    }
+    if (!l->hc_attn_fn) return dspark_seed_refuse(why, "stage hc_attn_fn absent");
+    if (!l->hc_attn_scale) return dspark_seed_refuse(why, "stage hc_attn_scale absent");
+    if (!l->hc_attn_base) return dspark_seed_refuse(why, "stage hc_attn_base absent");
+    if (!l->attn_norm) return dspark_seed_refuse(why, "stage attn_norm absent");
+    if (!l->attn_kv) return dspark_seed_refuse(why, "stage attn_kv absent");
+    if (!l->attn_kv_a_norm) return dspark_seed_refuse(why, "stage attn_kv_a_norm absent");
 
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t mix_hc = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
-    return
-        dspark_tensor_type_matches(l->hc_attn_fn->type, DS4_DSPARK_LAYOUT_PLAIN) &&
-        l->hc_attn_scale->type == DS4_TENSOR_F32 &&
-        l->hc_attn_base->type == DS4_TENSOR_F32 &&
-        l->attn_norm->type == DS4_TENSOR_F32 &&
-        dspark_tensor_type_matches(l->attn_kv->type, DS4_DSPARK_LAYOUT_DENSE) &&
-        l->attn_kv_a_norm->type == DS4_TENSOR_F32 &&
-        l->hc_attn_fn->ndim == 2 &&
-        l->hc_attn_fn->dim[0] == hc_dim &&
-        l->hc_attn_fn->dim[1] == mix_hc &&
-        l->attn_kv->ndim == 2 &&
-        l->attn_kv->dim[0] == DS4_N_EMBD &&
-        l->attn_kv->dim[1] == DS4_N_HEAD_DIM &&
-        ds4_gpu_tensor_bytes(metal_graph_batch_cur_hc(g)) >=
-            (uint64_t)n_tokens * hc_dim * sizeof(float) &&
-        ds4_gpu_tensor_bytes(metal_graph_batch_hc_mix(g)) >=
-            (uint64_t)n_tokens * mix_hc * sizeof(float) &&
-        ds4_gpu_tensor_bytes(metal_graph_batch_hc_split(g)) >=
-            (uint64_t)n_tokens * mix_hc * sizeof(float) &&
-        ds4_gpu_tensor_bytes(metal_graph_batch_flat_hc(g)) >=
-            (uint64_t)n_tokens * hc_dim * sizeof(float) &&
-        ds4_gpu_tensor_bytes(metal_graph_batch_attn_cur(g)) >=
-            (uint64_t)n_tokens * DS4_N_EMBD * sizeof(float) &&
-        ds4_gpu_tensor_bytes(metal_graph_batch_attn_norm(g)) >=
-            (uint64_t)n_tokens * DS4_N_EMBD * sizeof(float) &&
-        ds4_gpu_tensor_bytes(metal_graph_batch_kv_raw(g)) >=
-            (uint64_t)n_tokens * DS4_N_HEAD_DIM * sizeof(float) &&
-        ds4_gpu_tensor_bytes(metal_graph_batch_kv(g)) >=
-            (uint64_t)n_tokens * DS4_N_HEAD_DIM * sizeof(float);
+    if (!dspark_tensor_type_matches(l->hc_attn_fn->type, DS4_DSPARK_LAYOUT_PLAIN))
+        return dspark_seed_refuse(why, "stage hc_attn_fn type is not F16/F32");
+    if (l->hc_attn_scale->type != DS4_TENSOR_F32)
+        return dspark_seed_refuse(why, "stage hc_attn_scale is not F32");
+    if (l->hc_attn_base->type != DS4_TENSOR_F32)
+        return dspark_seed_refuse(why, "stage hc_attn_base is not F32");
+    if (l->attn_norm->type != DS4_TENSOR_F32)
+        return dspark_seed_refuse(why, "stage attn_norm is not F32");
+    if (!dspark_tensor_type_matches(l->attn_kv->type, DS4_DSPARK_LAYOUT_DENSE))
+        return dspark_seed_refuse(why, "stage attn_kv type is not F16/F32/Q8_0");
+    if (l->attn_kv_a_norm->type != DS4_TENSOR_F32)
+        return dspark_seed_refuse(why, "stage attn_kv_a_norm is not F32");
+    if (l->hc_attn_fn->ndim != 2 || l->hc_attn_fn->dim[0] != hc_dim ||
+        l->hc_attn_fn->dim[1] != mix_hc)
+        return dspark_seed_refuse(why, "stage hc_attn_fn is not (n_hc*n_embd, mix_hc)");
+    if (l->attn_kv->ndim != 2 || l->attn_kv->dim[0] != DS4_N_EMBD ||
+        l->attn_kv->dim[1] != DS4_N_HEAD_DIM)
+        return dspark_seed_refuse(why, "stage attn_kv is not (n_embd, n_head_dim)");
+    if (ds4_gpu_tensor_bytes(metal_graph_batch_cur_hc(g)) <
+        (uint64_t)n_tokens * hc_dim * sizeof(float))
+        return dspark_seed_refuse(why, "batch cur_hc too small for the rows");
+    if (ds4_gpu_tensor_bytes(metal_graph_batch_hc_mix(g)) <
+        (uint64_t)n_tokens * mix_hc * sizeof(float))
+        return dspark_seed_refuse(why, "batch hc_mix too small for the rows");
+    if (ds4_gpu_tensor_bytes(metal_graph_batch_hc_split(g)) <
+        (uint64_t)n_tokens * mix_hc * sizeof(float))
+        return dspark_seed_refuse(why, "batch hc_split too small for the rows");
+    if (ds4_gpu_tensor_bytes(metal_graph_batch_flat_hc(g)) <
+        (uint64_t)n_tokens * hc_dim * sizeof(float))
+        return dspark_seed_refuse(why, "batch flat_hc too small for the rows");
+    if (ds4_gpu_tensor_bytes(metal_graph_batch_attn_cur(g)) <
+        (uint64_t)n_tokens * DS4_N_EMBD * sizeof(float))
+        return dspark_seed_refuse(why, "batch attn_cur too small for the rows");
+    if (ds4_gpu_tensor_bytes(metal_graph_batch_attn_norm(g)) <
+        (uint64_t)n_tokens * DS4_N_EMBD * sizeof(float))
+        return dspark_seed_refuse(why, "batch attn_norm too small for the rows");
+    if (ds4_gpu_tensor_bytes(metal_graph_batch_kv_raw(g)) <
+        (uint64_t)n_tokens * DS4_N_HEAD_DIM * sizeof(float))
+        return dspark_seed_refuse(why, "batch kv_raw too small for the rows");
+    if (ds4_gpu_tensor_bytes(metal_graph_batch_kv(g)) <
+        (uint64_t)n_tokens * DS4_N_HEAD_DIM * sizeof(float))
+        return dspark_seed_refuse(why, "batch kv too small for the rows");
+    return true;
 }
 
 static bool metal_graph_seed_dspark_stage_target_cache(
@@ -35332,13 +35360,16 @@ static bool metal_graph_seed_dspark_stage_target_cache(
         uint32_t                  stage,
         uint32_t                  pos0,
         uint32_t                  n_tokens,
-        bool                      commands_open) {
+        bool                      commands_open,
+        const char              **why) {
+    if (why) *why = NULL;
     int seed_step = 0;
-    if (!g || !dspark_model || !dw ||
-        !dspark_stage_target_cache_seed_ready(g, dw, stage, n_tokens) ||
-        n_tokens > g->dspark_cache_cap) {
+    if (!g || !dspark_model || !dw)
+        return dspark_seed_refuse(why, "no graph, model, or draft weights");
+    if (!dspark_stage_target_cache_seed_ready(g, dw, stage, n_tokens, why))
         return false;
-    }
+    if (n_tokens > g->dspark_cache_cap)
+        return dspark_seed_refuse(why, "rows exceed dspark_cache_cap");
 
     const bool direct_target_kv = ds4_dspark_rocm_gfx1151_reference_alignment();
     if (direct_target_kv &&
@@ -35490,8 +35521,9 @@ static bool metal_graph_seed_dspark_stage_target_cache(
         static int seed_step_warned = 0;
         if (!seed_step_warned) {
             seed_step_warned = 1;
-            fprintf(stderr, "ds4: DSpark stage-cache seed failed at step %d\n",
-                    seed_step);
+            fprintf(stderr, "ds4: DSpark stage-cache seed failed at step %d%s%s\n",
+                    seed_step, why && *why ? ": " : "",
+                    why && *why ? *why : "");
         }
         if (!commands_open) (void)ds4_gpu_synchronize();
     }
@@ -35539,7 +35571,8 @@ static bool metal_graph_seed_dspark_initial_cache_from_prefill(
                                                         stage,
                                                         batch_start,
                                                         n_tokens,
-                                                        true);
+                                                        true,
+                                                        NULL);
     }
     if (ok) ok = ds4_gpu_end_commands() != 0;
     if (!ok) {
@@ -35996,28 +36029,48 @@ static bool metal_graph_seed_dspark_target_cache_step(
         ds4_gpu_graph            *g,
         const ds4_model          *dspark_model,
         const ds4_dspark_weights *dw,
-        uint32_t                  pos) {
-    if (!g || !dspark_model || !dw || !g->dspark_target_hc ||
-        dw->n_stages == 0) {
+        uint32_t                  pos,
+        const char              **why) {
+    if (why) *why = NULL;
+    /* These are no-ops rather than failures by design, but a no-op that reports
+     * success is indistinguishable from a seed that worked unless it says so. */
+    if (!g || !dspark_model || !dw) {
+        if (why) *why = "no graph, model, or draft weights";
+        return true;
+    }
+    if (dw->n_stages == 0) {
+        if (why) *why = "draft has no stages";
+        return true;
+    }
+    if (!g->dspark_target_hc) {
+        if (why) *why = "dspark_target_hc not allocated";
         return true;
     }
     const uint64_t hc_bytes = (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float);
     ds4_gpu_tensor *cur_hc = metal_graph_batch_cur_hc(g);
-    if (!cur_hc ||
-        ds4_gpu_tensor_bytes(g->dspark_target_hc) < hc_bytes ||
+    if (!cur_hc) {
+        if (why) *why = "batch cur_hc missing";
+        return true;
+    }
+    if (ds4_gpu_tensor_bytes(g->dspark_target_hc) < hc_bytes ||
         ds4_gpu_tensor_bytes(cur_hc) < hc_bytes) {
+        if (why) *why = "dspark_target_hc or batch cur_hc is short of one HC row";
         return true;
     }
     bool ok = ds4_gpu_tensor_copy(cur_hc, 0, g->dspark_target_hc, 0,
                                   hc_bytes) != 0;
+    if (!ok && why) *why = "copying the committed row into dspark_target_hc failed";
     for (uint32_t stage = 0; ok && stage < dw->n_stages; stage++) {
         ok = metal_graph_seed_dspark_stage_target_cache(g, dspark_model, dw,
-                                                       stage, pos, 1, false);
+                                                       stage, pos, 1, false, why);
     }
     /* The stores above write the rows; this is what makes the window admit them.
      * merge_target_range keeps at most DS4_N_SWA rows, which is the draft's real
      * attention window. */
-    if (ok) ok = metal_graph_dspark_cache_merge_target_range(g, pos, 1);
+    if (ok) {
+        ok = metal_graph_dspark_cache_merge_target_range(g, pos, 1);
+        if (!ok && why) *why = "merging the seeded row into the draft window failed";
+    }
     return ok;
 }
 
@@ -78359,18 +78412,42 @@ static bool ds4_session_prepare_dspark_draft_impl(ds4_session *s,
          * proposal, or the draft goes silent exactly as it did while
          * final_hidden refused V4.1. */
         if (ds4_session_is_ds41(s) && draft_cache_ready) {
+            const char *seed_why = NULL;
             if (!metal_graph_seed_dspark_target_cache_step(&s->graph,
                                                            &s->engine->mtp_model,
                                                            dw,
-                                                           feature_pos)) {
+                                                           feature_pos,
+                                                           &seed_why)) {
                 static int seed_warned = 0;
                 if (!seed_warned) {
                     seed_warned = 1;
                     fprintf(stderr,
                             "ds4: DSpark target-cache seed failed (pos=%u "
-                            "cache_len=%u cap=%u prefill_cap=%u)\n",
+                            "cache_len=%u cap=%u prefill_cap=%u): %s\n",
                             feature_pos, s->graph.dspark_cache_len,
-                            s->graph.dspark_cache_cap, s->graph.prefill_cap);
+                            s->graph.dspark_cache_cap, s->graph.prefill_cap,
+                            seed_why ? seed_why : "no reason reported");
+                }
+            } else if (seed_why) {
+                /* Reported once so a run says whether the draft is getting keys
+                 * at all.  cache_len is the number the failure text carries. */
+                static int skip_warned = 0;
+                if (!skip_warned) {
+                    skip_warned = 1;
+                    fprintf(stderr,
+                            "ds4: DSpark target-cache seed skipped (pos=%u "
+                            "cache_len=%u): %s\n",
+                            feature_pos, s->graph.dspark_cache_len, seed_why);
+                }
+            } else {
+                static int seeded_warned = 0;
+                if (!seeded_warned) {
+                    seeded_warned = 1;
+                    fprintf(stderr,
+                            "ds4: DSpark target-cache seeded (pos=%u "
+                            "cache_len=%u cap=%u)\n",
+                            feature_pos, s->graph.dspark_cache_len,
+                            s->graph.dspark_cache_cap);
                 }
             }
         }
