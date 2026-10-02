@@ -36057,8 +36057,18 @@ static bool metal_graph_seed_dspark_target_cache_step(
         if (why) *why = "dspark_target_hc or batch cur_hc is short of one HC row";
         return true;
     }
-    bool ok = ds4_gpu_tensor_copy(cur_hc, 0, g->dspark_target_hc, 0,
-                                  hc_bytes) != 0;
+    /* ds4_gpu_tensor_copy() encodes a blit into the batch command buffer and
+     * returns 0 when there is none open.  This copy is the only step here that
+     * runs outside a batch -- _stage() opens its own -- so it failed at every
+     * position, the seed returned false, the draft's cache stayed empty
+     * (cache_len = 0) and the draft proposed every token with no keys to attend
+     * over.  That is the whole of the acceptance problem.  Bracket it the way
+     * ds41_dspark_select_committed_row() brackets its own copies. */
+    bool ok = ds4_gpu_begin_commands() != 0;
+    if (ok) ok = ds4_gpu_tensor_copy(cur_hc, 0, g->dspark_target_hc, 0,
+                                     hc_bytes) != 0;
+    if (ok) ok = ds4_gpu_end_commands() != 0;
+    else (void)ds4_gpu_synchronize();
     if (!ok && why) *why = "copying the committed row into dspark_target_hc failed";
     for (uint32_t stage = 0; ok && stage < dw->n_stages; stage++) {
         ok = metal_graph_seed_dspark_stage_target_cache(g, dspark_model, dw,
