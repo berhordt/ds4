@@ -78421,12 +78421,26 @@ static bool ds4_session_prepare_dspark_draft_impl(ds4_session *s,
          * incrementally.  Best effort: a seed failure must not cost the whole
          * proposal, or the draft goes silent exactly as it did while
          * final_hidden refused V4.1. */
-        if (ds4_session_is_ds41(s) && draft_cache_ready) {
+        /* The row that belongs to this step is the one at feature_pos - 1, not
+         * feature_pos.  Two things fix the geometry: the proposal path demands a
+         * window ending exactly at feature_pos (crop_to_prefix + ends_at here,
+         * and the same ends_at in metal_graph_eval_dspark_stage_chain), and
+         * merge_target_range(g, x, 1) leaves a window ending at x + 1.  So
+         * seeding x = feature_pos ends the window at feature_pos + 1 and every
+         * proposal is refused -- but only once the cache is non-empty, because
+         * ends_at() returns true unconditionally for an empty one.  That is why
+         * the draft proposed 204 times while the seed was failing and stopped
+         * proposing entirely the moment seeding started to work.
+         *
+         * With feature_pos - 1 the window grows by exactly one position per
+         * proposal and ends at feature_pos each time, which is what "seeding one
+         * row per position builds the same window incrementally" describes. */
+        if (ds4_session_is_ds41(s) && draft_cache_ready && feature_pos > 0) {
             const char *seed_why = NULL;
             if (!metal_graph_seed_dspark_target_cache_step(&s->graph,
                                                            &s->engine->mtp_model,
                                                            dw,
-                                                           feature_pos,
+                                                           feature_pos - 1u,
                                                            &seed_why)) {
                 static int seed_warned = 0;
                 if (!seed_warned) {
