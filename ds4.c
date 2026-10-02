@@ -43040,12 +43040,29 @@ static bool ds41_graph_prefill(ds41_gpu_graph *g, const ds4_model *m,
  * individually rather than only the last one so that a partial commit can pick
  * the row it committed -- the same reason the ds41 frontier keeps per-row
  * carries.  Row 0 is never written or read. */
+/* Capture one row's hidden state for the draft's stage cache.
+ *
+ * The DSpark taps read the *input* to their target layers, not the output.  All
+ * three callers run at the end of a layer, where `hc` is the state leaving
+ * `il`, so the target layer this belongs to is `il + 1`.  sglang states the
+ * convention outright -- deepseek_v4.py captures `hidden_states` at the top of
+ * the layer loop under the comment "The draft head reads the attention input of
+ * its target layers", and kimi_k3.py's dflash adapter notes that "DSPARK taps
+ * already capture" layer inputs where DFLASH ids name layer outputs, "hence the
+ * usual +1 shift".  Reading the output instead conditions the draft on one
+ * layer's worth of wrong state: the shapes all still match, so nothing fails,
+ * the proposals are just worse.
+ *
+ * Offsetting here rather than at the call sites keeps the three callers uniform
+ * and keeps the shift next to the reason for it.  It is exactly equivalent to
+ * capturing at the top of layer il+1, because ds41_hc_mix() does not write
+ * g->residual -- it only reads it. */
 static DS4_MAYBE_UNUSED bool ds41_dspark_capture_row(
         ds41_gpu_graph *g, const ds4_gpu_tensor *hc, uint32_t il, uint32_t row) {
     ds4_gpu_graph *a = g ? g->dspark_arena : NULL;
     if (!a || !hc || !g->dspark_row_hc || row == 0 ||
         row > g->dspark_verify_rows) return true;
-    const int slot = metal_graph_dspark_target_slot(a, il);
+    const int slot = metal_graph_dspark_target_slot(a, il + 1u);
     if (slot < 0) return true;
     const uint64_t embd_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
     ds4_gpu_tensor *dst = ds4_gpu_tensor_view(
