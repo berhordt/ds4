@@ -43555,6 +43555,12 @@ int ds4_gpu_routed_moe_batch_tensor(
              (gate_type == DS4_METAL_TENSOR_Q4_K && down_type == DS4_METAL_TENSOR_Q4_K));
         const bool use_tiny_pair_mv =
             !g_quality_mode &&
+            /* Narrow knob.  --quality also disables this path, but it gates about
+             * ten other things (indexer kernel, matmul tiling, routed MPP), so it
+             * cannot answer "what does the per-row MoE cost" on its own.  With
+             * this set, decode row counts take the grouped matmul path that
+             * prefill uses. */
+            getenv("DS4_METAL_DISABLE_V41_TINY_PAIR") == NULL &&
             (n_tokens <= 5u || v41_decode_batch ||
              (n_tokens == 6u && ds4_gpu_device_is_m5_apple_silicon() &&
               (gate_type == DS4_METAL_TENSOR_IQ2_XXS ||
