@@ -63633,23 +63633,25 @@ static uint64_t ds41_tensor_hash(ds4_gpu_tensor *t, uint64_t bytes) {
 }
 
 /* Value summary of a head-input row.  A hash says the batch and the ordinary
- * decode disagree; only the numbers say how, and the measurement that matters
- * is that spec's row 0 and the reference's single row describe the same
- * position.  x, norm and residual all hold bf16 after ds41_bf16(), written into
- * the low half of a row laid out as f32, so read the narrow half and widen by
- * hand -- reading it as f32 interleaves the stale upper halves and reports
- * nonsense. */
+ * decode disagree; only the numbers say how.  The pair that describes one
+ * position is spec's row 0 against the reference's single row, because the
+ * graph's own buffers hold whatever the last row of a multi-row sweep left.
+ *
+ * These buffers are f32 storage holding bf16-*precision* values --
+ * ds41_bf16() is ds4_gpu_dsv41_quantize(x, width, 1, BF16), and
+ * kernel_dsv41_bf16_linear rounds in place with `bits & 0xffff0000u` on
+ * `device uint *x`.  It is not a two-byte packing: reading the narrow half as
+ * packed bf16 reports the low mantissa bits as exponents and produces norms in
+ * the tens of thousands. */
 static void ds41_head_input_line(FILE *f, ds41_gpu_graph *g, const char *tag,
                                  const char *name, ds4_gpu_tensor *t, uint32_t width) {
-    static uint16_t buf[32768];
+    static float buf[32768];
     if (!f || !t || !width || width > 32768u ||
-        !ds4_gpu_tensor_read(t, 0, buf, (uint64_t)width * 2u)) return;
+        !ds4_gpu_tensor_read(t, 0, buf, (uint64_t)width * sizeof(float))) return;
     double sumsq = 0, sum = 0;
     float mn = 0, mx = 0, e0 = 0, e1 = 0;
     for (uint32_t i = 0; i < width; i++) {
-        const uint32_t bits = (uint32_t)buf[i] << 16;
-        float v;
-        memcpy(&v, &bits, sizeof v);
+        const float v = buf[i];
         if (!isfinite(v)) continue;
         sumsq += (double)v * v;
         sum += v;
