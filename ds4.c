@@ -43334,7 +43334,14 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
         (uint64_t)rows * (width) * sizeof(float))) != NULL;
     DS41_PREFILL_ROWS(DS41_SESSION_VIEW)
 #undef DS41_SESSION_VIEW
-    const uint64_t head_bytes = (uint64_t)(DS4_N_HEAD / g->tp_world) * DS4_N_HEAD_DIM * sizeof(float);
+    /* Size the per-row q/heads views by the head count the attention path will
+     * actually use, not by the split share.  ds41_attn_split() is off by default
+     * for world > 2, so ds41_attention() runs the full DS4_N_HEAD there, and a
+     * view sized for DS4_N_HEAD / world is too small -- the rope call on g->q
+     * then fails its size guard and the whole batch is abandoned.  That is the
+     * batched-session failure. */
+    const uint32_t attn_heads = ds41_attn_split(g) ? DS4_N_HEAD / g->tp_world : DS4_N_HEAD;
+    const uint64_t head_bytes = (uint64_t)attn_heads * DS4_N_HEAD_DIM * sizeof(float);
     for (int i = 0; ok && i < count; i++) {
         queries[i] = ds4_gpu_tensor_view(g->batch.q, (uint64_t)i * head_bytes, head_bytes);
         heads[i] = ds4_gpu_tensor_view(g->batch.heads, (uint64_t)i * head_bytes, head_bytes);
