@@ -48268,9 +48268,17 @@ int ds4_gpu_dsv41_rope(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
 int ds4_gpu_dsv41_quantize(ds4_gpu_tensor *x, uint32_t width, uint32_t rows,
                           ds4_v41_activation_format format) {
     const uint32_t block = format == DS4_V41_FP4_E4M3 ? 16u : 32u;
+    /* Every refusal here and below is named.  This call is the one the batched
+     * session path reports as failing at layer 1 while the same call succeeds at
+     * layer 0 with argument-identical guards, so the interesting question is
+     * which of the four exits was taken -- and "return 0" cannot say. */
+    const bool have_floats = x && dsv41_tensor_has_floats(x, (uint64_t)width * rows);
     if (!width || !rows || format < DS4_V41_BF16 || format > DS4_V41_FP4_E4M3 ||
-        (format != DS4_V41_BF16 && width % block) ||
-        !dsv41_tensor_has_floats(x, (uint64_t)width * rows)) return 0;
+        (format != DS4_V41_BF16 && width % block) || !have_floats) {
+        fprintf(stderr, "ds4: V4.1 quantize refused arguments (width=%u rows=%u fmt=%d "
+                        "floats=%d)\n", width, rows, (int)format, (int)have_floats);
+        return 0;
+    }
     if (!g_initialized && !ds4_gpu_init()) return 0;
     @autoreleasepool {
         const uint64_t count = (uint64_t)width * rows;
@@ -48279,12 +48287,22 @@ int ds4_gpu_dsv41_quantize(ds4_gpu_tensor *x, uint32_t width, uint32_t rows,
             !getenv("DS4_METAL_DISABLE_V41_LINEAR_BF16");
         id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline(linear ?
             "kernel_dsv41_bf16_linear" : "kernel_dsv41_quantize");
-        if (!pipeline) return 0;
+        if (!pipeline) {
+            fprintf(stderr, "ds4: V4.1 quantize has no pipeline (%s)\n",
+                    linear ? "kernel_dsv41_bf16_linear" : "kernel_dsv41_quantize");
+            return 0;
+        }
         const uint32_t args[] = {width, rows, (uint32_t)format};
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
         id<MTLComputeCommandEncoder> enc = cb ? ds4_gpu_compute_encoder(cb) : nil;
-        if (!enc) return 0;
+        if (!enc) {
+            fprintf(stderr, "ds4: V4.1 quantize has no encoder (width=%u rows=%u owned=%d "
+                            "batch_cb=%p batch_enc=%p)\n",
+                    width, rows, owned, (__bridge void *)g_batch_cb,
+                    (__bridge void *)g_batch_enc);
+            return 0;
+        }
         [enc setComputePipelineState:pipeline];
         if (linear) [enc setBytes:&count length:sizeof(count) atIndex:0];
         else [enc setBytes:args length:sizeof(args) atIndex:0];

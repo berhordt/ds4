@@ -41674,26 +41674,42 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
     const bool head_split = ds41_attn_split(g);
     const uint32_t heads = head_split ? DS4_N_HEAD / g->tp_world : DS4_N_HEAD;
     const uint32_t head0 = head_split ? g->tp_rank * heads : 0u;
-    if (!projected && !ds41_attention_project(g, m, l)) return false;
-    if (!ds41_rope(g->q, heads, DS4_N_HEAD_DIM, il, pos, false) ||
-        !ds41_rope(g->kv, 1, DS4_N_HEAD_DIM, il, pos, false) ||
-        !ds4_gpu_dsv41_quantize(g->kv, DS4_N_HEAD_DIM, 1, DS4_V41_FP8_E8M0) ||
-        !ds4_gpu_tensor_copy(g->window[il], (uint64_t)(pos % 128u) * 512u * 4u,
-                             g->kv, 0, 512u * 4u) ||
-        !ds41_attention_select(g, m, l, il)) return false;
+    /* Name the refusal.  The batched session path arrives here with 2 rows and
+     * fails at layer 1, and this chain cannot say which of its nine calls went.
+     * The same technique in ds41_graph_step_batch took that from eight candidates
+     * to this function in two runs. */
+    const char *bad = NULL;
+    if (!projected && !ds41_attention_project(g, m, l)) bad = "project";
+    if (!bad && !ds41_rope(g->q, heads, DS4_N_HEAD_DIM, il, pos, false)) bad = "rope_q";
+    if (!bad && !ds41_rope(g->kv, 1, DS4_N_HEAD_DIM, il, pos, false)) bad = "rope_kv";
+    if (!bad && !ds4_gpu_dsv41_quantize(g->kv, DS4_N_HEAD_DIM, 1, DS4_V41_FP8_E8M0))
+        bad = "quant_kv";
+    if (!bad && !ds4_gpu_tensor_copy(g->window[il], (uint64_t)(pos % 128u) * 512u * 4u,
+                                     g->kv, 0, 512u * 4u)) bad = "window_copy";
+    if (!bad && !ds41_attention_select(g, m, l, il)) bad = "select";
     const uint32_t attended = n_comp < DS4_N_INDEXER_TOP_K ? n_comp : DS4_N_INDEXER_TOP_K;
-    if (n_comp && !ds4_gpu_dsv41_gather_kv(g->selected_kv, g->compressed[owner],
-                                         g->selected_comp, n_comp, attended)) return false;
+    if (!bad && n_comp && !ds4_gpu_dsv41_gather_kv(g->selected_kv, g->compressed[owner],
+                                         g->selected_comp, n_comp, attended))
+        bad = "gather_kv";
     const uint32_t n_raw = pos + 1u < 128u ? pos + 1u : 128u;
-    if (!ds4_gpu_attention_decode_heads_tensor(g->heads, m->map, m->size,
+    if (!bad && !ds4_gpu_attention_decode_heads_tensor(g->heads, m->map, m->size,
             l->attn_sinks->abs_offset + (uint64_t)head0 * sizeof(float),
             g->q, g->window[il], n_raw, 128, (pos + 1u - n_raw) % 128u,
             g->selected_kv, 0, attended, NULL, 0,
-            heads, DS4_N_HEAD_DIM) ||
-        !ds41_bf16(g->heads, heads * DS4_N_HEAD_DIM) ||
-        !ds41_rope(g->heads, heads, DS4_N_HEAD_DIM, il, pos, true)) return false;
+            heads, DS4_N_HEAD_DIM)) bad = "decode_heads";
+    if (!bad && !ds41_bf16(g->heads, heads * DS4_N_HEAD_DIM)) bad = "bf16_heads";
+    if (!bad && !ds41_rope(g->heads, heads, DS4_N_HEAD_DIM, il, pos, true)) bad = "rope_heads";
+    if (bad) {
+        fprintf(stderr, "ds4: V4.1 attention refused step=%s layer=%u pos=%u world=%u "
+                        "n_comp=%u attended=%u n_raw=%u heads=%u projected=%d\n",
+                bad, il, pos, g->tp_world, n_comp, attended, n_raw, heads, (int)projected);
+        return false;
+    }
     if (!projected) {
-        if (!ds41_attention_output(g, m, l)) return false;
+        if (!ds41_attention_output(g, m, l)) {
+            fprintf(stderr, "ds4: V4.1 attention output refused layer=%u pos=%u\n", il, pos);
+            return false;
+        }
         ds41_tp_probe("attn_out", g->block, DS4_N_EMBD, il, g->tp_rank);
         if (!ds41_attention_gate(g, il)) return false;
         ds41_tp_probe("attn_gated", g->block, DS4_N_EMBD, il, g->tp_rank);
@@ -43354,9 +43370,13 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
     uint32_t il = 0;
     for (; ok && il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *l = &weights->layer[il];
-        stage = "engram_upload";
+        /* Assign the stage *inside* the guard.  Setting it before the guard made
+         * every report one step late: the failing call leaves ok false, the next
+         * assignment then runs unconditionally, and that step's own call is
+         * skipped -- so the name printed was the step after the real failure. */
         if (ds41_engram_layer(il)) {
             const unsigned table = il == 1 ? 0 : 1;
+            stage = "engram_upload";
             for (int i = 0; ok && i < count; i++) {
                 ds41_gpu_graph *s = graphs[i];
                 stage_row = i;
@@ -43365,10 +43385,12 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
                     sizeof(s->rows[table]));
             }
         }
-        stage = "before_attention_batch";
-        if (ok) ok = ds41_before_attention_batch(g, &active, model, l, il, rows) &&
-            ds41_attention_project_batch(g, model, l, rows);
-        stage = "attention_rows";
+        if (ok) {
+            stage = "before_attention_batch";
+            ok = ds41_before_attention_batch(g, &active, model, l, il, rows) &&
+                 ds41_attention_project_batch(g, model, l, rows);
+        }
+        if (ok) stage = "attention_rows";
         for (int i = 0; ok && i < count; i++) {
             ds41_gpu_graph row = *graphs[i];
             row.pos = positions[i];
@@ -43381,8 +43403,8 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
             ok = ds41_attention(&row, model, l, il, true) &&
                 ds41_attention_output(&row, model, l);
         }
-        stage = "attn_sum";
         if (ok && g->tp_world > 1) {
+            stage = "attn_sum";
             if (ds41_attn_split(g)) {
                 ok = ds41_sum_partial_batch(g, active.block, il, rows);
                 ds41_tp_probe("attn_sum_b", active.block, (uint64_t)rows * DS4_N_EMBD,
@@ -43399,23 +43421,23 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
         }
         /* Split, because this chain runs unchanged at every layer and yet only
          * layer 1 fails: naming the group is not enough to say which call. */
-        stage = "moe_block_quant";
-        if (ok) ok = ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, rows, DS4_V41_BF16);
-        stage = "moe_after_attention";
-        if (ok) ok = ds41_after_attention_batch(&active, model, l, rows);
-        stage = "moe_routed";
-        if (ok) ok = ds41_moe_batch(g, model, l, il, rows, shared_owner);
-        stage = "moe_combine";
-        if (ok) ok = shared_owner ? ds4_gpu_tensor_copy(active.block, 0, active.routed, 0,
-                (uint64_t)rows * DS4_N_EMBD * sizeof(float)) :
-                ds4_gpu_add_tensor(active.block, active.routed, active.shared, rows * DS4_N_EMBD);
-        stage = "moe_out_quant";
-        if (ok) ok = ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, rows, DS4_V41_BF16);
-        stage = "moe_expand";
-        if (ok) ok = ds4_gpu_hc_expand_split_tensor(active.residual, active.block, active.after_attn,
-                active.ffn_split, DS4_N_EMBD, DS4_N_HC, 0, DS4_N_EMBD);
-        stage = "moe_res_quant";
-        if (ok) ok = ds4_gpu_dsv41_quantize(active.residual, DS4_N_EMBD * DS4_N_HC, rows, DS4_V41_BF16);
+        if (ok) { stage = "moe_block_quant";
+            ok = ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, rows, DS4_V41_BF16); }
+        if (ok) { stage = "moe_after_attention";
+            ok = ds41_after_attention_batch(&active, model, l, rows); }
+        if (ok) { stage = "moe_routed";
+            ok = ds41_moe_batch(g, model, l, il, rows, shared_owner); }
+        if (ok) { stage = "moe_combine";
+            ok = shared_owner ? ds4_gpu_tensor_copy(active.block, 0, active.routed, 0,
+                    (uint64_t)rows * DS4_N_EMBD * sizeof(float)) :
+                    ds4_gpu_add_tensor(active.block, active.routed, active.shared, rows * DS4_N_EMBD); }
+        if (ok) { stage = "moe_out_quant";
+            ok = ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, rows, DS4_V41_BF16); }
+        if (ok) { stage = "moe_expand";
+            ok = ds4_gpu_hc_expand_split_tensor(active.residual, active.block, active.after_attn,
+                    active.ffn_split, DS4_N_EMBD, DS4_N_HC, 0, DS4_N_EMBD); }
+        if (ok) { stage = "moe_res_quant";
+            ok = ds4_gpu_dsv41_quantize(active.residual, DS4_N_EMBD * DS4_N_HC, rows, DS4_V41_BF16); }
         /* The second Engram upload reuses the first one's input storage. */
         if (ok && il == 13) ok = ds4_gpu_end_commands() && ds4_gpu_begin_commands();
     }
