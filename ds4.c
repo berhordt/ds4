@@ -43324,10 +43324,20 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
         heads[i] = ds4_gpu_tensor_view(g->batch.heads, (uint64_t)i * head_bytes, head_bytes);
         ok = queries[i] && heads[i];
     }
+    /* Name the failing step, not just the layer.  This body is one long && chain
+     * across eight candidates, so "failed at layer 1" does not say which one
+     * went -- and layer 1 is the first Engram layer, so both the upload loop and
+     * the Engram branch of before_attention_batch are live there and
+     * indistinguishable from the report.  Set stage before each step: with &&
+     * short-circuiting, the stage still current at the end is the one that ran
+     * and failed. */
+    const char *stage = "prep";
+    int stage_row = -1;
     const float initial_pre[] = {1, 0, 0, 0};
     for (int i = 0; ok && i < count; i++) {
         ds41_gpu_graph *s = graphs[i];
         uint32_t ids[2][DS4_ENGRAM_COLS];
+        stage_row = i;
         const bool continued = i > 0 && (uint32_t)i < prefill_rows;
         positions[i] = s->pos + (continued ? (uint32_t)i : 0u);
         history[i] = continued ? history[i - 1] : s->history;
@@ -43344,20 +43354,25 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
     uint32_t il = 0;
     for (; ok && il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *l = &weights->layer[il];
+        stage = "engram_upload";
         if (ds41_engram_layer(il)) {
             const unsigned table = il == 1 ? 0 : 1;
             for (int i = 0; ok && i < count; i++) {
                 ds41_gpu_graph *s = graphs[i];
+                stage_row = i;
                 ok = ds4_gpu_tensor_write(g->rows_view[i].engram_rows, 0,
                     engram && (uint32_t)i < prefill_rows ? engram[i][table] : s->rows[table],
                     sizeof(s->rows[table]));
             }
         }
+        stage = "before_attention_batch";
         if (ok) ok = ds41_before_attention_batch(g, &active, model, l, il, rows) &&
             ds41_attention_project_batch(g, model, l, rows);
+        stage = "attention_rows";
         for (int i = 0; ok && i < count; i++) {
             ds41_gpu_graph row = *graphs[i];
             row.pos = positions[i];
+            stage_row = i;
 #define DS41_SESSION_ROW(name, width) row.name = g->rows_view[i].name;
             DS41_PREFILL_ROWS(DS41_SESSION_ROW)
 #undef DS41_SESSION_ROW
@@ -43366,6 +43381,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
             ok = ds41_attention(&row, model, l, il, true) &&
                 ds41_attention_output(&row, model, l);
         }
+        stage = "attn_sum";
         if (ok && g->tp_world > 1) {
             if (ds41_attn_split(g)) {
                 ok = ds41_sum_partial_batch(g, active.block, il, rows);
@@ -43381,19 +43397,32 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
                                                 g->tp_big_in, bytes);
             }
         }
-        if (ok) ok = ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, rows, DS4_V41_BF16) &&
-            ds41_after_attention_batch(&active, model, l, rows) &&
-            ds41_moe_batch(g, model, l, il, rows, shared_owner) &&
-            (shared_owner ? ds4_gpu_tensor_copy(active.block, 0, active.routed, 0,
+        /* Split, because this chain runs unchanged at every layer and yet only
+         * layer 1 fails: naming the group is not enough to say which call. */
+        stage = "moe_block_quant";
+        if (ok) ok = ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, rows, DS4_V41_BF16);
+        stage = "moe_after_attention";
+        if (ok) ok = ds41_after_attention_batch(&active, model, l, rows);
+        stage = "moe_routed";
+        if (ok) ok = ds41_moe_batch(g, model, l, il, rows, shared_owner);
+        stage = "moe_combine";
+        if (ok) ok = shared_owner ? ds4_gpu_tensor_copy(active.block, 0, active.routed, 0,
                 (uint64_t)rows * DS4_N_EMBD * sizeof(float)) :
-                ds4_gpu_add_tensor(active.block, active.routed, active.shared, rows * DS4_N_EMBD)) &&
-            ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, rows, DS4_V41_BF16) &&
-            ds4_gpu_hc_expand_split_tensor(active.residual, active.block, active.after_attn,
-                active.ffn_split, DS4_N_EMBD, DS4_N_HC, 0, DS4_N_EMBD) &&
-            ds4_gpu_dsv41_quantize(active.residual, DS4_N_EMBD * DS4_N_HC, rows, DS4_V41_BF16);
+                ds4_gpu_add_tensor(active.block, active.routed, active.shared, rows * DS4_N_EMBD);
+        stage = "moe_out_quant";
+        if (ok) ok = ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, rows, DS4_V41_BF16);
+        stage = "moe_expand";
+        if (ok) ok = ds4_gpu_hc_expand_split_tensor(active.residual, active.block, active.after_attn,
+                active.ffn_split, DS4_N_EMBD, DS4_N_HC, 0, DS4_N_EMBD);
+        stage = "moe_res_quant";
+        if (ok) ok = ds4_gpu_dsv41_quantize(active.residual, DS4_N_EMBD * DS4_N_HC, rows, DS4_V41_BF16);
         /* The second Engram upload reuses the first one's input storage. */
         if (ok && il == 13) ok = ds4_gpu_end_commands() && ds4_gpu_begin_commands();
     }
+    /* Only name the head step if the layer loop actually finished: assigning it
+     * unconditionally clobbers the stage that failed inside the body, which is
+     * how the first run of this reported "head" for a body failure. */
+    if (ok) stage = "head";
     const uint64_t logits_bytes = (uint64_t)DS4_N_VOCAB * sizeof(float) /
                                   (g->tp_logits_half ? 2u : 1u);
     /* The final FFN intermediates are dead. Reuse that storage for the head
@@ -43428,7 +43457,8 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
         if (ok) { s->history = history[i]; s->pos = positions[i] + 1u; }
     }
     ds4_gpu_tensor_free(batch_logits);
-    if (!ok) fprintf(stderr, "ds4: V4.1 session batch failed at layer %u (%d rows)\n", il, count);
+    if (!ok) fprintf(stderr, "ds4: V4.1 session batch failed at layer %u step=%s row=%d (%d rows)\n",
+                     il, stage, stage_row, count);
 #define DS41_SESSION_FREE(name, width) ds4_gpu_tensor_free(active.name);
     DS41_PREFILL_ROWS(DS41_SESSION_FREE)
 #undef DS41_SESSION_FREE
