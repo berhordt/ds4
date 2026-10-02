@@ -42042,6 +42042,10 @@ static bool ds41_index_batch(ds41_gpu_graph *g, const ds4_model *m,
     return true;
 }
 
+/* Declared here because ds41_attention_batch() below records a row boundary
+ * mid-sweep, while the frontier helpers themselves live with the graph state. */
+static DS4_MAYBE_UNUSED bool ds41_spec_frontier_note_slot(ds41_gpu_graph *g, uint32_t slot);
+
 static bool ds41_attention_batch(ds41_gpu_graph *g, const ds4_model *m,
                                   const ds4_layer_weights *l, uint32_t il, uint32_t count) {
     const uint32_t start = g->pos, ratio = ds4_layer_compress_ratio(il);
@@ -42070,7 +42074,21 @@ static bool ds41_attention_batch(ds41_gpu_graph *g, const ds4_model *m,
     ds41_gpu_graph row = *g;
     const bool batch_index = ds41_index_source(il) &&
         !getenv("DS4_METAL_DISABLE_V41_BATCH_INDEX");
-    const bool batch_publish = ds41_kv_source(il) &&
+    /* A verify block publishes one row at a time, for two independent reasons.
+     *
+     * It is the only way to see the pooling carry *between* rows: a count-row
+     * pool2() leaves just the end-of-chunk carry, so an intermediate prefix has
+     * nothing to rewind to and the caller replays the accepted tokens serially
+     * instead (see ds41_spec_frontier_restore).  Publishing per row is what makes
+     * slot t+1 below a real row boundary.
+     *
+     * And at verify sizes it is simply faster.  Measured at prefix 127 over 94
+     * cycles, identical acceptance and identical output: verify=1606.3 ms per row
+     * against 2107.9 ms batched, so a count-row pool2 costs more than count
+     * one-row ones.  Bulk prefill keeps the batch path, where the same trade goes
+     * the other way. */
+    const bool spec_row_publish = g->dspark_verify_rows != 0 && ds41_kv_source(il);
+    const bool batch_publish = !spec_row_publish && ds41_kv_source(il) &&
 #ifdef __APPLE__
         ratio == 2u &&
 #endif
@@ -42082,6 +42100,12 @@ static bool ds41_attention_batch(ds41_gpu_graph *g, const ds4_model *m,
         DS41_PREFILL_ROWS(DS41_SELECT_ROW)
 #undef DS41_SELECT_ROW
         if (!batch_publish && !ds41_attention_publish(&row, m, l, il)) return false;
+        /* Slot t+1 is the carry entering row t+1, which is where a commit of
+         * t+1 drafts leaves the session.  Each kv-source layer rewrites it, so
+         * the last one wins -- and that is the serial order, because no later
+         * layer touches this owner's carry. */
+        if (spec_row_publish && t + 1u <= g->dspark_verify_rows &&
+            !ds41_spec_frontier_note_slot(g, t + 1u)) return false;
         if (!batch_index && !ds41_attention_select_published(&row, m, l, il)) return false;
     }
     if (batch_index && !ds41_index_batch(g, m, l, il, count)) return false;
@@ -42263,6 +42287,7 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
  * prefix of `a` rows is a copy of slot `a`.  Only the ratio-2 pooling carry and
  * the Engram n-gram tail are captured; see the note on the struct for why the
  * compressed and indexer caches need no rewind at all. */
+static DS4_MAYBE_UNUSED bool ds41_spec_frontier_note_slot(ds41_gpu_graph *g, uint32_t slot);
 static DS4_MAYBE_UNUSED bool ds41_spec_frontier_note_row(ds41_gpu_graph *g);
 
 static DS4_MAYBE_UNUSED bool ds41_spec_frontier_snapshot(ds41_gpu_graph *g) {
@@ -42286,35 +42311,49 @@ static DS4_MAYBE_UNUSED void ds41_spec_frontier_clear(ds41_gpu_graph *g) {
     g->spec_valid = false;
 }
 
-/* Capture the carry state entering the next verify row. */
-static DS4_MAYBE_UNUSED bool ds41_spec_frontier_note_row(ds41_gpu_graph *g) {
-    const uint32_t slot = g->spec_rows;
+/* Copy the current pooling carry into one frontier slot.
+ *
+ * Split out of ds41_spec_frontier_note_row() because the verify sweep calls it
+ * from *inside* its own command buffer: it publishes one verify row at a time
+ * while a batch is open, so opening a second one here would nest.  When a batch
+ * is already active the copies just join it.  Callers that already hold a
+ * reference to g and know which row they are on use this directly; when this
+ * returns the copy is only encoded, not finished, unless it opened the batch
+ * itself -- which is exactly the contract ds41_spec_frontier_restore() then
+ * relies on to see the row boundaries in order. */
+static DS4_MAYBE_UNUSED bool ds41_spec_frontier_note_slot(ds41_gpu_graph *g, uint32_t slot) {
     if (!g || slot > DS4_DSPARK_MAX_BLOCK_SIZE + 1u) return false;
-    g->spec_row_history[slot] = g->history;
     const uint64_t off = (uint64_t)slot * 512u * sizeof(float);
-    bool ok = ds4_gpu_begin_commands() != 0;
+    const bool own_batch = !ds4_gpu_commands_active();
+    bool ok = !own_batch || ds4_gpu_begin_commands() != 0;
     for (uint32_t i = 0; ok && i < 4; i++) {
         ok = ds4_gpu_tensor_copy(g->spec_previous_kv[i], off,
                                  g->previous_kv[i], 0, 512u * sizeof(float)) != 0 &&
              ds4_gpu_tensor_copy(g->spec_previous_score[i], off,
                                  g->previous_score[i], 0, 512u * sizeof(float)) != 0;
     }
-    if (ok) ok = ds4_gpu_end_commands() != 0;
-    else (void)ds4_gpu_synchronize();
-    if (ok) g->spec_rows = slot + 1u;
+    if (own_batch) {
+        if (ok) ok = ds4_gpu_end_commands() != 0;
+        else (void)ds4_gpu_synchronize();
+    }
     return ok;
 }
 
+/* Capture the carry state entering the next verify row. */
+static DS4_MAYBE_UNUSED bool ds41_spec_frontier_note_row(ds41_gpu_graph *g) {
+    const uint32_t slot = g->spec_rows;
+    if (!g || slot > DS4_DSPARK_MAX_BLOCK_SIZE + 1u) return false;
+    g->spec_row_history[slot] = g->history;
+    if (!ds41_spec_frontier_note_slot(g, slot)) return false;
+    g->spec_rows = slot + 1u;
+    return true;
+}
+
 static DS4_MAYBE_UNUSED bool ds41_spec_frontier_restore(ds41_gpu_graph *g, uint32_t accepted) {
-    if (!g || !g->spec_valid || accepted > g->spec_rows) return false;
-    /* Only the pre-block slot and the end-of-block state are captured today:
-     * slot 0 comes from the snapshot and the state past the last row needs no
-     * rewind at all.  Intermediate prefixes would need the ratio-2 pooling
-     * carry and the n-gram tail captured per verify row, which means hooking
-     * inside the sweep's row loop.  Refuse them rather than rewind to the wrong
-     * state -- the caller then falls back to rollback-and-replay, which is
-     * correct, just slower. */
-    if (accepted != 0 && accepted != g->spec_rows - 1u) return false;
+    if (!g || !g->spec_valid || accepted >= g->spec_rows) return false;
+    /* Slots 0..spec_rows-1 are all captured: slot 0 by the snapshot, slot r at row
+     * r-1's publish inside ds41_attention_batch(), so any prefix is a copy.  Slot
+     * spec_rows-1 needs no rewind at all, and restoring there is harmless. */
     const uint64_t off = (uint64_t)accepted * 512u * sizeof(float);
     bool ok = ds4_gpu_begin_commands() != 0;
     for (uint32_t i = 0; ok && i < 4; i++) {
@@ -43179,6 +43218,20 @@ static DS4_MAYBE_UNUSED bool ds41_verify_suffix_tops(
     if (n_tokens > g->prefill_cap || n_tokens > g->ctx - g->pos) return false;
     if (n_tokens > 1 && !row_tops) return false;
     if (!ds41_spec_frontier_snapshot(g)) return false;
+    /* Materialise the per-row n-gram tails now, while g->pos is still the block
+     * start: ds41_hash_tokens() masks text/image positions from g->pos, and the
+     * sweep advances it.  The sweep records the other half of the rewind state
+     * (the pooling carry) as it publishes each row; together the two make every
+     * slot a real row boundary.  Slot 0 came from the snapshot, so walking
+     * forward from it reaches slot r at r tokens consumed. */
+    {
+        ds4_engram_history h = g->spec_row_history[0];
+        for (uint32_t t = 0; t < n_tokens; t++) {
+            if (!ds41_hash_tokens(g, &h, &tokens[t], 1, &g->prefill_ids[t][0][0]))
+                return false;
+            g->spec_row_history[t + 1u] = h;
+        }
+    }
     /* Ask the sweep to capture each row's target-layer hidden state as it goes;
      * the accept path selects the committed row out of it afterwards. */
     g->dspark_verify_rows = n_tokens;
@@ -43186,6 +43239,10 @@ static DS4_MAYBE_UNUSED bool ds41_verify_suffix_tops(
                                                    NULL, NULL, false, false);
     g->dspark_verify_rows = 0;
     if (!sweep_ok) return false;
+    /* Only now claim the slots the sweep actually filled.  Claiming them earlier
+     * would let a failed sweep leave a rewind target that describes a block that
+     * never ran. */
+    g->spec_rows = n_tokens + 1u;
     /* rows_view[i].norm still holds row i's FFN norm, but the output head needs
      * the head norm.  Rebuild it per row from that row's HC residual, then
      * project every row in one batched matmul, the same shape as the
