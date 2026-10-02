@@ -42070,7 +42070,16 @@ static bool ds41_attention_batch(ds41_gpu_graph *g, const ds4_model *m,
     ds41_gpu_graph row = *g;
     const bool batch_index = ds41_index_source(il) &&
         !getenv("DS4_METAL_DISABLE_V41_BATCH_INDEX");
-    const bool batch_publish = ds41_kv_source(il) &&
+    /* A verify block publishes one row at a time, which at verify sizes is also
+     * faster: a count-row pool2() costs more than count one-row ones.  Measured at
+     * prefix 127 over 94 cycles, forcing this path with
+     * DS4_METAL_DISABLE_V41_BATCH_COMPRESS gave verify=1606.3 ms against 2107.9 ms
+     * batched, with identical acceptance and identical output -- the per-row pools
+     * are computed independently, so the change is numerically neutral and only
+     * the dispatch changes.  Bulk prefill keeps the batch path, where the same
+     * trade goes the other way. */
+    const bool spec_row_publish = g->dspark_verify_rows != 0 && ds41_kv_source(il);
+    const bool batch_publish = !spec_row_publish && ds41_kv_source(il) &&
 #ifdef __APPLE__
         ratio == 2u &&
 #endif
