@@ -63632,6 +63632,37 @@ static uint64_t ds41_tensor_hash(ds4_gpu_tensor *t, uint64_t bytes) {
     return h;
 }
 
+/* Value summary of a head-input row.  A hash says the batch and the ordinary
+ * decode disagree; only the numbers say how, and the measurement that matters
+ * is that spec's row 0 and the reference's single row describe the same
+ * position.  x, norm and residual all hold bf16 after ds41_bf16(), written into
+ * the low half of a row laid out as f32, so read the narrow half and widen by
+ * hand -- reading it as f32 interleaves the stale upper halves and reports
+ * nonsense. */
+static void ds41_head_input_line(FILE *f, ds41_gpu_graph *g, const char *tag,
+                                 const char *name, ds4_gpu_tensor *t, uint32_t width) {
+    static uint16_t buf[32768];
+    if (!f || !t || !width || width > 32768u ||
+        !ds4_gpu_tensor_read(t, 0, buf, (uint64_t)width * 2u)) return;
+    double sumsq = 0, sum = 0;
+    float mn = 0, mx = 0, e0 = 0, e1 = 0;
+    for (uint32_t i = 0; i < width; i++) {
+        const uint32_t bits = (uint32_t)buf[i] << 16;
+        float v;
+        memcpy(&v, &bits, sizeof v);
+        if (!isfinite(v)) continue;
+        sumsq += (double)v * v;
+        sum += v;
+        if (!i || v < mn) mn = v;
+        if (!i || v > mx) mx = v;
+        if (!i) e0 = v;
+        else if (i == 1u) e1 = v;
+    }
+    fprintf(f, "HEAD %s pos=%u %s n=%u l2=%.6f mean=%.6f min=%.6f max=%.6f "
+            "e0=%.6f e1=%.6f\n", tag, g->pos, name, width, sqrt(sumsq),
+            sum / width, mn, mx, e0, e1);
+}
+
 int ds4_test_ds41_state_digest(ds4_session *s, const char *tag) {
     const char *path = getenv("DS4_DSP41_STATE_DIGEST");
     if (!s || !path || !s->ds41_graph_ready || !tag) return -1;
@@ -63653,6 +63684,17 @@ int ds4_test_ds41_state_digest(ds4_session *s, const char *tag) {
         fprintf(f, "CARRY %s pos=%u i=%u kv=%016llx sc=%016llx\n", tag, g->pos, i,
                 (unsigned long long)ds41_tensor_hash(g->previous_kv[i], 512u * 4u),
                 (unsigned long long)ds41_tensor_hash(g->previous_score[i], 512u * 4u));
+    /* The graph's own buffers hold the last row a multi-row sweep touched, so
+     * pair the batch's row 0 against the reference's single row instead. */
+    if (g->rows_view) {
+        ds41_head_input_line(f, g, tag, "r0res", g->rows_view[0].residual,
+                             DS4_N_HC * DS4_N_EMBD);
+        ds41_head_input_line(f, g, tag, "r0x", g->rows_view[0].x, DS4_N_EMBD);
+        ds41_head_input_line(f, g, tag, "r0norm", g->rows_view[0].norm, DS4_N_EMBD);
+    }
+    ds41_head_input_line(f, g, tag, "res", g->residual, DS4_N_HC * DS4_N_EMBD);
+    ds41_head_input_line(f, g, tag, "x", g->x, DS4_N_EMBD);
+    ds41_head_input_line(f, g, tag, "norm", g->norm, DS4_N_EMBD);
     fclose(f);
     return 0;
 }
