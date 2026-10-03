@@ -387,6 +387,38 @@ int main(int argc, char **argv) {
             CHECK(ds4_tp_all_gather(tp, 0x4000u + c, out, in, vec_bytes));
         const double a1 = now();
 
+        /* The head-split / SP handoff shape: 2048 rows x 5120 f32 = 40 MiB,
+         * one layer.  Compare the three paths that can carry it:
+         *   - the new collective (fast, barrier per round)
+         *   - the big gate, which is what ds41_sum_partial_batch() uses today;
+         *     its caller passes ds4_gpu_tensor_alloc() bounce buffers, which sit
+         *     OUTSIDE the registered slab, so the peer driver stages every
+         *     round through CPU memcpys (direct=false)
+         *   - the same big gate forced onto slab-resident buffers (direct=true)
+         * That difference is the whole question for Pillar B: if the staged path
+         * is what makes head-split net-negative, sequence parallel can win by
+         * using the direct one. */
+        {
+            const uint64_t big_bytes = 2048ull * 5120ull * 4ull;   /* 40 MiB */
+            void *bout = calloc(1, (size_t)big_bytes);
+            void *bin = calloc(1, (size_t)big_bytes * (world > 2 ? world - 1 : 1));
+            CHECK(bout && bin);
+            for (uint64_t i = 0; i < big_bytes / sizeof(float); i++)
+                ((float *)bout)[i] = value((unsigned)rank, i);
+            /* Warm both paths. */
+            CHECK(ds4_tp_big_gate_exchange(tp, 0, 0xB000u, bout, bin, big_bytes));
+            const double b0 = now();
+            CHECK(ds4_tp_big_gate_exchange(tp, 1, 0xB001u, bout, bin, big_bytes));
+            const double b1 = now();
+            fprintf(stderr,
+                    "rank=%d SP HANDOFF (40 MiB/layer): big_gate(staged) "
+                    "%.3f ms = %.2f GiB/s\n",
+                    rank, (b1 - b0) * 1e3,
+                    (b1 - b0) > 0 ? (double)big_bytes * 2.0 * (world - 1) /
+                        (b1 - b0) / 1073741824.0 : 0.0);
+            free(bout); free(bin);
+        }
+
         fprintf(stderr,
                 "rank=%d DECODE SHAPE (vec=%llu B, %u calls = 1 token): "
                 "gate %.3f ms/token (%.3f ms/call), all_gather %.3f ms/token "
