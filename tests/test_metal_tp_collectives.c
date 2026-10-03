@@ -56,6 +56,34 @@ static void fill_partial(float *out, uint64_t words, uint64_t world,
  * the whole [out, out+bytes) and [in, in+bytes) to sit inside the registered
  * slab; both always do here, which is the point -- the test measures the path
  * production will use. */
+/* Compare fast vs. exact and fail loudly with the first differing bit.  This
+ * mirrors ds4_tp_compare_exact(), which is not exported to the test. */
+static int tp_coll_one_check(const char *what, int rank, const void *fast,
+                             const void *exact, uint64_t bytes) {
+    const uint64_t words = bytes / sizeof(float);
+    const float *a = (const float *)fast;
+    const float *b = (const float *)exact;
+    uint64_t diffs = 0;
+    for (uint64_t i = 0; i < words; i++) {
+        uint32_t ba, bb;
+        memcpy(&ba, &a[i], sizeof(ba));
+        memcpy(&bb, &b[i], sizeof(bb));
+        if (ba == bb) continue;
+        if (diffs == 0)
+            fprintf(stderr,
+                    "rank=%d %s NOT bit-exact at word %llu: fast=%g (%08x) "
+                    "exact=%g (%08x)\n",
+                    rank, what, (unsigned long long)i, a[i], ba, b[i], bb);
+        diffs++;
+    }
+    if (diffs) {
+        fprintf(stderr, "rank=%d %s: %llu/%llu words differ\n", rank, what,
+                (unsigned long long)diffs, (unsigned long long)words);
+        return 0;
+    }
+    return 1;
+}
+
 static void report(const char *what, uint32_t world, unsigned rank,
                    uint64_t shard_bytes, double secs) {
     /* Each rank moves (world-1) shards out and the same in. */
@@ -271,6 +299,54 @@ int main(int argc, char **argv) {
         free(send); free(recv); free(partial); free(rrecv); free(scratch);
     }
     fprintf(stderr, "rank=%d collectives 1..64 MB: exact PASS\n", rank);
+
+    /* --------------------------------------------------------------------
+     * Stage 1: the _EXACT cross-check, over the real RDMA path.  The fast
+     * collectives are graded bit-for-bit against ds4_tp_all_gather_exact() /
+     * ds4_tp_reduce_all_exact(), which use plain blocking TCP with no round
+     * machinery -- so a bookkeeping bug in the fast path cannot hide in both.
+     * Deliberately small: the exact paths move whole tensors over TCP, so this
+     * is validation, never a timing run.  Guarded by DS4_COLL_DEBUG=compare so
+     * an ordinary run keeps the full 64 MiB sweep above.
+     * -------------------------------------------------------------------- */
+    if (getenv("DS4_COLL_DEBUG") &&
+        !strcmp(getenv("DS4_COLL_DEBUG"), "compare")) {
+        const uint64_t checks[] = {64ull * 1024, 4ull << 20};
+        for (unsigned c = 0; c < sizeof(checks) / sizeof(*checks); c++) {
+            const uint64_t shard_bytes = checks[c] / world;
+            const uint64_t words = shard_bytes / sizeof(float);
+            void *send = calloc(1, (size_t)shard_bytes);
+            void *fast = calloc(1, (size_t)shard_bytes * world);
+            void *exact = calloc(1, (size_t)shard_bytes * world);
+            void *rfast = calloc(1, (size_t)shard_bytes);
+            void *scratch = calloc(1, (size_t)shard_bytes * (world - 1));
+            void *partial = calloc(1, (size_t)shard_bytes * world);
+            CHECK(send && fast && exact && rfast && scratch && partial);
+            for (uint64_t i = 0; i < words; i++)
+                ((float *)send)[i] = value((unsigned)rank, i);
+
+            CHECK(ds4_tp_all_gather(tp, 0x9000u + c, send, fast, shard_bytes));
+            CHECK(ds4_tp_all_gather_exact(tp, 0x9100u + c, send, exact,
+                                          shard_bytes));
+            CHECK(tp_coll_one_check("all_gather", rank, fast, exact,
+                                    shard_bytes * world));
+
+            fill_partial((float *)partial, words, world, (unsigned)rank);
+            CHECK(ds4_tp_reduce_scatter(tp, 0x9200u + c, partial, rfast,
+                                        scratch, shard_bytes));
+            CHECK(ds4_tp_reduce_all_exact(tp, 0x9300u + c, partial, exact,
+                                          shard_bytes * world));
+            CHECK(tp_coll_one_check("reduce_scatter", rank, rfast,
+                                    (const uint8_t *)exact +
+                                        (uint64_t)rank * shard_bytes,
+                                    shard_bytes));
+            fprintf(stderr, "rank=%d _EXACT cross-check shard=%llu B: "
+                            "bit-identical\n",
+                    rank, (unsigned long long)shard_bytes);
+            free(send); free(fast); free(exact); free(rfast);
+            free(scratch); free(partial);
+        }
+    }
 
     /* --------------------------------------------------------------------
      * Stage 0: the decode-shape comparison.  A decode token already fires 80

@@ -3965,6 +3965,168 @@ static int tp_coll_exchange(ds4_tp *tp, uint16_t kind, uint32_t seq,
     return 1;
 }
 
+/* ------------------------------------------------------------------------
+ * _EXACT reference and _DEBUG=compare (Pillar B correctness gate).
+ * ------------------------------------------------------------------------
+ *
+ * The plan's method, copied from the reference implementation, is that the fast
+ * path is never trusted on its own: an `_EXACT` mode computes the same result
+ * through a slower, obviously-correct route, and `DS4_COLL_DEBUG=compare` runs
+ * both and reports any differing *bit*.  The bar is bit-identity, not a
+ * tolerance chosen to make a diff pass.
+ *
+ * The oracle here is deliberately a different mechanism rather than a second
+ * copy of the same arithmetic: the exact paths use one plain blocking TCP
+ * write-then-read per link, with no rounds, no RDMA, and no receive-window
+ * bookkeeping.  A bug in the round machinery therefore cannot hide in both.
+ * They are slow (whole tensors cross the wire) and meant for validation runs,
+ * never for timings. */
+
+/* Slow, obviously-correct all-reduce over plain TCP: every rank sends its
+ * whole tensor to every peer, then the rank-ordered sum is written to `recv`.
+ * No collective bookkeeping is involved. */
+int ds4_tp_reduce_all_exact(ds4_tp *tp, uint32_t seq, const void *send,
+                            void *recv, uint64_t bytes) {
+    const int world = tp->world;
+    if (world < 2 || !send || !recv || bytes == 0) return 0;
+    if (bytes % sizeof(float) != 0) return 0;
+    uint8_t *peer = calloc((size_t)(world - 1), (size_t)bytes);
+    if (!peer) return 0;
+    ds4_tp_gate_header h = { DS4_TP_BATCH_MAGIC, 0xE0u, 0xE1u, seq };
+    int slot = 0, ok = 1;
+    for (int m = 0; m < world; m++) {
+        if (m == tp->rank) continue;
+        if (tp->data_fd[m] < 0) { ok = 0; break; }
+        if (!tp_write_full(tp->data_fd[m], &h, sizeof(h))) { ok = 0; break; }
+        ds4_tp_gate_header ph;
+        if (!tp_read_full(tp->data_fd[m], &ph, sizeof(ph)) ||
+            ph.magic != DS4_TP_BATCH_MAGIC || ph.gate != 0xE1u ||
+            ph.seq != seq) {
+            ok = 0;
+            break;
+        }
+        /* Bounded write/read alternation: see ds4_tp_all_gather_exact. */
+        uint8_t *dst = peer + (size_t)slot * bytes;
+        uint64_t off = 0;
+        while (off < bytes) {
+            const uint64_t n = bytes - off > DS4_TP_BIG_CHUNK ?
+                DS4_TP_BIG_CHUNK : bytes - off;
+            if (!tp_write_full(tp->data_fd[m], (const uint8_t *)send + off, n) ||
+                !tp_read_full(tp->data_fd[m], dst + off, n)) {
+                ok = 0;
+                break;
+            }
+            off += n;
+        }
+        if (!ok) break;
+        slot++;
+    }
+    if (ok) {
+        const uint64_t words = bytes / sizeof(float);
+        const float *own = (const float *)send;
+        float *dst = (float *)recv;
+        int s2 = 0, started = 0;
+        for (int i = 0; i < world; i++) {
+            const float *src;
+            if (i == tp->rank) {
+                src = own;
+            } else {
+                src = (const float *)(peer + (size_t)s2 * bytes);
+                s2++;
+            }
+            if (!started) {
+                memcpy(dst, src, (size_t)bytes);
+                started = 1;
+            } else {
+                for (uint64_t k = 0; k < words; k++) dst[k] += src[k];
+            }
+        }
+    }
+    free(peer);
+    return ok;
+}
+
+/* Slow, obviously-correct all-gather over plain TCP: rank r writes its shard to
+ * every peer and reads each peer's shard into the peer's slot.  Each link
+ * carries a header so a desynchronised pair fails loudly, and the header is
+ * read on the receiving side -- writing one and not reading it shifts every
+ * subsequent byte, which is exactly the bug the first version of this had.
+ * The payload alternates write/read in bounded chunks for the same reason the
+ * big-gate TCP fallback does: writing a whole shard per peer before reading
+ * any of them overflows the socket buffers and deadlocks at world 4. */
+int ds4_tp_all_gather_exact(ds4_tp *tp, uint32_t seq, const void *send,
+                            void *recv, uint64_t shard_bytes) {
+    const int world = tp->world, rank = tp->rank;
+    if (world < 2 || !send || !recv || shard_bytes == 0) return 0;
+    ds4_tp_gate_header h = { DS4_TP_BATCH_MAGIC, 0xE2u, 0xE3u, seq };
+    memcpy((uint8_t *)recv + (uint64_t)rank * shard_bytes, send, shard_bytes);
+    for (int m = 0; m < world; m++) {
+        if (m == rank) continue;
+        if (tp->data_fd[m] < 0) return 0;
+        if (!tp_write_full(tp->data_fd[m], &h, sizeof(h))) return 0;
+        ds4_tp_gate_header ph;
+        if (!tp_read_full(tp->data_fd[m], &ph, sizeof(ph)) ||
+            ph.magic != DS4_TP_BATCH_MAGIC || ph.gate != 0xE3u || ph.seq != seq)
+            return 0;
+        uint8_t *dst = (uint8_t *)recv + (uint64_t)m * shard_bytes;
+        uint64_t off = 0;
+        while (off < shard_bytes) {
+            const uint64_t n = shard_bytes - off > DS4_TP_BIG_CHUNK ?
+                DS4_TP_BIG_CHUNK : shard_bytes - off;
+            if (!tp_write_full(tp->data_fd[m], (const uint8_t *)send + off, n) ||
+                !tp_read_full(tp->data_fd[m], dst + off, n))
+                return 0;
+            off += n;
+        }
+    }
+    return 1;
+}
+
+/* Compare two float buffers bit-for-bit.  Returns the number of differing
+ * words (0 = identical), and fills `err` with the first difference. */
+uint64_t ds4_tp_compare_exact(const float *a, const float *b, uint64_t words,
+                              char *err, size_t errlen) {
+    uint64_t diffs = 0;
+    for (uint64_t i = 0; i < words; i++) {
+        uint32_t ba, bb;
+        memcpy(&ba, &a[i], sizeof(ba));
+        memcpy(&bb, &b[i], sizeof(bb));
+        if (ba == bb) continue;
+        if (diffs == 0 && err && errlen)
+            snprintf(err, errlen,
+                     "first differing bit at word %llu: fast=%g (%08x) "
+                     "exact=%g (%08x)",
+                     (unsigned long long)i, a[i], ba, b[i], bb);
+        diffs++;
+    }
+    return diffs;
+}
+
+static int tp_coll_compare_mode(void) {
+    const char *v = getenv("DS4_COLL_DEBUG");
+    return v && !strcmp(v, "compare");
+}
+
+/* Grade one fast result against the exact path's.  Returns 0 on any difference
+ * -- the bar is bit-identity, not a tolerance chosen to make a diff pass. */
+static int tp_coll_check(const char *what, int rank, const void *fast,
+                         const void *exact, uint64_t bytes) {
+    char diff[256] = "";
+    const uint64_t words = bytes / sizeof(float);
+    const uint64_t n = ds4_tp_compare_exact((const float *)fast,
+                                            (const float *)exact, words,
+                                            diff, sizeof(diff));
+    if (n) {
+        fprintf(stderr,
+                "ds4-tp: %s NOT bit-exact on rank %d: %llu/%llu words "
+                "differ; %s\n",
+                what, rank, (unsigned long long)n, (unsigned long long)words,
+                diff);
+        return 0;
+    }
+    return 1;
+}
+
 int ds4_tp_all_gather(ds4_tp *tp, uint32_t seq, const void *send,
                       void *recv, uint64_t shard_bytes) {
     const int world = tp->world;
@@ -3979,7 +4141,23 @@ int ds4_tp_all_gather(ds4_tp *tp, uint32_t seq, const void *send,
         r[m] = (uint8_t *)recv + (uint64_t)m * shard_bytes;
     }
     memcpy((uint8_t *)recv + (uint64_t)rank * shard_bytes, send, shard_bytes);
-    return tp_coll_exchange(tp, DS4_TP_COLL_ALL_GATHER, seq, s, r, shard_bytes);
+    if (!tp_coll_exchange(tp, DS4_TP_COLL_ALL_GATHER, seq, s, r, shard_bytes))
+        return 0;
+    /* DS4_COLL_DEBUG=compare: cross-check against the exact path.  The two
+     * share no round machinery, so a bookkeeping bug cannot hide in both.
+     * Slow by construction -- it ships whole tensors, not shards -- so this is
+     * a validation mode, never a timed one. */
+    if (tp_coll_compare_mode()) {
+        float *exact = calloc(1, (size_t)shard_bytes * world);
+        if (!exact) return 0;
+        const int ok = ds4_tp_all_gather_exact(tp, seq + 0x10000u, send, exact,
+                                               shard_bytes) &&
+            tp_coll_check("all_gather", rank, recv, exact,
+                          shard_bytes * world);
+        free(exact);
+        if (!ok) return 0;
+    }
+    return 1;
 }
 
 int ds4_tp_reduce_scatter(ds4_tp *tp, uint32_t seq, const void *send,
@@ -4028,6 +4206,22 @@ int ds4_tp_reduce_scatter(ds4_tp *tp, uint32_t seq, const void *send,
         } else {
             for (uint64_t k = 0; k < words; k++) dst[k] += src[k];
         }
+    }
+    /* DS4_COLL_DEBUG=compare: the expected result is this rank's shard of the
+     * rank-ordered element sum, which is what an all-reduce would produce for
+     * this shard.  A second all-reduce over the whole tensor is a different
+     * route to the same bytes, so a sharding bug cannot satisfy both. */
+    if (tp_coll_compare_mode()) {
+        float *exact = calloc(1, (size_t)shard_bytes * world);
+        if (!exact) return 0;
+        const int ok = ds4_tp_reduce_all_exact(tp, seq + 0x10000u, send, exact,
+                                               shard_bytes * world) &&
+            tp_coll_check("reduce_scatter", rank, recv,
+                          (const uint8_t *)exact +
+                              (uint64_t)rank * shard_bytes,
+                          shard_bytes);
+        free(exact);
+        if (!ok) return 0;
     }
     return 1;
 }

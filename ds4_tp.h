@@ -256,6 +256,28 @@ int ds4_tp_all_gather(ds4_tp *tp, uint32_t seq, const void *send,
 int ds4_tp_reduce_scatter(ds4_tp *tp, uint32_t seq, const void *send,
                           void *recv, void *scratch, uint64_t shard_bytes);
 
+/* `_EXACT` reference implementations of the same collectives, for grading the
+ * fast path rather than replacing it.  They use one plain blocking TCP
+ * write-then-read per link with no rounds, no RDMA and no receive-window
+ * bookkeeping, so a bug in the fast path's round machinery cannot hide in
+ * both.  Slow by construction (whole tensors cross the wire): never time them.
+ *
+ *   ds4_tp_reduce_all_exact  element-wise sum over every rank of `send`
+ *                            (bytes elements) -> `recv`, in rank order.
+ *   ds4_tp_all_gather_exact  rank-ordered concatenation -> `recv`.
+ *
+ * `ds4_tp_compare_exact` reports how many words differ, and names the first
+ * difference; 0 means bit-identical.  Setting DS4_COLL_DEBUG=compare makes the
+ * fast collectives run the corresponding exact path and fail (returning 0) on
+ * any differing bit -- including at the one call site that matters, so the
+ * wiring above them is validated end to end, not just in a unit test. */
+int ds4_tp_reduce_all_exact(ds4_tp *tp, uint32_t seq, const void *send,
+                            void *recv, uint64_t bytes);
+int ds4_tp_all_gather_exact(ds4_tp *tp, uint32_t seq, const void *send,
+                            void *recv, uint64_t shard_bytes);
+uint64_t ds4_tp_compare_exact(const float *a, const float *b, uint64_t words,
+                              char *err, size_t errlen);
+
 /* Lockstep mirroring (leader side) and worker loop primitives. */
 typedef struct {
     uint64_t session_id;
