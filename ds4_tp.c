@@ -2207,6 +2207,8 @@ static int tp_rdma_bulk_peer_finish(ds4_tp *tp, tp_rdma_bulk_peer *st) {
     return 1;
 }
 
+
+
 static void tp_rdma_close(ds4_tp *tp) {
     ds4_tp_verbs_api *api = &tp->rdma_api;
     for (int m = 0; m < DS4_TP_MAX_WORLD; m++) {
@@ -3638,6 +3640,400 @@ int ds4_tp_big_gate_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
     if (tp->world > 2) tp_big_combine(tp, out, in, bytes);
     return 1;
 }
+
+/* ------------------------------------------------------------------------
+ * Sequence-parallel collectives: direct all-gather and reduce-scatter.
+ * ------------------------------------------------------------------------
+ *
+ * Both ride the per-peer RDMA bulk path -- one private QP per link, every peer
+ * in flight concurrently, no ring hops -- and the same 2 MB symmetric
+ * write/read rounds over TCP as the big gate.
+ *
+ *   all-gather      rank r ships its shard to every peer; peer m's copy lands
+ *                   in slot m, producing the rank-ordered concatenation.
+ *   reduce-scatter  rank r ships the slice each peer needs from it (offset
+ *                   m*shard_bytes for peer m) and keeps peer m's slice for
+ *                   its own shard.  Payload per link is one shard, not the
+ *                   whole tensor.
+ *
+ * Ordering, and why it is explicit.  AppleThunderboltRDMA exposes UC queue
+ * pairs only, and UC does not retransmit: a SEND that arrives before its
+ * matching receive is posted is dropped with no completion, which surfaces as
+ * "timeout waiting for bulk RDMA round (0/1 recvs, send=1)".  The ring bulk
+ * path guards this with a per-round ready handshake on the data sockets; on
+ * the direct mesh the equivalent guarantee is a per-round header barrier on
+ * every link: post the round's receives everywhere, cross the barrier, then
+ * send.  A rank writes its header only after its receives are up, so once a
+ * rank has read every peer's header, every peer is listening.
+ *
+ * The header also carries the collective kind in `layer` and `gate`, so a
+ * mismatched pair fails with a named desync instead of mixing payloads.  TCP
+ * needs none of this (reliable stream) but takes the identical path so the two
+ * transports stay in lockstep and a TCP run is a valid correctness oracle for
+ * the RDMA one.
+ */
+
+/* Distinguish the collectives on the wire, clear of the batch gate's `rows`
+ * and the big gate's 0xB16u. */
+#define DS4_TP_COLL_ALL_GATHER     0xC01u
+#define DS4_TP_COLL_REDUCE_SCATTER 0xC02u
+
+static const char *tp_collective_name(uint16_t gate) {
+    switch (gate) {
+    case DS4_TP_COLL_ALL_GATHER: return "all_gather";
+    case DS4_TP_COLL_REDUCE_SCATTER: return "reduce_scatter";
+    default: return "collective";
+    }
+}
+
+/* ------------------------------------------------------------------------
+ * Direct (per-peer) bulk round: receive-then-send with an explicit barrier.
+ * ------------------------------------------------------------------------
+ * These are separate from tp_rdma_bulk_peer_post()/finish() so the proven big
+ * gate keeps its exact behaviour; the difference is that a collective posts
+ * every link's receives before it sends on any link, and does so per round. */
+
+/* Post one round of receives for this peer, at byte offset `off` in the
+ * caller's `in`.  Returns 1 on success. */
+static int tp_rdma_round_recv(ds4_tp *tp, tp_rdma_bulk_peer *st,
+                              uint64_t off, uint64_t bytes) {
+    ds4_tp_rdma_link *r = &tp->rdma[st->peer];
+    /* st->direct is set once in tp_rdma_bulk_peer_init and requires *both*
+     * out and in to sit in the registered slab; recomputing it per side could
+     * let recv stage while send goes direct, which would misplace bytes. */
+    const int direct = st->direct;
+    /* One round is at most BULK_SLOTS x 16 KB; the caller sizes rounds so this
+     * holds, and chaining beyond the queue depth would be rejected anyway. */
+    uint32_t chunks = (uint32_t)((bytes + DS4_TP_RDMA_MAX_MSG - 1u) /
+                                 DS4_TP_RDMA_MAX_MSG);
+    if (chunks == 0 || chunks > DS4_TP_RDMA_BULK_SLOTS) return 0;
+    uint8_t *stage_recv = tp->slab + st->stage_recv_off;
+    struct ibv_sge sge[DS4_TP_RDMA_BULK_SLOTS];
+    struct ibv_recv_wr wr[DS4_TP_RDMA_BULK_SLOTS];
+    memset(wr, 0, sizeof(wr));
+    uint64_t done = 0;
+    for (uint32_t i = 0; i < chunks; i++) {
+        const uint64_t left = bytes - done;
+        const uint32_t len = (uint32_t)(left > DS4_TP_RDMA_MAX_MSG ?
+                                        DS4_TP_RDMA_MAX_MSG : left);
+        sge[i] = (struct ibv_sge) {
+            .addr = direct ?
+                (uintptr_t)((uint8_t *)st->in + off + done) :
+                (uintptr_t)(stage_recv + (uint64_t)i * DS4_TP_RDMA_MAX_MSG),
+            .length = len,
+            .lkey = r->mr->lkey,
+        };
+        wr[i].wr_id = DS4_TP_RDMA_BULK_WR_TAG | ((uint64_t)i + 1u);
+        wr[i].sg_list = &sge[i];
+        wr[i].num_sge = 1;
+        wr[i].next = i + 1u < chunks ? &wr[i + 1u] : NULL;
+        done += len;
+    }
+    struct ibv_recv_wr *bad = NULL;
+    if (ibv_post_recv(r->qp, wr, &bad) != 0) {
+        fprintf(stderr, "ds4-tp: collective post_recv (peer %d): %s\n",
+                st->peer, strerror(errno));
+        return 0;
+    }
+    return 1;
+}
+
+/* Post one round of sends for this peer, at byte offset `off` in `out`.
+ * Returns without waiting, so the caller can get every link's send in flight
+ * before polling any of them (the three links are independent QPs, and
+ * serialising send+wait per peer would leave two links idle). */
+static int tp_rdma_round_send(ds4_tp *tp, tp_rdma_bulk_peer *st,
+                              uint64_t off, uint64_t bytes) {
+    ds4_tp_rdma_link *r = &tp->rdma[st->peer];
+    const int direct = st->direct;
+    uint32_t chunks = (uint32_t)((bytes + DS4_TP_RDMA_MAX_MSG - 1u) /
+                                 DS4_TP_RDMA_MAX_MSG);
+    if (chunks == 0 || chunks > DS4_TP_RDMA_BULK_SLOTS) return 0;
+    uint8_t *stage_send = tp->slab + st->stage_send_off;
+    struct ibv_sge sge[DS4_TP_RDMA_BULK_SLOTS];
+    struct ibv_send_wr wr[DS4_TP_RDMA_BULK_SLOTS];
+    memset(wr, 0, sizeof(wr));
+    uint64_t done = 0;
+    for (uint32_t i = 0; i < chunks; i++) {
+        const uint64_t left = bytes - done;
+        const uint32_t len = (uint32_t)(left > DS4_TP_RDMA_MAX_MSG ?
+                                        DS4_TP_RDMA_MAX_MSG : left);
+        uint64_t addr;
+        if (direct) {
+            addr = (uintptr_t)((const uint8_t *)st->out + off + done);
+        } else {
+            uint8_t *dst = stage_send + (uint64_t)i * DS4_TP_RDMA_MAX_MSG;
+            memcpy(dst, (const uint8_t *)st->out + off + done, len);
+            addr = (uintptr_t)dst;
+        }
+        sge[i] = (struct ibv_sge) {.addr = addr, .length = len,
+                                   .lkey = r->mr->lkey};
+        wr[i].wr_id = DS4_TP_RDMA_BULK_WR_TAG | ((uint64_t)i + 1u);
+        wr[i].sg_list = &sge[i];
+        wr[i].num_sge = 1;
+        wr[i].opcode = IBV_WR_SEND;
+        wr[i].send_flags = i + 1u == chunks ? IBV_SEND_SIGNALED : 0;
+        wr[i].next = i + 1u < chunks ? &wr[i + 1u] : NULL;
+        done += len;
+    }
+    atomic_thread_fence(memory_order_release);
+    struct ibv_send_wr *bad = NULL;
+    if (ibv_post_send(r->qp, wr, &bad) != 0) {
+        fprintf(stderr, "ds4-tp: collective post_send (peer %d): %s\n",
+                st->peer, strerror(errno));
+        return 0;
+    }
+    return 1;
+}
+
+/* Poll until this peer's round has fully landed, then (on the non-direct
+ * path) copy the staged bytes into place.  Pairs with tp_rdma_round_send. */
+static int tp_rdma_round_wait(ds4_tp *tp, tp_rdma_bulk_peer *st,
+                              uint64_t off, uint64_t bytes, int direct,
+                              uint32_t chunks) {
+    ds4_tp_rdma_link *r = &tp->rdma[st->peer];
+    uint32_t recv_done = 0;
+    int send_done = 0;
+    const double deadline = tp_now_sec() + (double)tp->timeout_sec;
+    uint32_t peer_poll = 0;
+    while (recv_done < chunks || !send_done) {
+        struct ibv_wc wc[DS4_TP_RDMA_BULK_SLOTS + 1u];
+        int n = ibv_poll_cq(r->cq, (int)(DS4_TP_RDMA_BULK_SLOTS + 1u), wc);
+        if (n < 0) return 0;
+        for (int i = 0; i < n; i++) {
+            if (wc[i].status != IBV_WC_SUCCESS) {
+                fprintf(stderr, "ds4-tp: collective completion error: %s\n",
+                        tp_wc_status_str(wc[i].status));
+                return 0;
+            }
+            if ((wc[i].wr_id & DS4_TP_RDMA_BULK_WR_TAG) == 0) {
+                if (wc[i].opcode & IBV_WC_RECV) {
+                    if (wc[i].wr_id > r->recv_done) r->recv_done = wc[i].wr_id;
+                } else if (r->send_outstanding > 0) {
+                    r->send_outstanding--;
+                }
+                continue;
+            }
+            if (wc[i].opcode & IBV_WC_RECV) recv_done++;
+            else send_done = 1;
+        }
+        if ((peer_poll++ & 0x3fffu) == 0 && tp_peer_closed(tp, st->peer)) {
+            fprintf(stderr,
+                    "ds4-tp: peer %d disconnected during collective\n",
+                    st->peer);
+            return 0;
+        }
+        if (tp_now_sec() > deadline) {
+            fprintf(stderr,
+                    "ds4-tp: timeout in collective round with peer %d "
+                    "(%u/%u recvs, send=%d, off=%llu/%llu)\n",
+                    st->peer, recv_done, chunks, send_done,
+                    (unsigned long long)off, (unsigned long long)st->bytes);
+            return 0;
+        }
+    }
+    if (!direct) {
+        uint64_t placed = 0;
+        for (uint32_t i = 0; i < chunks; i++) {
+            const uint64_t left = bytes - placed;
+            const uint32_t len = (uint32_t)(left > DS4_TP_RDMA_MAX_MSG ?
+                                            DS4_TP_RDMA_MAX_MSG : left);
+            memcpy((uint8_t *)st->in + off + placed,
+                   tp->slab + st->stage_recv_off +
+                       (uint64_t)i * DS4_TP_RDMA_MAX_MSG, len);
+            placed += len;
+        }
+    }
+    return 1;
+}
+
+/* Exchange `shard_bytes` on every link, one round at a time, with a per-round
+ * header barrier.  send[i]/recv[i] are the per-peer slice base pointers. */
+static int tp_coll_exchange(ds4_tp *tp, uint16_t kind, uint32_t seq,
+                            const void *const *send, void *const *recv,
+                            uint64_t shard_bytes) {
+    const int rank = tp->rank;
+    const int world = tp->world;
+    if (world < 2 || !send || !recv || shard_bytes == 0) return 0;
+    if (shard_bytes % sizeof(float) != 0) {
+        fprintf(stderr, "ds4-tp: %s payload %llu is not a float multiple\n",
+                tp_collective_name(kind), (unsigned long long)shard_bytes);
+        return 0;
+    }
+
+    tp_rdma_bulk_peer st[DS4_TP_MAX_WORLD];
+    uint32_t n = 0;
+#ifdef DS4_TP_HAVE_VERBS
+    if (tp->rdma_active) {
+        for (int m = 0; m < world; m++) {
+            if (m == rank) continue;
+            if (tp->data_fd[m] < 0) return 0;
+            if (!tp_rdma_drain_decode_window(tp, m)) return 0;
+            if (!tp_rdma_bulk_peer_init(tp, &st[n], m, send[m], recv[m],
+                                        shard_bytes))
+                return 0;
+            n++;
+        }
+    }
+#endif
+
+    /* One round per BULK_SLOTS x MAX_MSG, so each post fits the send/recv
+     * queue depth (MAX_INFLIGHT is 1: the driver rejects deeper queues). */
+    const uint64_t ROUND = (uint64_t)DS4_TP_RDMA_BULK_SLOTS * DS4_TP_RDMA_MAX_MSG;
+    const uint64_t rounds = (shard_bytes + ROUND - 1u) / ROUND;
+    for (uint64_t round = 0; round < rounds; round++) {
+        const uint64_t off = round * ROUND;
+        const uint64_t left = shard_bytes - off;
+        const uint64_t bytes = left > ROUND ? ROUND : left;
+        /* 1. Receives on every link, before any send on any link. */
+#ifdef DS4_TP_HAVE_VERBS
+        if (tp->rdma_active) {
+            for (uint32_t i = 0; i < n; i++) {
+                if (!tp_rdma_round_recv(tp, &st[i], off, bytes)) return 0;
+            }
+        }
+#endif
+        /* 2. Barrier: announce listening, wait for every peer's announcement.
+         * The header carries the round in `gate` so a peer that is a round
+         * ahead (or behind) is named rather than silently matched. */
+        ds4_tp_gate_header h = { DS4_TP_BATCH_MAGIC, (uint16_t)kind,
+                                 (uint16_t)(kind + (uint16_t)round), seq };
+        /* Write to every peer first, then read from every peer: the links are
+         * independent, and a peer writes only after its receives are posted,
+         * so a single write-then-read pass is a real all-to-all barrier.  Doing
+         * it one peer at a time would serialise world-1 round trips and set the
+         * per-call floor (~0.28 ms measured), which is most of a decode-sized
+         * collective. */
+        for (int m = 0; m < world; m++) {
+            if (m == rank) continue;
+            if (tp->data_fd[m] < 0) return 0;
+            if (!tp_write_full(tp->data_fd[m], &h, sizeof(h))) return 0;
+        }
+        for (int m = 0; m < world; m++) {
+            if (m == rank) continue;
+            ds4_tp_gate_header ph;
+            if (!tp_read_full(tp->data_fd[m], &ph, sizeof(ph))) return 0;
+            if (ph.magic != DS4_TP_BATCH_MAGIC || ph.layer != (uint16_t)kind ||
+                ph.gate != (uint16_t)(kind + (uint16_t)round) || ph.seq != seq) {
+                fprintf(stderr,
+                        "ds4-tp: %s desync with peer %d in round %llu: got "
+                        "l=%u tag=%x seq=%llu, want l=%u tag=%x seq=%llu\n",
+                        tp_collective_name(kind), m,
+                        (unsigned long long)round, ph.layer, ph.gate,
+                        (unsigned long long)ph.seq, (unsigned)kind,
+                        (unsigned)(kind + (uint16_t)round),
+                        (unsigned long long)seq);
+                return 0;
+            }
+        }
+
+        /* 3. Get every link's send in flight, then wait for them all.  The
+         * links are independent QPs, so serialising send-then-wait per peer
+         * would leave the other two idle and cut throughput. */
+#ifdef DS4_TP_HAVE_VERBS
+        if (tp->rdma_active) {
+            uint32_t chunks = (uint32_t)((bytes + DS4_TP_RDMA_MAX_MSG - 1u) /
+                                         DS4_TP_RDMA_MAX_MSG);
+            for (uint32_t i = 0; i < n; i++) {
+                if (!tp_rdma_round_send(tp, &st[i], off, bytes)) return 0;
+            }
+            for (uint32_t i = 0; i < n; i++) {
+                if (!tp_rdma_round_wait(tp, &st[i], off, bytes,
+                                        st[i].direct, chunks))
+                    return 0;
+            }
+            continue;
+        }
+#endif
+
+        for (int m = 0; m < world; m++) {
+            if (m == rank) continue;
+            uint64_t sent = 0;
+            while (sent < bytes) {
+                const uint64_t chunk = bytes - sent > DS4_TP_BIG_CHUNK ?
+                    DS4_TP_BIG_CHUNK : bytes - sent;
+                if (!tp_write_full(tp->data_fd[m],
+                                   (const uint8_t *)send[m] + off + sent, chunk))
+                    return 0;
+                if (!tp_read_full(tp->data_fd[m],
+                                  (uint8_t *)recv[m] + off + sent, chunk))
+                    return 0;
+                sent += chunk;
+            }
+        }
+    }
+    return 1;
+}
+
+int ds4_tp_all_gather(ds4_tp *tp, uint32_t seq, const void *send,
+                      void *recv, uint64_t shard_bytes) {
+    const int world = tp->world;
+    const int rank = tp->rank;
+    const void *s[DS4_TP_MAX_WORLD];
+    void *r[DS4_TP_MAX_WORLD];
+    /* Every rank ships the same shard (offset 0) to each peer, and peer m's
+     * copy lands in slot m: the rank-ordered concatenation.  This rank's own
+     * slot is filled locally so the buffer is complete without a self-send. */
+    for (int m = 0; m < world; m++) {
+        s[m] = send;
+        r[m] = (uint8_t *)recv + (uint64_t)m * shard_bytes;
+    }
+    memcpy((uint8_t *)recv + (uint64_t)rank * shard_bytes, send, shard_bytes);
+    return tp_coll_exchange(tp, DS4_TP_COLL_ALL_GATHER, seq, s, r, shard_bytes);
+}
+
+int ds4_tp_reduce_scatter(ds4_tp *tp, uint32_t seq, const void *send,
+                          void *recv, void *scratch, uint64_t shard_bytes) {
+    const int world = tp->world;
+    const int rank = tp->rank;
+    if (!send || !recv || !scratch) return 0;
+    const void *s[DS4_TP_MAX_WORLD];
+    void *r[DS4_TP_MAX_WORLD];
+    /* Peer m needs this rank's slice m; it lands in scratch slot m unless the
+     * peer is this rank, whose own slice is the fold accumulator in `recv`. */
+    int slot = 0;
+    for (int m = 0; m < world; m++) {
+        s[m] = (const uint8_t *)send + (uint64_t)m * shard_bytes;
+        if (m == rank) {
+            r[m] = recv;
+        } else {
+            r[m] = (uint8_t *)scratch + (uint64_t)slot * shard_bytes;
+            slot++;
+        }
+    }
+    if (!tp_coll_exchange(tp, DS4_TP_COLL_REDUCE_SCATTER, seq, s, r,
+                          shard_bytes))
+        return 0;
+    /* Canonical rank-order sum on every rank: shard[0] + ... + shard[world-1],
+     * where shard[i] is this rank's own slice when i == rank and peer i's
+     * scratch slot otherwise.  Identical expression everywhere => bit-exact. */
+    const uint64_t words = shard_bytes / sizeof(float);
+    const float *own = (const float *)((const uint8_t *)send +
+                                       (uint64_t)rank * shard_bytes);
+    float *dst = (float *)recv;
+    int slot2 = 0;
+    int started = 0;
+    for (int i = 0; i < world; i++) {
+        const float *src;
+        if (i == rank) {
+            src = own;
+        } else {
+            src = (const float *)((uint8_t *)scratch +
+                                  (uint64_t)slot2 * shard_bytes);
+            slot2++;
+        }
+        if (!started) {
+            memcpy(dst, src, (size_t)shard_bytes);
+            started = 1;
+        } else {
+            for (uint64_t k = 0; k < words; k++) dst[k] += src[k];
+        }
+    }
+    return 1;
+}
+
+
+
 
 /* ------------------------------------------------------------------------
  * Lockstep control plane.

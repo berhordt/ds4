@@ -77,14 +77,14 @@ int main(int argc, char **argv) {
     int rc = 1;
     CHECK(ds4_gpu_init());
     CHECK(ds4_tp_create(&tp, &opt, &id, err, sizeof(err)));
-    slab = ds4_gpu_tensor_alloc(ds4_tp_slab_bytes(40, 5120));
+    slab = ds4_gpu_tensor_alloc(ds4_tp_slab_bytes(40, 5120, 2));
     x = ds4_gpu_tensor_alloc(size);
     out = ds4_gpu_tensor_alloc(size);
     in = ds4_gpu_tensor_alloc(size);
     CHECK(slab && x && out && in);
-    memset(ds4_gpu_tensor_contents(slab), 0, ds4_tp_slab_bytes(40, 5120));
+    memset(ds4_gpu_tensor_contents(slab), 0, ds4_tp_slab_bytes(40, 5120, 2));
     CHECK(ds4_tp_attach_slab(tp, ds4_gpu_tensor_contents(slab), err, sizeof(err)));
-    CHECK(ds4_gpu_tp_init(rank, slab, ds4_tp_slab_gpu_flags_offset(tp),
+    CHECK(ds4_gpu_tp_init(rank, 2, slab, ds4_tp_slab_gpu_flags_offset(tp),
         ds4_tp_slab_out_offset(tp, 0, 0), vec, exchange, tp));
     ds4_gpu_tp_set_big_exchange(exchange_big);
     ds4_gpu_tp_set_batch_exchange(exchange_batch);

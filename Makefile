@@ -898,11 +898,27 @@ tests/test_tp_link.o: tests/test_tp_link.c ds4_tp.h ds4.h
 tests/test_tp_link: tests/test_tp_link.o $(CPU_CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
+tests/test_metal_tp_collectives.o: tests/test_metal_tp_collectives.c ds4_tp.h ds4.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -I. -c -o $@ $<
+
+tests/test_metal_tp_collectives: tests/test_metal_tp_collectives.o $(CPU_CORE_OBJS)
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -o $@ $^ $(LDLIBS)
+
 tests/test_tp_tcp.o: tests/test_tp_tcp.c ds4_tp.c ds4_tp.h ds4.h ds4_gpu_tp.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
 
+tests/test_tp_collectives.o: tests/test_tp_collectives.c ds4_tp.c ds4_tp.h ds4.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_tp_collectives: tests/test_tp_collectives.o $(filter-out ds4_tp.o,$(CPU_CORE_OBJS))
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
 tests/test_tp_tcp: tests/test_tp_tcp.o $(filter-out ds4_tp.o,$(CPU_CORE_OBJS))
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+.PHONY: test-tp-collectives
+test-tp-collectives: tests/test_tp_collectives
+	./tests/test_tp_collectives
 
 .PHONY: test-session-state
 test-session-state: tests/test_session_state tests/test_tp_commands tests/test_tp_rdma tests/test_tp_tcp
@@ -1095,6 +1111,7 @@ clean:
 	rm -f tests/test_ssd_cache tests/test_engram
 	rm -f tests/test_session_state tests/test_session_state_gpu tests/test_tp_commands
 	rm -f tests/test_tp_rdma tests/test_tp_link tests/test_tp_tcp
+	rm -f tests/test_tp_collectives tests/test_metal_tp_collectives tests/test_metal_tp_bulk
 	rm -f tests/test_metal_tp_spec
 	rm -f tests/test_metal_tp_cancel
 	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_metal_moe_prefill tests/test_qwen4_moe_mm_specialize tests/test_qwen4_conv_parallel tests/test_q8_prefill_variants tests/test_metal_dense_mpp tests/test_glm53_kda tests/test_glm53_kda_rocm tests/test_glm53_vision_engine tests/test_glm53_vision_prompt tests/test_deepseek4_vision_image tests/test_prompt_prefix tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o

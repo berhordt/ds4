@@ -224,6 +224,38 @@ int ds4_tp_batch_block_end(ds4_tp *tp);
 int ds4_tp_big_gate_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
                              const void *out, void *in, uint64_t bytes);
 
+/* Sequence-parallel collectives (Pillar B / T2).  Direct all-gather /
+ * reduce-scatter over the mesh on the per-peer bulk path: no ring hops and
+ * none of the ring's per-round ready/done handshakes, all peers in flight at
+ * once.  This is the primitive Pillar B needs before any sequence-parallel
+ * re-wiring; validate it with tests/test_metal_tp_collectives at 1..64 MB
+ * first (tests/test_tp_collectives covers the same logic locally, no cluster).
+ *
+ * `shard_bytes` is the size of one rank's share, and must be a multiple of
+ * sizeof(float) so the folds are bit-exact.
+ *
+ *   ds4_tp_all_gather:      `send` is this rank's shard (shard_bytes);
+ *                           `recv` receives the rank-ordered concatenation
+ *                           (world * shard_bytes).  `send` must not overlap
+ *                           `recv`.
+ *   ds4_tp_reduce_scatter:  `send` is this rank's full partial
+ *                           (world * shard_bytes); `recv` receives the
+ *                           element-wise sum of every rank's partial but only
+ *                           this rank's own shard of it (shard_bytes);
+ *                           `scratch` holds the peers' shards
+ *                           ((world-1) * shard_bytes) and must not overlap
+ *                           `send` or `recv`.
+ *
+ * Both are rank-order consistent: reduce-scatter accumulates peers in rank
+ * order, so every rank computes the identical FP sum -- the property an
+ * _EXACT mode needs to keep stock numerics.  On the RDMA path, place the
+ * buffers in the registered slab for the direct (zero-copy) transfer;
+ * otherwise the peer driver stages them through its 2 MB bounce buffers. */
+int ds4_tp_all_gather(ds4_tp *tp, uint32_t seq, const void *send,
+                      void *recv, uint64_t shard_bytes);
+int ds4_tp_reduce_scatter(ds4_tp *tp, uint32_t seq, const void *send,
+                          void *recv, void *scratch, uint64_t shard_bytes);
+
 /* Lockstep mirroring (leader side) and worker loop primitives. */
 typedef struct {
     uint64_t session_id;
