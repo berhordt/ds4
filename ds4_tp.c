@@ -4226,6 +4226,35 @@ int ds4_tp_reduce_scatter(ds4_tp *tp, uint32_t seq, const void *send,
     return 1;
 }
 
+/* All-reduce, decomposed as reduce-scatter + all-gather.
+ *
+ * This is the primitive Pillar B actually needs, and it is not the same thing
+ * as the existing big gate.  The big gate has every rank send its *whole*
+ * tensor to every peer and sums the copies: traffic is O(world^2 * bytes) and
+ * every rank ships world-1 full tensors.  The decomposition moves O(bytes)
+ * instead -- each rank ships one shard, and the summed tensor is assembled
+ * from the shards -- so at world 4 it is a 4x traffic reduction, and it rides
+ * the direct per-peer path rather than the bounce-staged one.
+ *
+ * `scratch` must hold (world-1) * shard_bytes for the reduce-scatter stage.
+ * `tmp` must hold the full tensor (world * shard_bytes) for the summed shards,
+ * and may not overlap `recv`.  Both stages are the measured fast collectives,
+ * so this inherits their properties: rank-ordered accumulation, bit-identical
+ * on every rank, and gradable with DS4_COLL_DEBUG=compare. */
+int ds4_tp_all_reduce(ds4_tp *tp, uint32_t seq, const void *send, void *recv,
+                      void *tmp, void *scratch, uint64_t shard_bytes) {
+    const int world = tp->world;
+    if (world < 2 || !send || !recv || !tmp || !scratch || shard_bytes == 0)
+        return 0;
+    if (!ds4_tp_reduce_scatter(tp, seq, send, tmp, scratch, shard_bytes))
+        return 0;
+    /* ds4_tp_reduce_scatter leaves this rank's summed shard at offset 0 of its
+     * `recv`, not at rank*shard_bytes -- it returns one shard, not a full
+     * tensor.  Every rank then ships that one summed shard, and the
+     * rank-ordered concatenation completed by the all-gather is the full sum. */
+    return ds4_tp_all_gather(tp, seq + 1u, tmp, recv, shard_bytes);
+}
+
 
 
 

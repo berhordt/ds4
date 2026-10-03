@@ -256,6 +256,15 @@ int ds4_tp_all_gather(ds4_tp *tp, uint32_t seq, const void *send,
 int ds4_tp_reduce_scatter(ds4_tp *tp, uint32_t seq, const void *send,
                           void *recv, void *scratch, uint64_t shard_bytes);
 
+/* All-reduce as reduce-scatter + all-gather.  The stock big gate ships every
+ * rank's *whole* tensor to every peer (O(world^2) traffic, bounce-staged); this
+ * moves O(bytes) on the direct path, which at world 4 is a 4x traffic cut.  It
+ * is the primitive Pillar B needs.  `tmp` holds the full tensor of summed
+ * shards (world * shard_bytes) and must not overlap `recv`; `scratch` holds
+ * (world-1) * shard_bytes. */
+int ds4_tp_all_reduce(ds4_tp *tp, uint32_t seq, const void *send, void *recv,
+                      void *tmp, void *scratch, uint64_t shard_bytes);
+
 /* `_EXACT` reference implementations of the same collectives, for grading the
  * fast path rather than replacing it.  They use one plain blocking TCP
  * write-then-read per link with no rounds, no RDMA and no receive-window

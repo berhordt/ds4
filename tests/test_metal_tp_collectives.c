@@ -416,6 +416,37 @@ int main(int argc, char **argv) {
                     rank, (b1 - b0) * 1e3,
                     (b1 - b0) > 0 ? (double)big_bytes * 2.0 * (world - 1) /
                         (b1 - b0) / 1073741824.0 : 0.0);
+
+            /* The all-reduce Pillar B would use: reduce-scatter + all-gather,
+             * O(bytes) traffic on the direct path instead of the big gate's
+             * O(world^2) staged copy.  Correctness first: it must equal what an
+             * all-reduce means -- the rank-ordered element sum -- and the fast
+             * big gate above is the independent check. */
+            void *ar_recv = calloc(1, (size_t)big_bytes);
+            void *ar_tmp = calloc(1, (size_t)big_bytes);
+            void *ar_scratch = calloc(1, (size_t)big_bytes);
+            void *ar_exact = calloc(1, (size_t)big_bytes);
+            CHECK(ar_recv && ar_tmp && ar_scratch && ar_exact);
+            const uint64_t shard_b = big_bytes / world;
+            CHECK(ds4_tp_all_reduce(tp, 0xB100u, bout, ar_recv, ar_tmp,
+                                    ar_scratch, shard_b));
+            /* Reference: the slow exact all-reduce over the same inputs. */
+            CHECK(ds4_tp_reduce_all_exact(tp, 0xB200u, bout, ar_exact,
+                                          big_bytes));
+            CHECK(tp_coll_one_check("all_reduce", rank, ar_recv, ar_exact,
+                                    big_bytes));
+            const double r0 = now();
+            for (int rep = 0; rep < 3; rep++)
+                CHECK(ds4_tp_all_reduce(tp, 0xB300u + (uint32_t)rep, bout,
+                                        ar_recv, ar_tmp, ar_scratch, shard_b));
+            const double r1 = now();
+            fprintf(stderr,
+                    "rank=%d SP HANDOFF (40 MiB/layer): all_reduce(direct) "
+                    "%.3f ms = %.2f GiB/s  [bit-exact vs exact]\n",
+                    rank, (r1 - r0) * 1e3 / 3.0,
+                    (r1 - r0) > 0 ? (double)big_bytes * 2.0 /
+                        ((r1 - r0) / 3.0) / 1073741824.0 : 0.0);
+            free(ar_recv); free(ar_tmp); free(ar_scratch); free(ar_exact);
             free(bout); free(bin);
         }
 
