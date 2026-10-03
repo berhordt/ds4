@@ -453,41 +453,50 @@ int main(int argc, char **argv) {
              * the slab's batch regions, so the big gate can be given
              * slab-resident buffers here and the two effects separated. */
             {
+                /* Isolate *why* the decomposition wins: traffic (O(bytes) vs
+                 * O(world^2)) or staging (direct vs bounce)?  The clean
+                 * control is to hold staging CONSTANT -- put both paths on
+                 * heap buffers, so both take the staged route -- and vary only
+                 * the traffic.  An earlier version of this block gave the big
+                 * gate slab buffers and all_reduce heap buffers, which changed
+                 * both variables at once and could not answer the question. */
                 const uint64_t fits = 6ull << 20;
                 const uint64_t fshard = fits / world;
-                const uint64_t off_out = ds4_tp_slab_batch_out_offset(tp, 0);
-                const uint64_t off_in  = ds4_tp_slab_batch_in_offset(tp, 0);
-                uint8_t *sout = (uint8_t *)slab + off_out;
-                uint8_t *sin  = (uint8_t *)slab + off_in;
-                for (uint64_t i = 0; i < fits / sizeof(float); i++)
-                    ((float *)sout)[i] = value((unsigned)rank, i);
-                CHECK(ds4_tp_big_gate_exchange(tp, 0, 0xC000u, sout, sin, fits));
-                const double s0 = now();
-                CHECK(ds4_tp_big_gate_exchange(tp, 1, 0xC001u, sout, sin, fits));
-                const double s1 = now();
+                void *gout = calloc(1, (size_t)fits);
+                void *gin = calloc(1, (size_t)fits * (world - 1));
                 void *dtmp = calloc(1, (size_t)fits);
-                void *dscr = calloc(1, (size_t)fits);
+                void *dscr = calloc(1, (size_t)fits * (world - 1));
                 void *drecv = calloc(1, (size_t)fits);
-                CHECK(dtmp && dscr && drecv);
-                CHECK(ds4_tp_all_reduce(tp, 0xC100u, sout, drecv, dtmp, dscr,
+                CHECK(gout && gin && dtmp && dscr && drecv);
+                for (uint64_t i = 0; i < fits / sizeof(float); i++)
+                    ((float *)gout)[i] = value((unsigned)rank, i);
+                CHECK(ds4_tp_big_gate_exchange(tp, 0, 0xC000u, gout, gin, fits));
+                const double s0 = now();
+                CHECK(ds4_tp_big_gate_exchange(tp, 1, 0xC001u, gout, gin, fits));
+                const double s1 = now();
+                CHECK(ds4_tp_all_reduce(tp, 0xC100u, gout, drecv, dtmp, dscr,
                                         fshard));
                 const double d0 = now();
                 for (int rep = 0; rep < 3; rep++)
-                    CHECK(ds4_tp_all_reduce(tp, 0xC200u + (uint32_t)rep, sout,
+                    CHECK(ds4_tp_all_reduce(tp, 0xC200u + (uint32_t)rep, gout,
                                             drecv, dtmp, dscr, fshard));
                 const double d1 = now();
+                /* Traffic per rank: big gate ships a full tensor to each peer
+                 * and receives one, 2(world-1)B.  all_reduce ships one shard
+                 * per peer each way, twice (reduce-scatter then all-gather),
+                 * i.e. 2 * 2(world-1)B/world.  At world 4 that is 2x, not the
+                 * 4x an earlier revision of this line claimed. */
+                const double traffic_ratio =
+                    (2.0 * (world - 1) * (double)fits) /
+                    (2.0 * 2.0 * (world - 1) * (double)fshard);
                 fprintf(stderr,
-                        "rank=%d STAGING vs TRAFFIC (6 MiB): big_gate "
-                        "%.3f ms (slab-resident, direct-eligible)= %.2f GiB/s | "
-                        "all_reduce %.3f ms = %.2f GiB/s | ratio %.2fx\n",
-                        rank, (s1 - s0) * 1e3,
-                        (s1 - s0) > 0 ? (double)fits * 2.0 * (world - 1) /
-                            (s1 - s0) / 1073741824.0 : 0.0,
-                        (d1 - d0) * 1e3 / 3.0,
-                        (d1 - d0) > 0 ? (double)fits * 2.0 /
-                            ((d1 - d0) / 3.0) / 1073741824.0 : 0.0,
-                        (d1 - d0) > 0 ? (s1 - s0) / ((d1 - d0) / 3.0) : 0.0);
-                free(dtmp); free(dscr); free(drecv);
+                        "rank=%d TRAFFIC vs STAGING (6 MiB, BOTH heap=staged): "
+                        "big_gate %.3f ms | all_reduce %.3f ms | ratio %.2fx "
+                        "(pure traffic ratio %.2fx)\n",
+                        rank, (s1 - s0) * 1e3, (d1 - d0) * 1e3 / 3.0,
+                        (d1 - d0) > 0 ? (s1 - s0) / ((d1 - d0) / 3.0) : 0.0,
+                        traffic_ratio);
+                free(gout); free(gin); free(dtmp); free(dscr); free(drecv);
             }
             free(bout); free(bin);
         }
