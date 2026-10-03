@@ -265,6 +265,14 @@ int ds4_tp_reduce_scatter(ds4_tp *tp, uint32_t seq, const void *send,
 int ds4_tp_all_reduce(ds4_tp *tp, uint32_t seq, const void *send, void *recv,
                       void *tmp, void *scratch, uint64_t shard_bytes);
 
+/* Big-gate entry point with the DS4_TP_ALL_REDUCE opt-in applied: with the env
+ * set (and world > 2) it runs the reduce-scatter + all-gather decomposition
+ * instead of the stock mesh exchange, leaving the rank-order sum at the head of
+ * `in` either way, so callers are unaffected.  Off by default. */
+int ds4_tp_big_gate_exchange_or_all_reduce(ds4_tp *tp, uint32_t layer,
+                                           uint64_t seq, const void *out,
+                                           void *in, uint64_t bytes);
+
 /* `_EXACT` reference implementations of the same collectives, for grading the
  * fast path rather than replacing it.  They use one plain blocking TCP
  * write-then-read per link with no rounds, no RDMA and no receive-window

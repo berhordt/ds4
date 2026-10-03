@@ -73992,7 +73992,8 @@ static int ds4_engine_tp_big_exchange(void *ud, uint32_t layer, uint64_t seq,
 #endif
     ds4_engine *e = ud;
     ds4_tp *tp = e->tp.ctx;
-    const int ok = ds4_tp_big_gate_exchange(tp, layer, seq, out, in, bytes);
+    const int ok = ds4_tp_big_gate_exchange_or_all_reduce(tp, layer, seq, out, in,
+                                                          bytes);
     if (!ok) ds4_tp_mark_failed(tp);
     return ok;
 }

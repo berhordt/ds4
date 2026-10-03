@@ -235,6 +235,13 @@ struct ds4_tp {
     ds4_tp_rdma_link rdma[DS4_TP_MAX_WORLD];   /* one QP per peer link */
 #endif
     uint64_t sync_checkpoint_seq;
+    /* All-reduce decomposition scratch (DS4_TP_ALL_REDUCE).  Owned by the
+     * transport because the engine's gate callback cannot be handed extra
+     * pointers; grown on demand and freed in tp_free. */
+    void *c_tmp;
+    uint64_t c_tmp_bytes;
+    void *c_scratch;
+    uint64_t c_scratch_bytes;
 };
 
 /* ------------------------------------------------------------------------
@@ -2241,6 +2248,19 @@ static int ds4_tp_big_tcp_env(void) {
     return 1;
 }
 
+/* DS4_TP_ALL_REDUCE: replace the mesh big gate's all-reduce with the
+ * reduce-scatter + all-gather decomposition.  Explicit true enables it; unset
+ * or any falsey value leaves the stock path, so the default is unchanged and
+ * an A/B is one env var. */
+static int ds4_tp_all_reduce_env(void) {
+    const char *v = getenv("DS4_TP_ALL_REDUCE");
+    if (!v || !*v) return 0;
+    if (!strcmp(v, "0") || !strcmp(v, "false") || !strcmp(v, "no") ||
+        !strcmp(v, "off") || !strcmp(v, "FALSE") || !strcmp(v, "NO") ||
+        !strcmp(v, "OFF")) return 0;
+    return 1;
+}
+
 static int tp_hello_exchange(ds4_tp *tp, int peer, const ds4_tp_identity *id,
                              int rdma_ok, char *err, size_t errlen) {
     ds4_tp_hello_fixed mine = {
@@ -2783,6 +2803,8 @@ void ds4_tp_free(ds4_tp *tp) {
         }
     }
     ds4_tp_topology_free(&tp->topo);
+    free(tp->c_tmp);
+    free(tp->c_scratch);
     free(tp);
 }
 
@@ -4233,8 +4255,11 @@ int ds4_tp_reduce_scatter(ds4_tp *tp, uint32_t seq, const void *send,
  * tensor to every peer and sums the copies: traffic is O(world^2 * bytes) and
  * every rank ships world-1 full tensors.  The decomposition moves O(bytes)
  * instead -- each rank ships one shard, and the summed tensor is assembled
- * from the shards -- so at world 4 it is a 4x traffic reduction, and it rides
- * the direct per-peer path rather than the bounce-staged one.
+ * from the shards -- so at world 4 it is a **2x** traffic cut (big gate
+ * 2(world-1)B, decomposition 2 * 2(world-1)B/world), and it rides the direct
+ * per-peer path rather than the bounce-staged one.  Measured against the big
+ * gate with staging held constant the total win is ~5x; the rest is round
+ * structure (3 rounds/peer in the big gate vs 1 per stage here).
  *
  * `scratch` must hold (world-1) * shard_bytes for the reduce-scatter stage.
  * `tmp` must hold the full tensor (world * shard_bytes) for the summed shards,
@@ -4253,6 +4278,67 @@ int ds4_tp_all_reduce(ds4_tp *tp, uint32_t seq, const void *send, void *recv,
      * tensor.  Every rank then ships that one summed shard, and the
      * rank-ordered concatenation completed by the all-gather is the full sum. */
     return ds4_tp_all_gather(tp, seq + 1u, tmp, recv, shard_bytes);
+}
+
+/* Self-contained all-reduce for the engine's big-gate callback.
+ *
+ * The callback is handed exactly two buffers -- the local partial in `out` and
+ * a `(world-1)*bytes` receive area in `in` -- and cannot be given extra
+ * scratch pointers.  So the decomposition's intermediates are cached inside
+ * the transport, grown on demand.
+ *
+ * Buffer roles, and why they fit the existing contract:
+ *   - `out` (bytes) is this rank's partial.  Reduce-scatter only *reads* it,
+ *     so it survives untouched until the end.
+ *   - `in` ((world-1)*bytes) is this rank's all-gather destination, needing
+ *     `world*shard_bytes == bytes`; it is large enough by definition.
+ *   - `c_tmp` (bytes) holds the reduce-scatter result (one shard) while the
+ *     all-gather reads it, then receives the assembled sum.
+ *   - `c_scratch` ((world-1)*shard_bytes) holds the peers' shards.
+ *
+ * The caller for world>2 reads the sum from the head of `in`, which is where
+ * the all-gather leaves it -- the same convention ds4_tp_big_gate_exchange
+ * already establishes, so no caller change is needed. */
+static int tp_all_reduce_cached(ds4_tp *tp, uint32_t seq, const void *out,
+                                void *in, uint64_t bytes) {
+    const uint64_t shard = bytes / (uint64_t)tp->world;
+    if (shard == 0 || shard % sizeof(float) != 0) {
+        fprintf(stderr, "ds4-tp: all-reduce payload %llu is not a float "
+                        "multiple of the world size\n",
+                (unsigned long long)bytes);
+        return 0;
+    }
+    const uint64_t need_tmp = bytes;
+    const uint64_t need_scratch =
+        (uint64_t)(tp->world - 1) * shard;
+    if (tp->c_tmp_bytes < need_tmp) {
+        free(tp->c_tmp);
+        tp->c_tmp = malloc((size_t)need_tmp);
+        tp->c_tmp_bytes = tp->c_tmp ? need_tmp : 0;
+    }
+    if (tp->c_scratch_bytes < need_scratch) {
+        free(tp->c_scratch);
+        tp->c_scratch = malloc((size_t)need_scratch);
+        tp->c_scratch_bytes = tp->c_scratch ? need_scratch : 0;
+    }
+    if (!tp->c_tmp || !tp->c_scratch) return 0;
+    /* Stage 1: reduce-scatter.  Result (this rank's summed shard) is written
+     * to the head of c_tmp. */
+    if (!ds4_tp_reduce_scatter(tp, seq, out, tp->c_tmp, tp->c_scratch, shard))
+        return 0;
+    /* Stage 2: all-gather the summed shards into `in`; the caller reads the
+     * sum from in[0..bytes). */
+    if (!ds4_tp_all_gather(tp, seq + (uint32_t)tp->world, tp->c_tmp, in, shard))
+        return 0;
+    return 1;
+}
+
+int ds4_tp_big_gate_exchange_or_all_reduce(ds4_tp *tp, uint32_t layer,
+                                           uint64_t seq, const void *out,
+                                           void *in, uint64_t bytes) {
+    if (ds4_tp_all_reduce_env() && tp->world > 2)
+        return tp_all_reduce_cached(tp, seq, out, in, bytes);
+    return ds4_tp_big_gate_exchange(tp, layer, seq, out, in, bytes);
 }
 
 
