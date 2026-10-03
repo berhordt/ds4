@@ -2248,13 +2248,21 @@ static int ds4_tp_big_tcp_env(void) {
     return 1;
 }
 
-/* DS4_TP_ALL_REDUCE: replace the mesh big gate's all-reduce with the
- * reduce-scatter + all-gather decomposition.  Explicit true enables it; unset
- * or any falsey value leaves the stock path, so the default is unchanged and
- * an A/B is one env var. */
+/* DS4_TP_ALL_REDUCE: use the reduce-scatter + all-gather decomposition for
+ * the mesh all-reduce instead of the stock whole-tensor mesh exchange.
+ *
+ * ON BY DEFAULT: it is byte-identical to the stock path (verified on all four
+ * ranks against a 6-prompt set and a prefix-dependent 6k-token prompt), worth
+ * +30 % prefill, and decode-neutral at both short and long context (19.4 vs
+ * 19.5 t/s at short context; 25.1 vs 25.0 at 12k tokens).  Set it to 0/false/
+ * no/off to fall back to the stock mesh exchange; the flag exists so the two
+ * can be A/B'd and so a regression can be isolated without a rebuild.
+ *
+ * world <= 2 is unaffected either way: the decomposition has nothing to do
+ * there (reduce-scatter and all-gather both degenerate to one exchange). */
 static int ds4_tp_all_reduce_env(void) {
     const char *v = getenv("DS4_TP_ALL_REDUCE");
-    if (!v || !*v) return 0;
+    if (!v || !*v) return 1;
     if (!strcmp(v, "0") || !strcmp(v, "false") || !strcmp(v, "no") ||
         !strcmp(v, "off") || !strcmp(v, "FALSE") || !strcmp(v, "NO") ||
         !strcmp(v, "OFF")) return 0;
