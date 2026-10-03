@@ -271,6 +271,57 @@ int main(int argc, char **argv) {
         free(send); free(recv); free(partial); free(rrecv); free(scratch);
     }
     fprintf(stderr, "rank=%d collectives 1..64 MB: exact PASS\n", rank);
+
+    /* --------------------------------------------------------------------
+     * Stage 0: the decode-shape comparison.  A decode token already fires 80
+     * cross-rank exchanges -- 40 layers x 2 gates -- at a 20 KB vector, which
+     * is what the slab's 80 slots are for.  The existing gate path pays *no*
+     * per-call barrier: it arms a sliding receive window 16 gates ahead, so
+     * successive gates pipeline (see tp_rdma_gate_exchange).  The collectives
+     * above are barrier-per-round, which is the price of passing arbitrary
+     * payloads.  This measures both at the shape decode actually uses, so the
+     * question "can T2's dense split afford a collective per layer?" gets a
+     * number instead of a prediction.
+     * -------------------------------------------------------------------- */
+    {
+        const uint64_t vec_bytes = (uint64_t)n_embd * sizeof(float);
+        const uint32_t calls = n_layer * 2u;   /* one decode token's gates */
+        void *out = calloc(1, (size_t)vec_bytes);
+        void *in = calloc(1, (size_t)vec_bytes);
+        CHECK(out && in);
+        /* Seed the partial so the exchange has real data to move. */
+        for (uint64_t i = 0; i < vec_bytes / sizeof(float); i++)
+            ((float *)out)[i] = value((unsigned)rank, i);
+
+        /* Warm up the QP state and the sliding receive window: the first
+         * gate of a run arms DS4_TP_RDMA_RECV_WINDOW receives, which is a
+         * one-time cost that must not land inside the timed loop.  The gate
+         * path requires slot == (seq-1) %% gates_per_token with layer/gate
+         * derived from that slot, so seq c+1 maps to layer (c>>1), gate (c&1). */
+        for (uint32_t w = 0; w < 4; w++)
+            CHECK(ds4_tp_gate_exchange(tp, w >> 1, w & 1u, 1u + w));
+
+        const double g0 = now();
+        for (uint32_t c = 0; c < calls; c++)
+            CHECK(ds4_tp_gate_exchange(tp, c >> 1, c & 1u, 1u + c));
+        const double g1 = now();
+
+        const double a0 = now();
+        for (uint32_t c = 0; c < calls; c++)
+            CHECK(ds4_tp_all_gather(tp, 0x4000u + c, out, in, vec_bytes));
+        const double a1 = now();
+
+        fprintf(stderr,
+                "rank=%d DECODE SHAPE (vec=%llu B, %u calls = 1 token): "
+                "gate %.3f ms/token (%.3f ms/call), all_gather %.3f ms/token "
+                "(%.3f ms/call), ratio %.2fx\n",
+                rank, (unsigned long long)vec_bytes, calls,
+                (g1 - g0) * 1e3, (g1 - g0) * 1e3 / calls,
+                (a1 - a0) * 1e3, (a1 - a0) * 1e3 / calls,
+                (a1 - a0) > 0 ? (a1 - a0) / (g1 - g0) : 0.0);
+        free(out); free(in);
+    }
+
     rc = 0;
 
 done:
