@@ -387,6 +387,33 @@ int main(int argc, char **argv) {
             CHECK(ds4_tp_all_gather(tp, 0x4000u + c, out, in, vec_bytes));
         const double a1 = now();
 
+        /* The bulk big gate at decode shape.  At world>2 the attention
+         * head-split routes its per-token output sum through
+         * ds41_sum_partial_batch(), i.e. this path, once per layer -- and it is
+         * the bulk path built for 25 MB prefill payloads, not for 20 KB.  That
+         * is the remaining decode cost of the split, so it needs its own
+         * number. */
+        {
+            void *bout = calloc(1, (size_t)vec_bytes);
+            void *bin = calloc(1, (size_t)vec_bytes * (world - 1));
+            CHECK(bout && bin);
+            for (uint64_t i = 0; i < vec_bytes / sizeof(float); i++)
+                ((float *)bout)[i] = value((unsigned)rank, i);
+            CHECK(ds4_tp_big_gate_exchange(tp, 0, 0xD000u, bout, bin, vec_bytes));
+            const double p0 = now();
+            for (uint32_t c = 0; c < calls; c++)
+                CHECK(ds4_tp_big_gate_exchange(tp, c >> 1, 0xD100u + c, bout, bin,
+                                               vec_bytes));
+            const double p1 = now();
+            fprintf(stderr,
+                    "rank=%d DECODE SHAPE big_gate (bulk path, %llu B): "
+                    "%.3f ms/token (%.3f ms/call) -- %.1fx the small gate\n",
+                    rank, (unsigned long long)vec_bytes, (p1 - p0) * 1e3,
+                    (p1 - p0) * 1e3 / calls,
+                    (g1 - g0) > 0 ? (p1 - p0) / (g1 - g0) : 0.0);
+            free(bout); free(bin);
+        }
+
         /* The head-split / SP handoff shape: 2048 rows x 5120 f32 = 40 MiB,
          * one layer.  Compare the three paths that can carry it:
          *   - the new collective (fast, barrier per round)
