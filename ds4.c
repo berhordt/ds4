@@ -41442,9 +41442,38 @@ static bool ds41_attention_gate(ds41_gpu_graph *g, uint32_t il) {
     if (g->tp_world == 2)
         return ds41_sum_partial(g, g->block, il, DS4_TP_GATE_ATTN);
     /* Split layout at world>2: the small gate's combined slot is not reliably
-     * visible on the very first (ATTN) gate of a session, so the output sum
-     * rides the bulk big gate and the small ATTN gate stays a barrier to keep
-     * the per-layer slot order unchanged. */
+     * visible, so the output sum rides the bulk big gate and the small ATTN
+     * gate stays a barrier to keep the per-layer slot order unchanged.
+     *
+     * GATE-MECHANISM INTERACTION, and it is not the small gate itself.
+     * ds41_sum_partial() reads tp_combined[slot], which the CPU wrote on the
+     * exchange thread, so the GPU must observe a CPU store immediately after a
+     * gate.  That is fine with event release and corrupt with poll release:
+     * DS4_V41_SPLIT_SMALL_GATE reproduces it --
+     *   flag arrival + poll release (default) : 0/3 .. 0/5 requests correct
+     *   flag arrival + event release          : 3/3
+     *   event arrival + event release         : 3/3
+     * with silent corruption (token salad, sometimes finish_reason=error) and no
+     * error on any rank.  It is persistent rather than a first-gate effect: the
+     * corrupting run stays corrupt over many requests.
+     *
+     * With DS4_TP_DISABLE_POLL_GATES the cheap gate is both correct and FASTER
+     * than the bulk one at decode (28-29 t/s vs 20), so the bulk gate is working
+     * around a poll-release visibility gap rather than something intrinsic to
+     * the small gate.
+     *
+     * A first fix attempt did NOT work and is recorded so it is not retried:
+     * making the poll-ring release stores __ATOMIC_RELEASE instead of RELAXED
+     * (the textbook ordering for "payload then flag") left the config 0/5.  The
+     * gap is therefore not a missing release barrier on the ring lines alone.
+     *
+     * The flag is a DIAGNOSTIC, off by default, and requires BOTH envs so it
+     * cannot be enabled into corruption by accident: it is the minimal
+     * reproduction of the poll-release gap.  The default (replicated) config
+     * does not exercise the gap and soaks clean (40/40). */
+    if (getenv("DS4_V41_SPLIT_SMALL_GATE") &&
+        getenv("DS4_TP_DISABLE_POLL_GATES"))
+        return ds41_sum_partial(g, g->block, il, DS4_TP_GATE_ATTN);
     if (!ds41_sum_partial_batch(g, g->block, il, 1u)) return false;
     return ds4_gpu_tensor_copy(g->tp_out[slot], 0, g->block, 0,
                                (uint64_t)DS4_N_EMBD * 4u) != 0 &&
